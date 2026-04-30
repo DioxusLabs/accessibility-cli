@@ -139,20 +139,38 @@ struct CalculatorGuard {
 }
 
 impl CalculatorGuard {
+    async fn connect_when_ready(pid: u32) -> App {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+
+        loop {
+            let last_error = match App::connect(pid, Platform::Linux).await {
+                Ok(app) => match app
+                    .locator("Button")
+                    .first()
+                    .with_timeout(Duration::from_secs(1))
+                    .wait()
+                    .await
+                {
+                    Ok(_) => return app,
+                    Err(err) => err.to_string(),
+                },
+                Err(err) => err.to_string(),
+            };
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Calculator should be ready: {}",
+                last_error
+            );
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
         let (pid, child) = Self::launch_calculator();
-
-        let app = App::connect(pid, Platform::Linux)
-            .await
-            .expect("Failed to connect to Calculator");
-
-        // Wait for Calculator to be ready
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
+        let app = Self::connect_when_ready(pid).await;
 
         Self { pid, app, child }
     }
@@ -161,17 +179,7 @@ impl CalculatorGuard {
     async fn launch_for_input() -> Self {
         let (pid, child) = Self::launch_calculator();
         Self::activate_app(pid);
-
-        let app = App::connect(pid, Platform::Linux)
-            .await
-            .expect("Failed to connect to Calculator");
-
-        // Wait for Calculator to be ready
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
+        let app = Self::connect_when_ready(pid).await;
 
         Self { pid, app, child }
     }
@@ -197,10 +205,16 @@ impl CalculatorGuard {
             .spawn()
             .expect("Failed to launch gnome-calculator");
 
-        let pid = child.id();
-
         // Wait for it to initialize
         std::thread::sleep(Duration::from_millis(2500));
+
+        let pid = Command::new("pgrep")
+            .args(["-n", "-f", "gnome-calculator"])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|stdout| stdout.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| child.id());
 
         (pid, child)
     }
