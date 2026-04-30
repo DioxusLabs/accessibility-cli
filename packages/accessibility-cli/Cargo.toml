@@ -13,7 +13,7 @@ ctrlc.workspace = true
 tokio.workspace = true
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }{ archive-suffix }"
+pkg-url = "{ repo }/releases/download/main/{ name }-{ target }{ archive-suffix }"
 pkg-fmt = "bin"
 
 [dev-dependencies]
