@@ -9,7 +9,7 @@ selector_value=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/install-macos-artifact.sh [options]
+Usage: scripts/install.sh [options]
 
 Downloads all unexpired GitHub Actions artifacts from the selected workflow run.
 
