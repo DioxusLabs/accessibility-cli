@@ -252,7 +252,7 @@ async fn click_button_with_fallback(calc: &App, titles: &[&str]) -> Result<(), S
             .click()
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(_) => return Ok(()),
             Err(e) => last_error = format!("Button '{}': {}", title, e),
         }
     }

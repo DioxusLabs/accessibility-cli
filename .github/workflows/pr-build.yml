@@ -126,6 +126,41 @@ jobs:
               accessibility-cli
             ```
 
+  publish-main-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish main commit release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: main-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: "main ${{ github.sha }}"
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            Install this main commit build with:
+
+            ```bash
+            export GITHUB_TOKEN=ghp_xxx
+            cargo binstall \
+              --git https://github.com/${{ github.repository }} \
+              --pkg-url "https://github.com/${{ github.repository }}/releases/download/main-${{ github.sha }}/accessibility-cli-{ target }{ archive-suffix }" \
+              --pkg-fmt bin \
+              --strategies crate-meta-data \
+              --no-confirm \
+              --force \
+              accessibility-cli
+            ```
+
   e2e:
     strategy:
       fail-fast: false
