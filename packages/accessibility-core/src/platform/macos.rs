@@ -7,14 +7,29 @@
 #![allow(unsafe_op_in_unsafe_fn, dead_code)]
 
 use crate::accessibility::{
-    AccessibilityReader, Element, ElementCache, ElementKey, ElementTree, Point, Rect, TreeFilter,
+    AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
+    ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, StopReason,
+    TreeFilter,
 };
+use crate::input::code_from_char;
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
+use keyboard_types::{Code, Modifiers};
+use objc2::{AnyThread, runtime::AnyObject};
+use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
+use objc2_core_graphics::{
+    CGDisplayBounds, CGEvent, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGImage, CGMainDisplayID, CGMouseButton,
+};
+use objc2_foundation::{NSData, NSDictionary};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // AX Attribute constants
 const AX_ROLE: &str = "AXRole";
@@ -115,6 +130,302 @@ impl MacOSAccessibility {
     pub fn is_process_trusted() -> bool {
         // Safety: AXIsProcessTrusted is a safe C function
         unsafe { AXIsProcessTrusted() }
+    }
+
+    /// Return the main display's bounds in global screen coordinates.
+    fn main_display_bounds() -> Rect {
+        let bounds = CGDisplayBounds(CGMainDisplayID());
+        Rect::new(
+            Point::new(bounds.origin.x, bounds.origin.y),
+            crate::accessibility::Size::new(bounds.size.width, bounds.size.height),
+        )
+    }
+
+    /// Capture the main display and encode it as PNG.
+    fn capture_main_display() -> Result<Screenshot> {
+        #[allow(deprecated)]
+        let image = objc2_core_graphics::CGDisplayCreateImage(CGMainDisplayID())
+            .ok_or_else(|| anyhow!("Failed to capture main display"))?;
+
+        Self::encode_cg_image_as_png(&image)
+    }
+
+    /// Convert a CoreGraphics image into the Screenshot format used by the public API.
+    fn encode_cg_image_as_png(image: &CGImage) -> Result<Screenshot> {
+        let width = CGImage::width(Some(image)) as u32;
+        let height = CGImage::height(Some(image)) as u32;
+        if width == 0 || height == 0 {
+            bail!("Captured image has empty dimensions: {}x{}", width, height);
+        }
+
+        let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), image);
+        let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+        let data = unsafe {
+            bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+        }
+        .ok_or_else(|| anyhow!("Failed to encode screenshot as PNG"))?;
+
+        let len = data.length();
+        if len == 0 {
+            bail!("Encoded screenshot is empty");
+        }
+
+        let mut bytes = vec![0; len];
+        unsafe {
+            data.getBytes_length(
+                NonNull::new(bytes.as_mut_ptr().cast::<c_void>())
+                    .expect("Vec pointer should be non-null"),
+                len,
+            );
+        }
+
+        Ok(Screenshot {
+            data: bytes,
+            width,
+            height,
+        })
+    }
+
+    /// Current timestamp in milliseconds since the Unix epoch.
+    fn timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Map keyboard-types codes to macOS virtual key codes.
+    fn key_code(code: Code) -> Option<u16> {
+        match code {
+            Code::KeyA => Some(0),
+            Code::KeyS => Some(1),
+            Code::KeyD => Some(2),
+            Code::KeyF => Some(3),
+            Code::KeyH => Some(4),
+            Code::KeyG => Some(5),
+            Code::KeyZ => Some(6),
+            Code::KeyX => Some(7),
+            Code::KeyC => Some(8),
+            Code::KeyV => Some(9),
+            Code::KeyB => Some(11),
+            Code::KeyQ => Some(12),
+            Code::KeyW => Some(13),
+            Code::KeyE => Some(14),
+            Code::KeyR => Some(15),
+            Code::KeyY => Some(16),
+            Code::KeyT => Some(17),
+            Code::Digit1 => Some(18),
+            Code::Digit2 => Some(19),
+            Code::Digit3 => Some(20),
+            Code::Digit4 => Some(21),
+            Code::Digit6 => Some(22),
+            Code::Digit5 => Some(23),
+            Code::Equal => Some(24),
+            Code::Digit9 => Some(25),
+            Code::Digit7 => Some(26),
+            Code::Minus => Some(27),
+            Code::Digit8 => Some(28),
+            Code::Digit0 => Some(29),
+            Code::BracketRight => Some(30),
+            Code::KeyO => Some(31),
+            Code::KeyU => Some(32),
+            Code::BracketLeft => Some(33),
+            Code::KeyI => Some(34),
+            Code::KeyP => Some(35),
+            Code::Enter | Code::NumpadEnter => Some(36),
+            Code::KeyL => Some(37),
+            Code::KeyJ => Some(38),
+            Code::Quote => Some(39),
+            Code::KeyK => Some(40),
+            Code::Semicolon => Some(41),
+            Code::Backslash => Some(42),
+            Code::Comma => Some(43),
+            Code::Slash => Some(44),
+            Code::KeyN => Some(45),
+            Code::KeyM => Some(46),
+            Code::Period => Some(47),
+            Code::Tab => Some(48),
+            Code::Space => Some(49),
+            Code::Backquote => Some(50),
+            Code::Backspace => Some(51),
+            Code::Escape => Some(53),
+            Code::MetaLeft | Code::MetaRight => Some(55),
+            Code::ShiftLeft => Some(56),
+            Code::CapsLock => Some(57),
+            Code::AltLeft => Some(58),
+            Code::ControlLeft => Some(59),
+            Code::ShiftRight => Some(60),
+            Code::AltRight => Some(61),
+            Code::ControlRight => Some(62),
+            Code::NumpadDecimal => Some(65),
+            Code::NumpadMultiply => Some(67),
+            Code::NumpadAdd => Some(69),
+            Code::NumLock => Some(71),
+            Code::NumpadDivide => Some(75),
+            Code::NumpadSubtract => Some(78),
+            Code::Numpad0 => Some(82),
+            Code::Numpad1 => Some(83),
+            Code::Numpad2 => Some(84),
+            Code::Numpad3 => Some(85),
+            Code::Numpad4 => Some(86),
+            Code::Numpad5 => Some(87),
+            Code::Numpad6 => Some(88),
+            Code::Numpad7 => Some(89),
+            Code::Numpad8 => Some(91),
+            Code::Numpad9 => Some(92),
+            Code::F5 => Some(96),
+            Code::F6 => Some(97),
+            Code::F7 => Some(98),
+            Code::F3 => Some(99),
+            Code::F8 => Some(100),
+            Code::F9 => Some(101),
+            Code::F11 => Some(103),
+            Code::F13 => Some(105),
+            Code::F16 => Some(106),
+            Code::F14 => Some(107),
+            Code::F10 => Some(109),
+            Code::F12 => Some(111),
+            Code::F15 => Some(113),
+            Code::Insert => Some(114),
+            Code::Home => Some(115),
+            Code::PageUp => Some(116),
+            Code::Delete => Some(117),
+            Code::F4 => Some(118),
+            Code::End => Some(119),
+            Code::F2 => Some(120),
+            Code::PageDown => Some(121),
+            Code::F1 => Some(122),
+            Code::ArrowLeft => Some(123),
+            Code::ArrowRight => Some(124),
+            Code::ArrowDown => Some(125),
+            Code::ArrowUp => Some(126),
+            _ => None,
+        }
+    }
+
+    fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {
+        let mut flags = CGEventFlags::empty();
+        if modifiers.contains(Modifiers::SHIFT) {
+            flags |= CGEventFlags::MaskShift;
+        }
+        if modifiers.contains(Modifiers::CONTROL) {
+            flags |= CGEventFlags::MaskControl;
+        }
+        if modifiers.contains(Modifiers::ALT) {
+            flags |= CGEventFlags::MaskAlternate;
+        }
+        if modifiers.contains(Modifiers::META) {
+            flags |= CGEventFlags::MaskCommand;
+        }
+        flags
+    }
+
+    fn post_event(pid: Option<u32>, event: &CGEvent) {
+        if let Some(pid) = pid {
+            CGEvent::post_to_pid(pid as libc::pid_t, Some(event));
+        } else {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        }
+    }
+
+    fn post_key_event(
+        pid: Option<u32>,
+        code: Code,
+        modifiers: Modifiers,
+        key_down: bool,
+    ) -> Result<()> {
+        let key_code = Self::key_code(code)
+            .ok_or_else(|| anyhow!("Key {:?} is not supported on macOS", code))?;
+        let event = CGEvent::new_keyboard_event(None, key_code, key_down)
+            .ok_or_else(|| anyhow!("Failed to create keyboard event"))?;
+        CGEvent::set_flags(Some(&event), Self::modifier_flags(modifiers));
+        Self::post_event(pid, &event);
+        Ok(())
+    }
+
+    fn post_keystroke(pid: Option<u32>, code: Code, modifiers: Modifiers) -> Result<()> {
+        Self::post_key_event(pid, code, modifiers, true)?;
+        std::thread::sleep(Duration::from_millis(10));
+        Self::post_key_event(pid, code, modifiers, false)
+    }
+
+    fn cg_mouse_button(button: crate::input::MouseButton) -> CGMouseButton {
+        match button {
+            crate::input::MouseButton::Left => CGMouseButton::Left,
+            crate::input::MouseButton::Right => CGMouseButton::Right,
+            crate::input::MouseButton::Middle => CGMouseButton::Center,
+        }
+    }
+
+    fn mouse_event_types(button: crate::input::MouseButton) -> (CGEventType, CGEventType) {
+        match button {
+            crate::input::MouseButton::Left => {
+                (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp)
+            }
+            crate::input::MouseButton::Right => {
+                (CGEventType::RightMouseDown, CGEventType::RightMouseUp)
+            }
+            crate::input::MouseButton::Middle => {
+                (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp)
+            }
+        }
+    }
+
+    fn post_mouse_event(
+        x: f64,
+        y: f64,
+        event_type: CGEventType,
+        button: CGMouseButton,
+    ) -> Result<()> {
+        let point = objc2_core_foundation::CGPoint { x, y };
+        let event = CGEvent::new_mouse_event(None, event_type, point, button)
+            .ok_or_else(|| anyhow!("Failed to create mouse event"))?;
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        Ok(())
+    }
+
+    fn flatten_elements(element: &Element, elements: &mut Vec<Element>) {
+        elements.push(element.clone());
+        for child in &element.children {
+            Self::flatten_elements(child, elements);
+        }
+    }
+
+    fn element_event_key(element: &Element) -> String {
+        let bounds = element.bounds.map(|bounds| {
+            (
+                bounds.origin.x.round() as i64,
+                bounds.origin.y.round() as i64,
+                bounds.size.width.round() as i64,
+                bounds.size.height.round() as i64,
+            )
+        });
+
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            element.role, element.title, element.description, element.identifier, bounds
+        )
+    }
+
+    fn listener_snapshots(
+        tree: &ElementTree,
+    ) -> (HashMap<String, Element>, Option<(String, Element)>) {
+        let mut elements = Vec::new();
+        Self::flatten_elements(&tree.root, &mut elements);
+
+        let mut values = HashMap::new();
+        let mut focused = None;
+        for element in elements {
+            let key = Self::element_event_key(&element);
+            if element.value.is_some() {
+                values.insert(key.clone(), element.clone());
+            }
+            if focused.is_none() && element.focused {
+                focused = Some((key, element));
+            }
+        }
+
+        (values, focused)
     }
 
     /// Get an attribute value from an AXUIElement.
@@ -463,6 +774,36 @@ impl MacOSAccessibility {
         None
     }
 
+    /// Get the main window bounds for a given PID using accessibility APIs.
+    unsafe fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
+        let app = AXUIElement::new_application(pid as i32);
+
+        if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
+            let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
+            if let Some(bounds) = Self::get_bounds(&window) {
+                if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
+                    return Some(bounds);
+                }
+            }
+        }
+
+        if let Ok(windows_attr) = Self::get_attribute(&app, AX_WINDOWS) {
+            let windows: CFRetained<CFArray<AXUIElement>> =
+                CFRetained::cast_unchecked(windows_attr);
+            for i in 0..windows.len() {
+                if let Some(window) = windows.get(i) {
+                    if let Some(bounds) = Self::get_bounds(&window) {
+                        if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
+                            return Some(bounds);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Get the focused application's PID (fallback using AX APIs).
     unsafe fn get_focused_app_pid_ax(&self) -> Option<u32> {
         // Try AXFocusedApplication first (returns the frontmost app element)
@@ -647,6 +988,189 @@ impl AccessibilityReader for MacOSAccessibility {
 
     fn snapshot_version(&self) -> u64 {
         self.cache.version()
+    }
+
+    fn keystroke(
+        &mut self,
+        pid: Option<u32>,
+        key: Code,
+        modifiers: Modifiers,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = Self::post_keystroke(pid, key, modifiers);
+        std::future::ready(result)
+    }
+
+    fn type_raw(
+        &mut self,
+        pid: Option<u32>,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = (|| {
+            for ch in text.chars() {
+                let (code, needs_shift) = code_from_char(ch)
+                    .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
+                let modifiers = if needs_shift {
+                    Modifiers::SHIFT
+                } else {
+                    Modifiers::empty()
+                };
+                Self::post_keystroke(pid, code, modifiers)?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })();
+
+        std::future::ready(result)
+    }
+
+    fn mouse_click_at(
+        &mut self,
+        _pid: Option<u32>,
+        x: f64,
+        y: f64,
+        button: crate::input::MouseButton,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = (|| {
+            let cg_button = Self::cg_mouse_button(button);
+            let (down_type, up_type) = Self::mouse_event_types(button);
+            Self::post_mouse_event(x, y, down_type, cg_button)?;
+            std::thread::sleep(Duration::from_millis(10));
+            Self::post_mouse_event(x, y, up_type, cg_button)
+        })();
+
+        std::future::ready(result)
+    }
+
+    fn supports_keystroke(&self) -> bool {
+        true
+    }
+
+    fn supports_mouse_click(&self) -> bool {
+        true
+    }
+
+    fn supports_hit_test(&self) -> bool {
+        true
+    }
+
+    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
+        let screenshot = Self::capture_main_display()?;
+
+        if let Some(pid) = pid {
+            if let Some(window_bounds) = unsafe { Self::get_window_bounds_for_pid(pid) } {
+                let screen_bounds = Self::main_display_bounds();
+                if let Ok(cropped) = screenshot.crop(&window_bounds, &screen_bounds) {
+                    return Ok(cropped);
+                }
+            }
+        }
+
+        Ok(screenshot)
+    }
+
+    fn get_screen_bounds(
+        &self,
+        pid: Option<u32>,
+    ) -> impl std::future::Future<Output = Result<Rect>> {
+        let bounds = pid
+            .and_then(|pid| unsafe { Self::get_window_bounds_for_pid(pid) })
+            .unwrap_or_else(Self::main_display_bounds);
+
+        std::future::ready(Ok(bounds))
+    }
+
+    fn start_listening(
+        &mut self,
+        config: ListenerConfig,
+        callback: Box<dyn FnMut(AccessibilityEvent) + Send + 'static>,
+    ) -> Result<ListenerHandle> {
+        let pid = config.pid;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let task_stop_flag = stop_flag.clone();
+
+        let runtime_handle = tokio::runtime::Handle::current();
+        let task_handle = tokio::task::spawn_blocking(move || {
+            let mut callback = callback;
+            let mut reader = match MacOSAccessibility::new() {
+                Ok(reader) => reader,
+                Err(error) => {
+                    callback(AccessibilityEvent::Error {
+                        message: error.to_string(),
+                        timestamp: MacOSAccessibility::timestamp_ms(),
+                    });
+                    return;
+                }
+            };
+
+            let mut previous_values: HashMap<String, Element> = HashMap::new();
+            let mut previous_focus: Option<String> = None;
+            let mut first_snapshot = true;
+
+            while !task_stop_flag.load(Ordering::SeqCst) {
+                match runtime_handle.block_on(reader.get_tree(pid, &TreeFilter::default())) {
+                    Ok(tree) => {
+                        let (values, focused) = MacOSAccessibility::listener_snapshots(&tree);
+
+                        if config.should_capture(AccessibilityEventType::FocusChanged)
+                            && let Some((focus_key, element)) = focused
+                            && (first_snapshot || previous_focus.as_deref() != Some(&focus_key))
+                        {
+                            previous_focus = Some(focus_key);
+                            callback(AccessibilityEvent::FocusChanged {
+                                element: Some(element),
+                                pid: tree.pid,
+                                timestamp: MacOSAccessibility::timestamp_ms(),
+                            });
+                        }
+
+                        if config.should_capture(AccessibilityEventType::ValueChanged) {
+                            for (key, element) in &values {
+                                let old_value =
+                                    previous_values.get(key).and_then(|e| e.value.clone());
+                                let new_value = element.value.clone();
+                                if first_snapshot || old_value != new_value {
+                                    callback(AccessibilityEvent::ValueChanged {
+                                        element: Some(element.clone()),
+                                        old_value,
+                                        new_value,
+                                        timestamp: MacOSAccessibility::timestamp_ms(),
+                                    });
+                                }
+                            }
+                        }
+
+                        previous_values = values;
+                        first_snapshot = false;
+                    }
+                    Err(error) => {
+                        callback(AccessibilityEvent::Error {
+                            message: error.to_string(),
+                            timestamp: MacOSAccessibility::timestamp_ms(),
+                        });
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            callback(AccessibilityEvent::Stopped {
+                reason: StopReason::UserRequested,
+                timestamp: MacOSAccessibility::timestamp_ms(),
+            });
+        });
+
+        Ok(ListenerHandle::new(stop_flag, task_handle))
+    }
+
+    fn supports_event_listening(&self) -> bool {
+        true
+    }
+
+    fn supported_event_types(&self) -> Vec<AccessibilityEventType> {
+        vec![
+            AccessibilityEventType::FocusChanged,
+            AccessibilityEventType::ValueChanged,
+        ]
     }
 }
 

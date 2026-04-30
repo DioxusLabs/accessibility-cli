@@ -1,9 +1,12 @@
-name: CI
+name: pr-build
 
 on:
-  push:
-    branches: [main, master]
   pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, develop]
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +16,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux dependencies
@@ -31,19 +36,21 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            artifact_name: accessibility-cli-linux-x86_64
+            artifact_name: accessibility-cli-x86_64-unknown-linux-gnu
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-            artifact_name: accessibility-cli-windows-x86_64.exe
+            artifact_name: accessibility-cli-x86_64-pc-windows-msvc.exe
           - os: macos-15
             target: aarch64-apple-darwin
-            artifact_name: accessibility-cli-macos-aarch64
+            artifact_name: accessibility-cli-aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            artifact_name: accessibility-cli-macos-x86_64
+            artifact_name: accessibility-cli-x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -56,15 +63,65 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }} -p accessibility-cli --bin accessibility-cli
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/accessibility-cli ${{ matrix.artifact_name }}
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/accessibility-cli dist/${{ matrix.artifact_name }}
       - name: Rename binary (Windows)
         if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/accessibility-cli.exe ${{ matrix.artifact_name }}
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/accessibility-cli.exe dist/${{ matrix.artifact_name }}
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.artifact_name }}
           if-no-files-found: error
+
+  publish-pr-release:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Move rolling PR tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: pr-${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if gh api --method PATCH "repos/${{ github.repository }}/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          gh api --method POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA"
+      - name: Publish rolling PR release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pr-${{ github.event.pull_request.number }}
+          target_commitish: ${{ github.event.pull_request.head.sha }}
+          name: "PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.head.ref }})"
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            Install this PR build with:
+
+            ```bash
+            export GITHUB_TOKEN=ghp_xxx
+            cargo binstall \
+              --git https://github.com/${{ github.repository }} \
+              --pkg-url "https://github.com/${{ github.repository }}/releases/download/pr-${{ github.event.pull_request.number }}/accessibility-cli-{ target }{ archive-suffix }" \
+              --pkg-fmt bin \
+              --strategies crate-meta-data \
+              --no-confirm \
+              --force \
+              accessibility-cli
+            ```
 
   e2e:
     strategy:
@@ -80,6 +137,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux E2E dependencies

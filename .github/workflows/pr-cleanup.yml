@@ -1,0 +1,19 @@
+name: pr-cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete PR release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="pr-${{ github.event.pull_request.number }}"
+          gh release delete "$TAG" --yes --cleanup-tag --repo "${{ github.repository }}" || true

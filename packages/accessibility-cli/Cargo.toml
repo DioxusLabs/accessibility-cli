@@ -3,12 +3,18 @@ name = "accessibility-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Cross-platform accessibility tree inspection and automation CLI"
+repository.workspace = true
 
 [dependencies]
 accessibility-core.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 tokio.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }{ archive-suffix }"
+pkg-fmt = "bin"
 
 [dev-dependencies]
 assert_cmd = "2"

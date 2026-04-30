@@ -40,10 +40,14 @@ objc2-application-services = { version = "0.3", features = [
     "libc",
 ] }
 objc2-app-kit = { version = "0.3", features = [
+    "NSBitmapImageRep",
+    "NSImageRep",
     "NSWorkspace",
     "NSRunningApplication",
+    "objc2-core-graphics",
 ] }
 objc2-core-graphics = { version = "0.3", features = [
+    "CGDirectDisplay",
     "CGWindow",
     "CGImage",
     "CGColorSpace",
@@ -52,6 +56,7 @@ objc2-core-graphics = { version = "0.3", features = [
     "CGEvent",
     "CGEventSource",
     "CGEventTypes",
+    "CGRemoteOperation",
 ] }
 libc = "0.2"
 
