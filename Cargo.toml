@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/accessibility-core",
-    "crates/accessibility-cli",
+    "packages/accessibility-core",
+    "packages/accessibility-cli",
 ]
 
 [workspace.package]
@@ -11,8 +11,8 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-accessibility-core = { path = "crates/accessibility-core" }
-accessibility-cli = { path = "crates/accessibility-cli" }
+accessibility-core = { path = "packages/accessibility-core" }
+accessibility-cli = { path = "packages/accessibility-cli" }
 ab_glyph = "0.2"
 accesskit = { version = "0.22", features = ["enumn", "schemars", "serde"] }
 anyhow = "1.0.100"
