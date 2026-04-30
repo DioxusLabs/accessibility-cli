@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,19 +58,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Patch main build version
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: pwsh
-        run: |
-          $shortSha = "${{ github.sha }}".Substring(0, 12)
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $baseVersion = ($metadata.packages | Where-Object { $_.name -eq "accessibility-cli" }).version
-          $baseVersion = $baseVersion -replace '-main\..*$', ''
-          $releaseVersion = "$baseVersion-main.$shortSha"
-          $cargoToml = Get-Content Cargo.toml -Raw
-          $cargoToml = $cargoToml -replace '(?m)^version = "([^"]+)"', "version = `"$releaseVersion`""
-          Set-Content Cargo.toml $cargoToml -NoNewline
-          "RELEASE_VERSION=$releaseVersion" >> $env:GITHUB_ENV
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -92,128 +79,6 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/${{ matrix.artifact_name }}
           if-no-files-found: error
-
-  publish-pr-release:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Move rolling PR tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: pr-${{ github.event.pull_request.number }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if gh api --method PATCH "repos/${{ github.repository }}/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null 2>&1; then
-            exit 0
-          fi
-
-          gh api --method POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA"
-      - name: Publish rolling PR release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: pr-${{ github.event.pull_request.number }}
-          target_commitish: ${{ github.event.pull_request.head.sha }}
-          name: "PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.head.ref }})"
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: dist/*
-          body: |
-            Install this PR build with:
-
-            ```bash
-            export GITHUB_TOKEN=ghp_xxx
-            cargo binstall \
-              --git https://github.com/${{ github.repository }} \
-              --pkg-url "https://github.com/${{ github.repository }}/releases/download/pr-${{ github.event.pull_request.number }}/accessibility-cli-{ target }{ archive-suffix }" \
-              --pkg-fmt bin \
-              --strategies crate-meta-data \
-              --no-confirm \
-              --force \
-              accessibility-cli
-            ```
-
-  publish-main-release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Set release vars
-        id: release-vars
-        shell: bash
-        run: |
-          short_sha="${GITHUB_SHA::12}"
-          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
-          echo "commit_tag=main-$short_sha" >> "$GITHUB_OUTPUT"
-      - name: Publish immutable main commit release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release-vars.outputs.commit_tag }}
-          target_commitish: ${{ github.sha }}
-          name: "main ${{ steps.release-vars.outputs.short_sha }}"
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: dist/*
-          body: |
-            Install this main commit build with:
-
-            ```bash
-            export GITHUB_TOKEN=ghp_xxx
-            cargo binstall \
-              --git https://github.com/${{ github.repository }} \
-              --pkg-url "https://github.com/${{ github.repository }}/releases/download/${{ steps.release-vars.outputs.commit_tag }}/accessibility-cli-{ target }{ archive-suffix }" \
-              --pkg-fmt bin \
-              --strategies crate-meta-data \
-              --no-confirm \
-              --force \
-              accessibility-cli
-            ```
-      - name: Move rolling main tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: main
-          SHA: ${{ github.sha }}
-        run: |
-          if gh api --method PATCH "repos/${{ github.repository }}/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null 2>&1; then
-            exit 0
-          fi
-
-          gh api --method POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA"
-      - name: Publish rolling main release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: main
-          target_commitish: ${{ github.sha }}
-          name: "main (rolling)"
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: dist/*
-          body: |
-            Install the latest main build with:
-
-            ```bash
-            export GITHUB_TOKEN=ghp_xxx
-            cargo binstall \
-              --git https://github.com/${{ github.repository }} \
-              --strategies crate-meta-data \
-              --no-confirm \
-              --force \
-              accessibility-cli
-            ```
 
   e2e:
     strategy:
