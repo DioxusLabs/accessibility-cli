@@ -320,12 +320,8 @@ impl MacOSAccessibility {
         flags
     }
 
-    fn post_event(pid: Option<u32>, event: &CGEvent) {
-        if let Some(pid) = pid {
-            CGEvent::post_to_pid(pid as libc::pid_t, Some(event));
-        } else {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
-        }
+    fn post_event(_pid: Option<u32>, event: &CGEvent) {
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
     }
 
     fn post_key_event(
