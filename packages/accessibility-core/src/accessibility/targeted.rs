@@ -533,6 +533,17 @@ impl TargetedAccessibility {
     /// Returns the clicked element's ID on success.
     pub async fn click_element(&mut self, target: &str, tree: &ElementTree) -> Result<ElementKey> {
         let elem = self.resolve_element(target, tree, true)?;
+        self.click_resolved_element(elem).await
+    }
+
+    /// Click a previously resolved element.
+    ///
+    /// Element clicks use the element's native accessibility action.
+    ///
+    /// On macOS this is the no-focus path for AX-addressable controls. Use
+    /// `mouse_click_at` for explicit pixel clicks on surfaces without useful AX
+    /// actions.
+    pub async fn click_resolved_element(&mut self, elem: &Element) -> Result<ElementKey> {
         let id = elem.id;
         self.perform_action(id, Action::Click).await?;
         Ok(id)

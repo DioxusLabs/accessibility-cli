@@ -18,16 +18,18 @@ use keyboard_types::{Code, Modifiers};
 use objc2::{AnyThread, runtime::AnyObject};
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CGRect};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGEvent, CGEventFlags, CGEventSourceStateID, CGEventTapLocation, CGEventType,
-    CGImage, CGMainDisplayID, CGMouseButton,
+    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGImage,
+    CGMainDisplayID, CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption,
+    CGWindowListOption,
 };
 use objc2_foundation::{NSData, NSDictionary};
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +93,73 @@ const ROLE_ROW: &str = "AXRow";
 const ROLE_COLUMN: &str = "AXColumn";
 const ROLE_CELL: &str = "AXCell";
 
+type SLEventPostToPidFn = unsafe extern "C-unwind" fn(libc::pid_t, Option<&CGEvent>);
+type AXUIElementGetWindowFn = unsafe extern "C-unwind" fn(&AXUIElement, *mut CGWindowID) -> AXError;
+
+fn dlerror_message() -> String {
+    unsafe {
+        let error = libc::dlerror();
+        if error.is_null() {
+            "unknown dynamic loader error".to_string()
+        } else {
+            CStr::from_ptr(error).to_string_lossy().into_owned()
+        }
+    }
+}
+
+fn skylight_handle() -> Option<*mut c_void> {
+    static HANDLE: OnceLock<Option<usize>> = OnceLock::new();
+
+    HANDLE
+        .get_or_init(|| unsafe {
+            let path = b"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight\0";
+            let handle = libc::dlopen(
+                path.as_ptr() as *const c_char,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if handle.is_null() {
+                let _ = dlerror_message();
+                None
+            } else {
+                Some(handle as usize)
+            }
+        })
+        .map(|handle| handle as *mut c_void)
+}
+
+fn skylight_event_post_to_pid() -> Option<SLEventPostToPidFn> {
+    static SYMBOL: OnceLock<Option<SLEventPostToPidFn>> = OnceLock::new();
+
+    *SYMBOL.get_or_init(|| unsafe {
+        let handle = skylight_handle()?;
+        let symbol = libc::dlsym(handle, c"SLEventPostToPid".as_ptr());
+        if symbol.is_null() {
+            let _ = dlerror_message();
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, SLEventPostToPidFn>(
+                symbol,
+            ))
+        }
+    })
+}
+
+fn ax_ui_element_get_window() -> Option<AXUIElementGetWindowFn> {
+    static SYMBOL: OnceLock<Option<AXUIElementGetWindowFn>> = OnceLock::new();
+
+    *SYMBOL.get_or_init(|| unsafe {
+        let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetWindow".as_ptr());
+        if symbol.is_null() {
+            let _ = dlerror_message();
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, AXUIElementGetWindowFn>(
+                symbol,
+            ))
+        }
+    })
+}
+
 /// macOS accessibility reader using AXUIElement API.
 pub struct MacOSAccessibility {
     /// Cache of elements with their platform handles.
@@ -98,6 +167,9 @@ pub struct MacOSAccessibility {
 
     /// Map from ElementKey to AXUIElement handle for performing actions.
     handles: HashMap<ElementKey, CFRetained<AXUIElement>>,
+
+    /// PID from the most recent tree build, used to keep cached actions targeted.
+    last_tree_pid: Option<u32>,
 
     /// System-wide accessibility element (for hit testing and focus queries).
     system_wide: CFRetained<AXUIElement>,
@@ -122,6 +194,7 @@ impl MacOSAccessibility {
         Ok(Self {
             cache: ElementCache::new(),
             handles: HashMap::new(),
+            last_tree_pid: None,
             system_wide,
         })
     }
@@ -320,8 +393,33 @@ impl MacOSAccessibility {
         flags
     }
 
-    fn post_event(_pid: Option<u32>, event: &CGEvent) {
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+    fn set_event_target_pid(event: &CGEvent, pid: u32) {
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::EventTargetUnixProcessID,
+            pid as i64,
+        );
+    }
+
+    fn post_event(pid: Option<u32>, event: &CGEvent) {
+        if let Some(pid) = pid {
+            Self::set_event_target_pid(event, pid);
+            CGEvent::post_to_pid(pid as libc::pid_t, Some(event));
+        } else {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        }
+    }
+
+    fn post_event_to_pid_via_skylight(pid: u32, event: &CGEvent) -> bool {
+        let Some(post_to_pid) = skylight_event_post_to_pid() else {
+            return false;
+        };
+
+        Self::set_event_target_pid(event, pid);
+        unsafe {
+            post_to_pid(pid as libc::pid_t, Some(event));
+        }
+        true
     }
 
     fn post_key_event(
@@ -367,17 +465,139 @@ impl MacOSAccessibility {
         }
     }
 
+    fn mouse_button_number(button: crate::input::MouseButton) -> i64 {
+        match button {
+            crate::input::MouseButton::Left => 0,
+            crate::input::MouseButton::Right => 1,
+            crate::input::MouseButton::Middle => 2,
+        }
+    }
+
+    fn configure_mouse_event(
+        event: &CGEvent,
+        pid: Option<u32>,
+        button: crate::input::MouseButton,
+        click_state: i64,
+        pressure: f64,
+    ) {
+        if let Some(pid) = pid {
+            Self::set_event_target_pid(event, pid);
+            if let Some(window_id) = unsafe { Self::get_window_id_for_pid(pid) } {
+                CGEvent::set_integer_value_field(
+                    Some(event),
+                    CGEventField::MouseEventWindowUnderMousePointer,
+                    window_id as i64,
+                );
+                CGEvent::set_integer_value_field(
+                    Some(event),
+                    CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+                    window_id as i64,
+                );
+            }
+        }
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventButtonNumber,
+            Self::mouse_button_number(button),
+        );
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventClickState,
+            click_state,
+        );
+        CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventSubtype, 0);
+        CGEvent::set_double_value_field(Some(event), CGEventField::MouseEventPressure, pressure);
+    }
+
     fn post_mouse_event(
+        pid: Option<u32>,
         x: f64,
         y: f64,
         event_type: CGEventType,
         button: CGMouseButton,
+        input_button: crate::input::MouseButton,
+        click_state: i64,
+        pressure: f64,
     ) -> Result<()> {
         let point = objc2_core_foundation::CGPoint { x, y };
         let event = CGEvent::new_mouse_event(None, event_type, point, button)
             .ok_or_else(|| anyhow!("Failed to create mouse event"))?;
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        Self::configure_mouse_event(&event, pid, input_button, click_state, pressure);
+
+        if let Some(pid) = pid {
+            if Self::post_event_to_pid_via_skylight(pid, &event) {
+                return Ok(());
+            }
+            CGEvent::post_to_pid(pid as libc::pid_t, Some(&event));
+        } else {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        }
         Ok(())
+    }
+
+    fn post_chromium_activation_primer(pid: Option<u32>) -> Result<()> {
+        if pid.is_none() {
+            return Ok(());
+        }
+
+        Self::post_mouse_event(
+            pid,
+            -1.0,
+            -1.0,
+            CGEventType::LeftMouseDown,
+            CGMouseButton::Left,
+            crate::input::MouseButton::Left,
+            1,
+            1.0,
+        )?;
+        std::thread::sleep(Duration::from_millis(2));
+        Self::post_mouse_event(
+            pid,
+            -1.0,
+            -1.0,
+            CGEventType::LeftMouseUp,
+            CGMouseButton::Left,
+            crate::input::MouseButton::Left,
+            1,
+            0.0,
+        )?;
+        std::thread::sleep(Duration::from_millis(2));
+        Ok(())
+    }
+
+    fn post_mouse_click_sequence(
+        pid: Option<u32>,
+        x: f64,
+        y: f64,
+        button: crate::input::MouseButton,
+        click_state: i64,
+    ) -> Result<()> {
+        if pid.is_some() && button == crate::input::MouseButton::Left && click_state == 1 {
+            Self::post_chromium_activation_primer(pid)?;
+        }
+
+        let cg_button = Self::cg_mouse_button(button);
+        let (down_type, up_type) = Self::mouse_event_types(button);
+        Self::post_mouse_event(pid, x, y, down_type, cg_button, button, click_state, 1.0)?;
+        std::thread::sleep(Duration::from_millis(10));
+        Self::post_mouse_event(pid, x, y, up_type, cg_button, button, click_state, 0.0)
+    }
+
+    fn current_mouse_location() -> Result<objc2_core_foundation::CGPoint> {
+        let event =
+            CGEvent::new(None).ok_or_else(|| anyhow!("Failed to read current mouse location"))?;
+        Ok(CGEvent::location(Some(&event)))
+    }
+
+    unsafe fn get_pid_for_element(element: &AXUIElement) -> Option<u32> {
+        let mut pid: libc::pid_t = 0;
+        let pid_ptr = NonNull::new(&mut pid as *mut libc::pid_t).unwrap();
+        let result = element.pid(pid_ptr);
+        if result == AXError::Success && pid > 0 {
+            Some(pid as u32)
+        } else {
+            None
+        }
     }
 
     fn flatten_elements(element: &Element, elements: &mut Vec<Element>) {
@@ -738,47 +958,15 @@ impl MacOSAccessibility {
         windows
     }
 
-    /// Get the window title for a given PID using accessibility APIs.
-    unsafe fn get_window_title_for_pid(pid: u32) -> Option<String> {
-        let app = AXUIElement::new_application(pid as i32);
-
-        // Try main window first
-        if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
-            let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
-            if let Some(title) = Self::get_string_attribute(&window, AX_TITLE) {
-                if !title.is_empty() {
-                    return Some(title);
-                }
-            }
-        }
-
-        // Fall back to first window in windows array
-        if let Ok(windows_attr) = Self::get_attribute(&app, AX_WINDOWS) {
-            let windows: CFRetained<CFArray<AXUIElement>> =
-                CFRetained::cast_unchecked(windows_attr);
-            if windows.len() > 0 {
-                if let Some(window) = windows.get(0) {
-                    if let Some(title) = Self::get_string_attribute(&window, AX_TITLE) {
-                        if !title.is_empty() {
-                            return Some(title);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Get the main window bounds for a given PID using accessibility APIs.
-    unsafe fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
+    /// Get the main window for a given PID using accessibility APIs.
+    unsafe fn get_window_for_pid(pid: u32) -> Option<CFRetained<AXUIElement>> {
         let app = AXUIElement::new_application(pid as i32);
 
         if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
             let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
             if let Some(bounds) = Self::get_bounds(&window) {
                 if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
-                    return Some(bounds);
+                    return Some(window);
                 }
             }
         }
@@ -790,7 +978,7 @@ impl MacOSAccessibility {
                 if let Some(window) = windows.get(i) {
                     if let Some(bounds) = Self::get_bounds(&window) {
                         if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
-                            return Some(bounds);
+                            return Some(window);
                         }
                     }
                 }
@@ -798,6 +986,60 @@ impl MacOSAccessibility {
         }
 
         None
+    }
+
+    /// Get the window title for a given PID using accessibility APIs.
+    unsafe fn get_window_title_for_pid(pid: u32) -> Option<String> {
+        let window = Self::get_window_for_pid(pid)?;
+        Self::get_string_attribute(&window, AX_TITLE).filter(|title| !title.is_empty())
+    }
+
+    /// Get the main window bounds for a given PID using accessibility APIs.
+    unsafe fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
+        let window = Self::get_window_for_pid(pid)?;
+        Self::get_bounds(&window)
+            .filter(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
+    }
+
+    /// Resolve an AX window to its WindowServer ID using private AX SPI.
+    unsafe fn get_window_id(window: &AXUIElement) -> Option<CGWindowID> {
+        let get_window = ax_ui_element_get_window()?;
+        let mut window_id: CGWindowID = 0;
+        let result = get_window(window, &mut window_id);
+        if result == AXError::Success && window_id != 0 {
+            Some(window_id)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn get_window_id_for_pid(pid: u32) -> Option<CGWindowID> {
+        let window = Self::get_window_for_pid(pid)?;
+        Self::get_window_id(&window)
+    }
+
+    /// Capture a target window through WindowServer so occluding windows are not included.
+    fn capture_window_for_pid(pid: u32) -> Result<Option<Screenshot>> {
+        let window = unsafe { Self::get_window_for_pid(pid) };
+        let Some(window_id) = window
+            .as_deref()
+            .and_then(|window| unsafe { Self::get_window_id(window) })
+        else {
+            return Ok(None);
+        };
+
+        #[allow(deprecated)]
+        let image = objc2_core_graphics::CGWindowListCreateImage(
+            CGRect::ZERO,
+            CGWindowListOption::OptionIncludingWindow,
+            window_id,
+            CGWindowImageOption::BoundsIgnoreFraming | CGWindowImageOption::BestResolution,
+        );
+
+        image
+            .as_deref()
+            .map(Self::encode_cg_image_as_png)
+            .transpose()
     }
 
     /// Get the focused application's PID (fallback using AX APIs).
@@ -859,6 +1101,7 @@ impl AccessibilityReader for MacOSAccessibility {
                     )
                 }
             };
+            self.last_tree_pid = Some(actual_pid);
 
             // Build the tree
             let mut element_count = 0;
@@ -980,6 +1223,7 @@ impl AccessibilityReader for MacOSAccessibility {
     fn clear_cache(&mut self) {
         self.cache.clear();
         self.handles.clear();
+        self.last_tree_pid = None;
     }
 
     fn snapshot_version(&self) -> u64 {
@@ -1021,17 +1265,102 @@ impl AccessibilityReader for MacOSAccessibility {
 
     fn mouse_click_at(
         &mut self,
-        _pid: Option<u32>,
+        pid: Option<u32>,
         x: f64,
         y: f64,
         button: crate::input::MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
+        let result = Self::post_mouse_click_sequence(pid, x, y, button, 1);
+
+        std::future::ready(result)
+    }
+
+    fn press_key(
+        &mut self,
+        pid: Option<u32>,
+        key: Code,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = Self::post_key_event(pid, key, Modifiers::empty(), true);
+
+        std::future::ready(result)
+    }
+
+    fn release_key(
+        &mut self,
+        pid: Option<u32>,
+        key: Code,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = Self::post_key_event(pid, key, Modifiers::empty(), false);
+
+        std::future::ready(result)
+    }
+
+    fn mouse_move(
+        &mut self,
+        pid: Option<u32>,
+        x: f64,
+        y: f64,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = Self::post_mouse_event(
+            pid,
+            x,
+            y,
+            CGEventType::MouseMoved,
+            CGMouseButton::Left,
+            crate::input::MouseButton::Left,
+            0,
+            0.0,
+        );
+
+        std::future::ready(result)
+    }
+
+    fn mouse_click(
+        &mut self,
+        pid: Option<u32>,
+        button: crate::input::MouseButton,
+    ) -> impl std::future::Future<Output = Result<()>> {
         let result = (|| {
-            let cg_button = Self::cg_mouse_button(button);
-            let (down_type, up_type) = Self::mouse_event_types(button);
-            Self::post_mouse_event(x, y, down_type, cg_button)?;
-            std::thread::sleep(Duration::from_millis(10));
-            Self::post_mouse_event(x, y, up_type, cg_button)
+            let point = Self::current_mouse_location()?;
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
+        })();
+
+        std::future::ready(result)
+    }
+
+    fn mouse_double_click(
+        &mut self,
+        pid: Option<u32>,
+        button: crate::input::MouseButton,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = (|| {
+            let point = Self::current_mouse_location()?;
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
+            std::thread::sleep(Duration::from_millis(40));
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
+        })();
+
+        std::future::ready(result)
+    }
+
+    fn mouse_scroll(
+        &mut self,
+        pid: Option<u32>,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        let result = (|| {
+            let event = CGEvent::new_scroll_wheel_event2(
+                None,
+                CGScrollEventUnit::Pixel,
+                2,
+                delta_y.round() as i32,
+                delta_x.round() as i32,
+                0,
+            )
+            .ok_or_else(|| anyhow!("Failed to create scroll event"))?;
+            Self::post_event(pid, &event);
+            Ok(())
         })();
 
         std::future::ready(result)
@@ -1050,6 +1379,12 @@ impl AccessibilityReader for MacOSAccessibility {
     }
 
     fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
+        if let Some(pid) = pid {
+            if let Ok(Some(screenshot)) = Self::capture_window_for_pid(pid) {
+                return Ok(screenshot);
+            }
+        }
+
         let screenshot = Self::capture_main_display()?;
 
         if let Some(pid) = pid {

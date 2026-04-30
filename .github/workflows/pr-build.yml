@@ -40,9 +40,15 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: accessibility-cli-x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: accessibility-cli-aarch64-unknown-linux-gnu
           - os: windows-2025
             target: x86_64-pc-windows-msvc
             artifact_name: accessibility-cli-x86_64-pc-windows-msvc.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_name: accessibility-cli-aarch64-pc-windows-msvc.exe
           - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: accessibility-cli-aarch64-apple-darwin
@@ -111,17 +117,31 @@ jobs:
             gnome-calculator \
             dbus-x11 \
             libgtk-3-0
-      - name: Install Windows Calculator
+      # Windows setup: Ensure Calculator is available (windows-2025 has winget pre-installed)
+      - name: Setup Windows Calculator
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The windows-2025 runner image does not ship with the UWP Calculator.
-          # Install it via winget so calculator_windows_e2e can launch CalculatorApp.
-          winget install --id Microsoft.WindowsCalculator `
-            --accept-package-agreements --accept-source-agreements `
-            --silent --disable-interactivity
-          # Verify install succeeded.
-          Get-AppxPackage -Name Microsoft.WindowsCalculator | Format-List Name, PackageFullName
+          # Check if Windows Calculator is installed
+          $calc = Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction SilentlyContinue
+          if ($calc) {
+            Write-Host "Windows Calculator is already installed: $($calc.Version)"
+            exit 0
+          }
+
+          Write-Host "Windows Calculator not found, installing via winget..."
+
+          # Install via winget from msstore (winget 1.3+ can install free Store apps without auth)
+          winget install 9WZDNCRFHVN5 -s msstore --disable-interactivity --accept-source-agreements --accept-package-agreements
+
+          # Verify installation
+          $calc = Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction SilentlyContinue
+          if ($calc) {
+            Write-Host "Windows Calculator installed successfully: $($calc.Version)"
+          } else {
+            Write-Error "Failed to install Windows Calculator"
+            exit 1
+          }
       - name: Run Linux E2E
         if: runner.os == 'Linux'
         run: |

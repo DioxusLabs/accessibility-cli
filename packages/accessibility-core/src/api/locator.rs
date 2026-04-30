@@ -231,7 +231,16 @@ impl Locator {
     /// Waits for the element to be found, then performs a click action.
     pub async fn click(&self) -> SkyVMResult<Element> {
         let elem = self.poll_for_element().await?;
-        self.perform_action(elem.id, Action::Click, "click").await?;
+        {
+            let mut inner = self.inner.lock().await;
+            inner
+                .click_resolved_element(&elem)
+                .await
+                .map_err(|e: anyhow::Error| SkyVMError::ActionFailed {
+                    action: "click".to_string(),
+                    message: e.to_string(),
+                })?;
+        }
         Ok(elem)
     }
 

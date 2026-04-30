@@ -307,9 +307,9 @@ impl<'a> SelectorElement for ElementRef<'a> {
     }
 
     fn has_local_name(&self, local_name: &RoleName) -> bool {
-        match &local_name.role {
-            Some(role) => self.element.role == *role,
-            None => local_name.original == "*" || local_name.original.is_empty(), // Universal selector matches all
+        match local_name.original.as_str() {
+            "*" | "" => true,
+            name => super::roles::role_name_matches(name, self.element.role),
         }
     }
 
@@ -687,7 +687,7 @@ mod tests {
             version: 1,
             pid: None,
             app_name: None,
-            element_count: 4,
+            element_count: 6,
             root: Element {
                 id: ElementKey::from_ffi(1),
                 role: Role::Window,
@@ -749,6 +749,38 @@ mod tests {
                         enabled: true,
                         focused: false,
                         actions: vec!["Click".to_string()],
+                        children: vec![],
+                    },
+                    Element {
+                        id: ElementKey::from_ffi(5),
+                        role: Role::TextRun,
+                        title: None,
+                        description: None,
+                        value: Some("Static text".to_string()),
+                        url: None,
+                        help: None,
+                        role_description: None,
+                        identifier: None,
+                        bounds: Some(Rect::new(Point::new(10.0, 90.0), Size::new(200.0, 20.0))),
+                        enabled: true,
+                        focused: false,
+                        actions: vec![],
+                        children: vec![],
+                    },
+                    Element {
+                        id: ElementKey::from_ffi(6),
+                        role: Role::Label,
+                        title: Some("Label text".to_string()),
+                        description: None,
+                        value: None,
+                        url: None,
+                        help: None,
+                        role_description: None,
+                        identifier: None,
+                        bounds: Some(Rect::new(Point::new(10.0, 120.0), Size::new(200.0, 20.0))),
+                        enabled: true,
+                        focused: false,
+                        actions: vec![],
                         children: vec![],
                     },
                 ],
@@ -864,5 +896,30 @@ mod tests {
         let matches = find_matches(&sel, &tree);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, target_key);
+    }
+
+    #[test]
+    fn test_find_text_aliases() {
+        let tree = make_test_tree();
+
+        let sel = parse("TextRun").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].role, Role::TextRun);
+
+        let sel = parse("Text").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().any(|e| e.role == Role::TextRun));
+        assert!(matches.iter().any(|e| e.role == Role::Label));
+
+        let sel = parse("StaticText").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 2);
+
+        let sel = parse("Label").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].role, Role::Label);
     }
 }

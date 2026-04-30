@@ -11,6 +11,7 @@
 //!
 //! Examples:
 //!   accessibility-cli --platform mac --pid 123 --llm           # Query specific macOS app
+//!   accessibility-cli --platform mac --pid 123 --mouse-click 300,240  # Targeted macOS click
 //!   accessibility-cli --platform win --pid 123 --llm           # Query specific Windows app
 //!   accessibility-cli --platform ios --udid ABC --annotate     # Annotated iOS screenshot
 //!   accessibility-cli --platform ios --hid-tap 100,200         # HID tap on iOS Simulator
@@ -34,6 +35,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use accessibility_core::input::MouseButton;
 use accessibility_core::platform::AndroidExtensions;
 use accessibility_core::platform::android::AndroidAccessibility;
 #[cfg(target_os = "macos")]
@@ -633,6 +635,29 @@ async fn handle_hit_test(adapter: &mut TargetedAccessibility, x: f64, y: f64) {
     }
 }
 
+async fn handle_mouse_click(adapter: &mut TargetedAccessibility, click: &MouseClickParams) {
+    if !adapter.supports_mouse_click() {
+        eprintln!(
+            "Mouse clicks are not supported on {}",
+            adapter.platform_name()
+        );
+        std::process::exit(1);
+    }
+
+    match adapter.mouse_click_at(click.x, click.y, click.button).await {
+        Ok(()) => {
+            println!(
+                "Clicked at ({}, {}) with {} button",
+                click.x, click.y, click.button
+            );
+        }
+        Err(e) => {
+            eprintln!("Mouse click failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Parse event type filter strings to AccessibilityEventType.
 fn parse_event_type(s: &str) -> Option<AccessibilityEventType> {
     match s.to_lowercase().as_str() {
@@ -889,6 +914,11 @@ async fn run_platform(
         return;
     }
 
+    if let Some(click) = &args.mouse_click {
+        handle_mouse_click(adapter, click).await;
+        return;
+    }
+
     // Determine if we should use timeout polling
     let use_polling = args.timeout > 0 && operation_supports_timeout(args);
 
@@ -990,6 +1020,7 @@ Usage:
 
 Examples:
     accessibility-cli --platform mac --pid 123 --llm                    # Query specific macOS app
+    accessibility-cli --platform mac --pid 123 --mouse-click 300,240    # Background pixel click on macOS
     accessibility-cli --platform mac --key "cmd+c" "[title=Username]"   # Send Cmd+C to username field
     accessibility-cli --platform win --pid 123 --llm                    # Query specific Windows app
     accessibility-cli --platform win --key "ctrl+c" "[title=Username]"  # Send Ctrl+C to username field
@@ -1262,6 +1293,12 @@ pub struct CommonArgs {
     #[arg(long, num_args = 2)]
     key: Option<Vec<String>>,
 
+    /// Click at absolute screen coordinates.
+    /// Usage: --mouse-click x,y[,button]
+    /// Buttons: left, right, middle
+    #[arg(long, value_parser = parse_mouse_click)]
+    mouse_click: Option<MouseClickParams>,
+
     /// Listen for and log accessibility events in real-time
     /// Press Ctrl+C to stop listening
     #[arg(long)]
@@ -1293,6 +1330,14 @@ pub struct SwipeParams {
     pub duration_ms: u64,
 }
 
+/// Parameters for a mouse click.
+#[derive(Clone, Debug)]
+pub struct MouseClickParams {
+    pub x: f64,
+    pub y: f64,
+    pub button: MouseButton,
+}
+
 fn parse_coords(s: &str) -> Result<(f64, f64), String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 2 {
@@ -1307,6 +1352,32 @@ fn parse_coords(s: &str) -> Result<(f64, f64), String> {
         .parse()
         .map_err(|_| "Invalid y coordinate")?;
     Ok((x, y))
+}
+
+fn parse_mouse_click(s: &str) -> Result<MouseClickParams, String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return Err("Expected format: x,y[,button]".to_string());
+    }
+
+    let x = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid x coordinate")?;
+    let y = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid y coordinate")?;
+    let button = parts
+        .get(2)
+        .map(|button| {
+            MouseButton::from_name(button.trim())
+                .ok_or_else(|| "Invalid button; expected left, right, or middle".to_string())
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(MouseClickParams { x, y, button })
 }
 
 /// Parse swipe parameters from a string.

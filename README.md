@@ -8,3 +8,5 @@ This repository contains:
 - `accessibility-cli`: primary `accessibility-cli` command-line interface plus a public runner entrypoint for compatibility wrappers.
 
 The CLI preserves the existing operational surface from the SkyVM guest tooling while making the accessibility implementation reusable outside SkyVM.
+
+On macOS, PID-targeted keyboard input, pixel clicks, and window screenshots use per-process CoreGraphics/SkyLight paths when available. This lets automation act on a target app without moving the shared cursor or capturing unrelated occluding windows.

@@ -58,14 +58,6 @@ fn operational_flags_parse_before_backend_startup() {
         &[
             "--platform",
             "android",
-            "--focus",
-            "EditText",
-            "--timeout",
-            "0",
-        ],
-        &[
-            "--platform",
-            "android",
             "--type",
             "EditText",
             "hello",

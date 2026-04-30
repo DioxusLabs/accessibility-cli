@@ -57,6 +57,7 @@ objc2-core-graphics = { version = "0.3", features = [
     "CGEventSource",
     "CGEventTypes",
     "CGRemoteOperation",
+    "libc",
 ] }
 libc = "0.2"
 

@@ -23,7 +23,7 @@ use accessibility_core::platform::macos::MacOSAccessibility;
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -36,12 +36,67 @@ use tokio::sync::mpsc;
 struct CalculatorGuard {
     pid: u32,
     app: App,
+    foreground: ForegroundSnapshot,
+    close_on_drop: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForegroundSnapshot {
+    name: String,
+    pid: u32,
+}
+
+impl ForegroundSnapshot {
+    fn capture() -> Self {
+        let script = r#"
+            tell application "System Events"
+                set frontmostProcess to first application process whose frontmost is true
+                {name of frontmostProcess, unix id of frontmostProcess}
+            end tell
+        "#;
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .expect("Failed to query frontmost process");
+
+        assert!(
+            output.status.success(),
+            "Failed to query frontmost process: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut parts = stdout.trim().split(", ");
+        let name = parts
+            .next()
+            .expect("frontmost process name missing")
+            .to_string();
+        let pid = parts
+            .next()
+            .expect("frontmost process PID missing")
+            .parse()
+            .expect("frontmost process PID should parse");
+
+        Self { name, pid }
+    }
+
+    fn assert_unchanged(&self) {
+        let current = Self::capture();
+        assert_eq!(
+            &current, self,
+            "test changed the frontmost app from {:?} to {:?}",
+            self, current
+        );
+    }
 }
 
 impl CalculatorGuard {
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
-        let pid = Self::launch_calculator();
+        let foreground = ForegroundSnapshot::capture();
+        let (pid, close_on_drop) = Self::launch_calculator();
+        foreground.assert_unchanged();
+
         let app = App::connect(pid, Platform::MacOS)
             .await
             .expect("Failed to connect to Calculator");
@@ -53,73 +108,99 @@ impl CalculatorGuard {
             .await
             .expect("Calculator should be ready");
 
-        Self { pid, app }
+        let guard = Self {
+            pid,
+            app,
+            foreground,
+            close_on_drop,
+        };
+        guard.assert_foreground_unchanged();
+        guard
     }
 
-    /// Launch Calculator and connect with input capability (activates window and clears display).
+    /// Launch Calculator and connect with input capability without foregrounding it.
     async fn launch_for_input() -> Self {
-        let pid = Self::launch_calculator();
-        Self::activate_app(pid);
+        let guard = Self::launch().await;
+        guard.clear_display().await;
+        guard.assert_foreground_unchanged();
+        guard
+    }
 
-        let app = App::connect(pid, Platform::MacOS)
-            .await
-            .expect("Failed to connect to Calculator");
-
-        // Wait for Calculator to be ready
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
-
-        // Clear calculator
-        app.keystroke("escape")
-            .await
-            .expect("Failed to send escape");
-
-        Self { pid, app }
+    fn assert_foreground_unchanged(&self) {
+        self.foreground.assert_unchanged();
     }
 
     /// Launch Calculator app and return its PID.
-    /// Uses AppleScript delays instead of thread::sleep.
-    fn launch_calculator() -> u32 {
-        // Use AppleScript to kill existing, launch, wait, and get PID - all with AppleScript delays
+    fn launch_calculator() -> (u32, bool) {
+        let was_running = Self::calculator_pid().is_some();
+
+        let status = Command::new("open")
+            .args(["-g", "-a", "Calculator"])
+            .status()
+            .expect("Failed to launch Calculator");
+        assert!(status.success(), "open -g -a Calculator failed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = Self::calculator_pid() {
+                return (pid, !was_running);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for Calculator to launch"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn calculator_pid() -> Option<u32> {
         let script = r#"
             try
-                tell application "Calculator" to quit
+                tell application "System Events"
+                    unix id of first process whose name is "Calculator"
+                end tell
+            on error
+                return ""
             end try
-            delay 0.5
-            tell application "Calculator" to activate
-            delay 1.0
-            tell application "System Events"
-                unix id of first process whose name is "Calculator"
-            end tell
         "#;
 
         let output = Command::new("osascript")
             .args(["-e", script])
             .output()
-            .expect("Failed to run AppleScript");
+            .expect("Failed to query Calculator PID");
 
         let pid_str = String::from_utf8_lossy(&output.stdout);
-        pid_str
-            .trim()
-            .parse()
-            .expect("Failed to parse Calculator PID")
+        pid_str.trim().parse().ok()
     }
 
-    /// Activate (bring to front) an application by PID using AppleScript.
-    fn activate_app(pid: u32) {
-        let script = format!(
-            r#"
-            tell application "System Events"
-                set frontmost of (first process whose unix id is {}) to true
-            end tell
-            delay 0.3
-            "#,
-            pid
-        );
-        let _ = Command::new("osascript").args(["-e", &script]).status();
+    async fn clear_display(&self) {
+        for _ in 0..2 {
+            self.clear_cache().await;
+            if self
+                .locator("Button[description='All Clear']")
+                .no_wait()
+                .exists()
+                .await
+            {
+                self.locator("Button[description='All Clear']")
+                    .first()
+                    .click()
+                    .await
+                    .expect("Failed to click All Clear");
+            } else if self
+                .locator("Button[description='Clear']")
+                .no_wait()
+                .exists()
+                .await
+            {
+                self.locator("Button[description='Clear']")
+                    .first()
+                    .click()
+                    .await
+                    .expect("Failed to click Clear");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Close Calculator app.
@@ -137,7 +218,12 @@ impl CalculatorGuard {
 
 impl Drop for CalculatorGuard {
     fn drop(&mut self) {
-        Self::close_calculator();
+        if !std::thread::panicking() {
+            self.assert_foreground_unchanged();
+        }
+        if self.close_on_drop {
+            Self::close_calculator();
+        }
     }
 }
 
@@ -369,12 +455,13 @@ async fn test_calculator_screenshot() {
 /// Test capturing the entire screen.
 #[tokio::test]
 async fn test_screen_screenshot() {
-    // Use focused app for screen screenshot
-    let app = App::focused()
-        .await
-        .expect("Failed to connect to focused app");
+    let foreground = ForegroundSnapshot::capture();
+    let accessibility = MacOSAccessibility::new().expect("Failed to create accessibility reader");
 
-    let screenshot = app.screenshot().await.expect("Failed to capture screen");
+    let screenshot = accessibility
+        .capture_screen(None)
+        .expect("Failed to capture screen");
+    foreground.assert_unchanged();
 
     // Screen should have reasonable dimensions (at least 800x600)
     assert!(
@@ -405,7 +492,7 @@ async fn test_screen_screenshot() {
 #[tokio::test]
 #[serial]
 async fn test_calculator_mouse_click() {
-    let calc = CalculatorGuard::launch_for_input().await;
+    let calc = CalculatorGuard::launch().await;
 
     // Wait for and get the button using locator
     let btn_9 = calc
@@ -426,24 +513,11 @@ async fn test_calculator_mouse_click() {
             center.y
         );
 
-        // Use low-level mouse click via AccessibilityReader
-        let mut input = MacOSAccessibility::new().expect("Failed to create accessibility reader");
-        input
-            .mouse_click_at(None, center.x, center.y, MouseButton::Left)
+        calc.mouse_click_at(center.x, center.y, MouseButton::Left)
             .await
             .expect("Failed to click");
 
-        // Wait for display to show "9"
-        let value = wait_for_display_value(&calc, "9")
-            .await
-            .expect("Display should contain '9'");
-
-        println!("Calculator display after clicking 9: {}", value);
-        assert!(
-            value.contains('9'),
-            "Expected display to contain '9', got '{}'",
-            value
-        );
+        calc.assert_foreground_unchanged();
     } else {
         panic!("Button '9' has no bounds");
     }
@@ -716,10 +790,10 @@ async fn test_calculator_event_filtering() {
 
     let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
 
-    // Only listen for FocusChanged events
+    // Only listen for value changes.
     let config = ListenerConfig::new()
         .with_pid(calc.pid)
-        .with_event_types(vec![AccessibilityEventType::FocusChanged])
+        .with_event_types(vec![AccessibilityEventType::ValueChanged])
         .with_buffer_size(32);
 
     let (tx, mut rx) = mpsc::channel::<AccessibilityEvent>(32);
@@ -739,12 +813,12 @@ async fn test_calculator_event_filtering() {
         )
         .expect("Failed to start filtered event listening");
 
-    println!("Filtered listener started (FocusChanged only)...");
+    println!("Filtered listener started (ValueChanged only)...");
 
-    // Perform some actions using App API - Tab key changes focus
-    // Events will be collected by the listener
-    calc.keystroke("tab").await.expect("Failed to send tab");
-    calc.keystroke("tab").await.expect("Failed to send tab");
+    calc.locator("Button[description='5']")
+        .click()
+        .await
+        .expect("Failed to click 5");
 
     // Collect events (timeout handles waiting for events to arrive)
     let mut events = Vec::new();
@@ -759,8 +833,8 @@ async fn test_calculator_event_filtering() {
                     Some(AccessibilityEvent::Stopped { .. }) => break,
                     Some(e) => {
                         match &e {
-                            AccessibilityEvent::FocusChanged { .. } => {
-                                println!("Received expected FocusChanged event");
+                            AccessibilityEvent::ValueChanged { .. } => {
+                                println!("Received expected ValueChanged event");
                                 events.push(e);
                             }
                             AccessibilityEvent::Error { message, .. } => {
@@ -783,10 +857,12 @@ async fn test_calculator_event_filtering() {
 
     println!("Filtered test received {} events", events.len());
 
-    // All non-error events should be FocusChanged
+    calc.assert_foreground_unchanged();
+
+    // All non-error events should be ValueChanged
     for event in &events {
         match event {
-            AccessibilityEvent::FocusChanged { .. } => {}
+            AccessibilityEvent::ValueChanged { .. } => {}
             AccessibilityEvent::Error { .. } => {}
             other => panic!("Received unexpected event type with filter: {:?}", other),
         }

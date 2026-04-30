@@ -32,13 +32,25 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "heading" => Some(Role::Heading),
         "application" | "app" => Some(Role::Application),
         "scrollbar" => Some(Role::ScrollBar),
-        "label" | "text" | "statictext" => Some(Role::Label),
+        "label" => Some(Role::Label),
+        "textrun" => Some(Role::TextRun),
+        "text" | "statictext" => Some(Role::TextRun),
         "scrollview" => Some(Role::ScrollView),
         "genericcontainer" | "container" | "div" => Some(Role::GenericContainer),
         "progressbar" | "progress" => Some(Role::ProgressIndicator),
         "spinbutton" | "spinner" => Some(Role::SpinButton),
         "*" => None, // Universal selector
         _ => None,
+    }
+}
+
+/// Return whether a user-facing role name should match an AccessKit role.
+pub fn role_name_matches(name: &str, role: Role) -> bool {
+    match name.to_lowercase().as_str() {
+        "text" | "statictext" => matches!(role, Role::TextRun | Role::Label),
+        "label" => role == Role::Label,
+        "textrun" => role == Role::TextRun,
+        _ => parse_role_name(name) == Some(role),
     }
 }
 
@@ -115,8 +127,21 @@ mod tests {
         assert_eq!(parse_role_name("BUTTON"), Some(Role::Button));
         assert_eq!(parse_role_name("TextInput"), Some(Role::TextInput));
         assert_eq!(parse_role_name("input"), Some(Role::TextInput));
+        assert_eq!(parse_role_name("TextRun"), Some(Role::TextRun));
         assert_eq!(parse_role_name("*"), None);
         assert_eq!(parse_role_name("unknown"), None);
+    }
+
+    #[test]
+    fn test_role_name_matches_text_aliases() {
+        assert!(role_name_matches("Text", Role::TextRun));
+        assert!(role_name_matches("Text", Role::Label));
+        assert!(role_name_matches("StaticText", Role::TextRun));
+        assert!(role_name_matches("StaticText", Role::Label));
+        assert!(role_name_matches("TextRun", Role::TextRun));
+        assert!(!role_name_matches("TextRun", Role::Label));
+        assert!(role_name_matches("Label", Role::Label));
+        assert!(!role_name_matches("Label", Role::TextRun));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::accessibility::{
     Element, ElementTree, Rect, Screenshot, TargetedAccessibility, TreeFilter,
 };
+use crate::input::MouseButton;
 
 use super::config::{AppConfig, LocatorOptions, Platform};
 use super::error::{SkyVMError, SkyVMResult};
@@ -320,6 +321,21 @@ impl App {
             .await
             .map_err(|e: anyhow::Error| SkyVMError::ActionFailed {
                 action: "type_text".to_string(),
+                message: e.to_string(),
+            })
+    }
+
+    /// Click at absolute screen coordinates.
+    ///
+    /// On macOS, this is routed to the connected PID when possible so the shared
+    /// cursor and foreground app are left alone.
+    pub async fn mouse_click_at(&self, x: f64, y: f64, button: MouseButton) -> SkyVMResult<()> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .mouse_click_at(x, y, button)
+            .await
+            .map_err(|e: anyhow::Error| SkyVMError::ActionFailed {
+                action: "mouse_click_at".to_string(),
                 message: e.to_string(),
             })
     }
