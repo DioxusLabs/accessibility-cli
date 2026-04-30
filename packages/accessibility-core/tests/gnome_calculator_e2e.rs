@@ -21,7 +21,7 @@ use accessibility_core::api::{App, Platform};
 use accessibility_core::platform::x11::LinuxAccessibility;
 use serial_test::serial;
 use std::fs;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -90,12 +90,11 @@ fn find_dbus_from_atspi_registryd() -> Option<String> {
         if let Ok(environ) = fs::read(&environ_path) {
             // Parse null-separated environment variables
             for var in environ.split(|&b| b == 0) {
-                if let Ok(s) = std::str::from_utf8(var) {
-                    if let Some(addr) = s.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
-                        if !addr.is_empty() {
-                            return Some(addr.to_string());
-                        }
-                    }
+                if let Ok(s) = std::str::from_utf8(var)
+                    && let Some(addr) = s.strip_prefix("DBUS_SESSION_BUS_ADDRESS=")
+                    && !addr.is_empty()
+                {
+                    return Some(addr.to_string());
                 }
             }
         }
@@ -136,12 +135,13 @@ fn try_dbus_launch() -> Option<String> {
 struct CalculatorGuard {
     pid: u32,
     app: App,
+    child: Child,
 }
 
 impl CalculatorGuard {
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
-        let pid = Self::launch_calculator();
+        let (pid, child) = Self::launch_calculator();
 
         let app = App::connect(pid, Platform::Linux)
             .await
@@ -154,12 +154,12 @@ impl CalculatorGuard {
             .await
             .expect("Calculator should be ready");
 
-        Self { pid, app }
+        Self { pid, app, child }
     }
 
     /// Launch Calculator and connect with input capability (activates window).
     async fn launch_for_input() -> Self {
-        let pid = Self::launch_calculator();
+        let (pid, child) = Self::launch_calculator();
         Self::activate_app(pid);
 
         let app = App::connect(pid, Platform::Linux)
@@ -173,11 +173,11 @@ impl CalculatorGuard {
             .await
             .expect("Calculator should be ready");
 
-        Self { pid, app }
+        Self { pid, app, child }
     }
 
     /// Launch GNOME Calculator app and return its PID.
-    fn launch_calculator() -> u32 {
+    fn launch_calculator() -> (u32, Child) {
         // Auto-detect D-Bus session bus if not set
         ensure_dbus_session_bus();
 
@@ -202,7 +202,7 @@ impl CalculatorGuard {
         // Wait for it to initialize
         std::thread::sleep(Duration::from_millis(2500));
 
-        pid
+        (pid, child)
     }
 
     /// Activate (bring to front) an application by PID.
@@ -229,6 +229,8 @@ impl CalculatorGuard {
 
 impl Drop for CalculatorGuard {
     fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         Self::close_calculator();
     }
 }
@@ -465,10 +467,10 @@ async fn test_calculator_event_listener() {
             Box::new({
                 let tx = tx.clone();
                 move |event| {
-                    if !matches!(event, AccessibilityEvent::Stopped { .. }) {
-                        if let Ok(tx) = tx.lock() {
-                            let _ = tx.try_send(event);
-                        }
+                    if !matches!(event, AccessibilityEvent::Stopped { .. })
+                        && let Ok(tx) = tx.lock()
+                    {
+                        let _ = tx.try_send(event);
                     }
                 }
             }),
