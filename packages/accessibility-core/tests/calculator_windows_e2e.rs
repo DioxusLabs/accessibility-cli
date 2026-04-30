@@ -79,12 +79,17 @@ impl CalculatorGuard {
 
     /// Launch Windows Calculator app and return its PID.
     fn launch_calculator() -> u32 {
+        // Poll for the process up to ~15s — `Start-Process calculator:` returns
+        // immediately while the UWP host warms up, so a fixed sleep is flaky on CI.
         let script = r#"
             Stop-Process -Name CalculatorApp -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
             Start-Process calculator:
-            Start-Sleep -Seconds 3
-            (Get-Process -Name CalculatorApp -ErrorAction SilentlyContinue | Select-Object -First 1).Id
+            for ($i = 0; $i -lt 30; $i++) {
+                $proc = Get-Process -Name CalculatorApp -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($proc) { $proc.Id; exit 0 }
+                Start-Sleep -Milliseconds 500
+            }
         "#;
 
         let output = Command::new("powershell")
@@ -92,11 +97,17 @@ impl CalculatorGuard {
             .output()
             .expect("Failed to run PowerShell");
 
-        let pid_str = String::from_utf8_lossy(&output.stdout);
-        pid_str
-            .trim()
-            .parse()
-            .expect("Failed to parse Calculator PID")
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        trimmed.parse().unwrap_or_else(|err| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "Failed to launch Calculator and read its PID ({err}). \
+                 Is the Microsoft Store Calculator (CalculatorApp) installed?\n\
+                 PowerShell stdout: {stdout:?}\n\
+                 PowerShell stderr: {stderr:?}"
+            )
+        })
     }
 
     /// Activate (bring to front) the Calculator using PowerShell.

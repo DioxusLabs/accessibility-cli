@@ -111,6 +111,17 @@ jobs:
             gnome-calculator \
             dbus-x11 \
             libgtk-3-0
+      - name: Install Windows Calculator
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The windows-2025 runner image does not ship with the UWP Calculator.
+          # Install it via winget so calculator_windows_e2e can launch CalculatorApp.
+          winget install --id Microsoft.WindowsCalculator `
+            --accept-package-agreements --accept-source-agreements `
+            --silent --disable-interactivity
+          # Verify install succeeded.
+          Get-AppxPackage -Name Microsoft.WindowsCalculator | Format-List Name, PackageFullName
       - name: Run Linux E2E
         if: runner.os == 'Linux'
         run: |
