@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fast:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --lib --bins
+      - run: cargo test -p accessibility-cli --test cli_smoke
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: accessibility-cli-linux-x86_64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            artifact_name: accessibility-cli-windows-x86_64.exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact_name: accessibility-cli-macos-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact_name: accessibility-cli-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
+      - run: cargo build --release --target ${{ matrix.target }} -p accessibility-cli --bin accessibility-cli
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/accessibility-cli ${{ matrix.artifact_name }}
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: cp target/${{ matrix.target }}/release/accessibility-cli.exe ${{ matrix.artifact_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            test: gnome_calculator_e2e
+          - os: windows-2025
+            test: calculator_windows_e2e
+          - os: macos-15
+            test: calculator_e2e
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux E2E dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            libx11-xcb-dev \
+            xvfb \
+            at-spi2-core \
+            gnome-calculator \
+            dbus-x11 \
+            libgtk-3-0
+      - name: Run Linux E2E
+        if: runner.os == 'Linux'
+        run: |
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          export GTK_MODULES=gail:atk-bridge
+          export NO_AT_BRIDGE=0
+          /usr/libexec/at-spi2-registryd &
+          sleep 1
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p accessibility-core --test ${{ matrix.test }} -- --nocapture --test-threads=1
+      - name: Run Desktop E2E
+        if: runner.os != 'Linux'
+        run: cargo test -p accessibility-core --test ${{ matrix.test }} -- --nocapture --test-threads=1
