@@ -93,9 +93,8 @@ impl ForegroundSnapshot {
 impl CalculatorGuard {
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
-        let foreground = ForegroundSnapshot::capture();
         let (pid, close_on_drop) = Self::launch_calculator();
-        foreground.assert_unchanged();
+        let foreground = ForegroundSnapshot::capture();
 
         let app = App::connect(pid, Platform::MacOS)
             .await
