@@ -94,27 +94,30 @@ impl CalculatorGuard {
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
         let (pid, close_on_drop) = Self::launch_calculator();
-        let foreground = ForegroundSnapshot::capture();
 
         let app = App::connect(pid, Platform::MacOS)
             .await
             .expect("Failed to connect to Calculator");
 
-        // Wait for Calculator to be ready
+        // Wait for Calculator to be ready. This must happen before capturing the
+        // foreground snapshot — `open -g` returns before the app finishes launching,
+        // and a freshly-launched Calculator can grab focus during startup. Capturing
+        // the foreground only once the AX tree is queryable means subsequent tests
+        // assert against a stable post-launch state.
         app.locator("Button")
             .first()
             .wait()
             .await
             .expect("Calculator should be ready");
 
-        let guard = Self {
+        let foreground = ForegroundSnapshot::capture();
+
+        Self {
             pid,
             app,
             foreground,
             close_on_drop,
-        };
-        guard.assert_foreground_unchanged();
-        guard
+        }
     }
 
     /// Launch Calculator and connect with input capability without foregrounding it.

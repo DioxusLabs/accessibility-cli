@@ -36,20 +36,44 @@ struct CalculatorGuard {
 }
 
 impl CalculatorGuard {
+    /// Connect to Calculator and wait until UI Automation can find its window.
+    ///
+    /// `Stop-Process` + `Start-Process calculator:` returns as soon as the UWP
+    /// host process exists, but the UI Automation root may not yet enumerate the
+    /// hosted ApplicationFrameWindow. Retry both `connect` and `wait` until they
+    /// succeed or the deadline passes.
+    async fn connect_when_ready(pid: u32) -> App {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+
+        loop {
+            let last_error = match App::connect(pid, Platform::Windows).await {
+                Ok(app) => match app
+                    .locator("Button")
+                    .first()
+                    .with_timeout(Duration::from_secs(1))
+                    .wait()
+                    .await
+                {
+                    Ok(_) => return app,
+                    Err(err) => err.to_string(),
+                },
+                Err(err) => err.to_string(),
+            };
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Calculator should be ready: {}",
+                last_error
+            );
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Launch Calculator and connect to it, waiting for it to be ready.
     async fn launch() -> Self {
         let pid = Self::launch_calculator();
-        let app = App::connect(pid, Platform::Windows)
-            .await
-            .expect("Failed to connect to Calculator");
-
-        // Wait for Calculator to be ready
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
-
+        let app = Self::connect_when_ready(pid).await;
         Self { pid, app }
     }
 
@@ -58,16 +82,7 @@ impl CalculatorGuard {
         let pid = Self::launch_calculator();
         Self::activate_app();
 
-        let app = App::connect(pid, Platform::Windows)
-            .await
-            .expect("Failed to connect to Calculator");
-
-        // Wait for Calculator to be ready
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
+        let app = Self::connect_when_ready(pid).await;
 
         // Clear calculator
         app.keystroke("escape")
