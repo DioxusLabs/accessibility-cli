@@ -17,7 +17,7 @@ use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader,
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
 use accessibility_core::platform::msft::{
-    WindowsAccessibility, hide_blockers_at_point, hide_top_level_windows_by_title,
+    BlockerSpec, WindowsAccessibility, hide_blockers_at_point, hide_top_level_blockers,
 };
 use serial_test::serial;
 use std::process::Command;
@@ -448,23 +448,25 @@ async fn test_calculator_mouse_click() {
             .focus_window(calc.pid)
             .expect("Failed to focus Calculator");
 
-        // The windows-11-arm runner image floats a "Microsoft account" UWP
-        // popup above the desktop that aggressively respawns within ~500ms of
-        // being killed. PowerShell-based dismissal is too slow to win the race
-        // (the popup re-emerges before SendInput dispatches), so hide blockers
-        // in-process instead. Two passes: first hide any visible top-level
-        // window with a matching title (catches popups not yet under the
-        // cursor), then walk the window directly under the click point and
-        // hide whatever's there if its title still matches a blocker — there
-        // are multiple "Microsoft account" windows in different processes
-        // (Shell_OOBEProxy + Windows.UI.Core.CoreWindow) that don't all show
-        // up in a single EnumWindows pass.
-        let blockers = ["Microsoft account"];
-        let pre_hidden = hide_top_level_windows_by_title(&blockers);
+        // The windows-11-arm runner image floats OOBE / "Microsoft account"
+        // sign-in windows above the desktop that intercept synthetic clicks at
+        // calculator's coordinates. They come in several flavours from a few
+        // processes (Shell_OOBEProxy, UserOOBEWindowClass with empty title,
+        // Windows.UI.Core.CoreWindow titled "Microsoft account") and uncover
+        // each other as we hide them. Match by title OR class to catch the
+        // empty-title OOBE frame, and combine an EnumWindows pass with a
+        // point-driven pass that hides whatever's actually under the click
+        // pixel. ShowWindow(SW_HIDE) keeps the host alive so the OS doesn't
+        // respawn a fresh popup.
+        let blockers = BlockerSpec {
+            titles: &["Microsoft account"],
+            classes: &["Shell_OOBEProxy", "UserOOBEWindowClass"],
+        };
+        let pre_hidden = hide_top_level_blockers(&blockers);
         let point_hidden = hide_blockers_at_point(center.x, center.y, &blockers);
         if pre_hidden + point_hidden > 0 {
             println!(
-                "Hid {} blocker popup(s) before click ({} via title enum, {} at click point)",
+                "Hid {} blocker popup(s) before click ({} via enum, {} at click point)",
                 pre_hidden + point_hidden,
                 pre_hidden,
                 point_hidden

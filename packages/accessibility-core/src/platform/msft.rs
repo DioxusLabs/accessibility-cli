@@ -1396,9 +1396,37 @@ fn describe_window(hwnd: HWND) -> String {
     )
 }
 
-/// Hide every visible top-level window whose title matches one of the supplied
-/// blockers by calling `ShowWindow(SW_HIDE)`. Returns the number of windows
-/// that were hidden.
+/// Spec for matching a "blocker" window — used by the helpers below to decide
+/// whether a given hwnd should be hidden. A window matches if its title equals
+/// any string in `titles` OR its class equals any string in `classes`.
+pub struct BlockerSpec<'a> {
+    pub titles: &'a [&'a str],
+    pub classes: &'a [&'a str],
+}
+
+fn window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn matches_blocker(hwnd: HWND, spec: &BlockerSpec<'_>) -> bool {
+    let title = window_title(hwnd);
+    if spec.titles.iter().any(|t| *t == title) {
+        return true;
+    }
+    let class = window_class(hwnd);
+    spec.classes.iter().any(|c| *c == class)
+}
+
+/// Hide every visible top-level window matching `spec` by calling
+/// `ShowWindow(SW_HIDE)`. Returns the number of windows that were hidden.
 ///
 /// `ShowWindow(SW_HIDE)` is preferable to terminating the host process: a hidden
 /// window stops being returned by `WindowFromPoint`, so synthetic clicks land on
@@ -1407,15 +1435,12 @@ fn describe_window(hwnd: HWND) -> String {
 /// completes in microseconds — important when the popup respawns within a few
 /// hundred milliseconds of being killed (as observed on the windows-11-arm
 /// runner image).
-pub fn hide_top_level_windows_by_title(blocker_titles: &[&str]) -> usize {
+pub fn hide_top_level_blockers(spec: &BlockerSpec<'_>) -> usize {
     struct Ctx<'a> {
-        blockers: &'a [&'a str],
+        spec: &'a BlockerSpec<'a>,
         hidden: usize,
     }
-    let mut ctx = Ctx {
-        blockers: blocker_titles,
-        hidden: 0,
-    };
+    let mut ctx = Ctx { spec, hidden: 0 };
     unsafe extern "system" fn enum_proc(
         hwnd: HWND,
         lparam: windows::Win32::Foundation::LPARAM,
@@ -1424,12 +1449,9 @@ pub fn hide_top_level_windows_by_title(blocker_titles: &[&str]) -> usize {
         if !unsafe { IsWindowVisible(hwnd).as_bool() } {
             return true.into();
         }
-        let mut buf = [0u16; 256];
-        let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
-        let title = String::from_utf16_lossy(&buf[..len]);
-        if ctx.blockers.iter().any(|b| *b == title) {
+        if matches_blocker(hwnd, ctx.spec) {
             eprintln!(
-                "[hide_top_level_windows_by_title] hiding {}",
+                "[hide_top_level_blockers] hiding {}",
                 describe_window(hwnd)
             );
             let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
@@ -1443,15 +1465,16 @@ pub fn hide_top_level_windows_by_title(blocker_titles: &[&str]) -> usize {
 }
 
 /// Repeatedly probe the window directly under `point` and hide it (via its
-/// top-level root) if its title matches a blocker. Retries until the window at
-/// `point` is no longer a blocker or `max_attempts` is reached.
+/// top-level root) if it matches `spec`. Retries until the window at `point`
+/// is no longer a blocker or six attempts have run.
 ///
-/// Necessary because the windows-11-arm runner has multiple "Microsoft account"
-/// windows in different processes (Shell_OOBEProxy + Windows.UI.Core.CoreWindow)
-/// that aren't all caught by a single EnumWindows pass — one becomes visible
-/// after another is hidden. Driving the dismissal by what's actually under the
-/// click point is more reliable than enumerating top-level windows.
-pub fn hide_blockers_at_point(point_x: f64, point_y: f64, blocker_titles: &[&str]) -> usize {
+/// Necessary because the windows-11-arm runner has multiple OOBE windows in
+/// different classes/processes (Shell_OOBEProxy, UserOOBEWindowClass,
+/// Windows.UI.Core.CoreWindow titled "Microsoft account") layered over the
+/// click target — they don't all show up in a single EnumWindows pass and
+/// uncovering one reveals another. Driving the dismissal by what's actually
+/// under the click pixel handles them in z-order.
+pub fn hide_blockers_at_point(point_x: f64, point_y: f64, spec: &BlockerSpec<'_>) -> usize {
     let target_pt = POINT {
         x: point_x as i32,
         y: point_y as i32,
@@ -1462,14 +1485,12 @@ pub fn hide_blockers_at_point(point_x: f64, point_y: f64, blocker_titles: &[&str
         if hwnd.is_invalid() {
             break;
         }
-        let mut title_buf = [0u16; 256];
-        let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) } as usize;
-        let title = String::from_utf16_lossy(&title_buf[..title_len]);
-        if !blocker_titles.iter().any(|b| *b == title) {
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let to_test = if root.is_invalid() { hwnd } else { root };
+        if !matches_blocker(to_test, spec) && !matches_blocker(hwnd, spec) {
             break;
         }
-        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let to_hide = if root.is_invalid() { hwnd } else { root };
+        let to_hide = to_test;
         eprintln!(
             "[hide_blockers_at_point] hiding {}",
             describe_window(to_hide)
