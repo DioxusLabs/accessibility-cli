@@ -215,23 +215,24 @@ jobs:
           '@
           $blockers = @('Microsoft account')
           $hits = New-Object System.Collections.ArrayList
-          $proc = [WD+EnumProc]{
+          # Note: $pid is a PowerShell automatic read-only variable; use $procId.
+          $callback = [WD+EnumProc]{
               param($h, $l)
               if (-not [WD]::IsWindowVisible($h)) { return $true }
               $sb = New-Object System.Text.StringBuilder 512
               [void][WD]::GetWindowTextW($h, $sb, 512)
               $title = $sb.ToString()
               if ($blockers -contains $title) {
-                  $pid = 0
-                  [void][WD]::GetWindowThreadProcessId($h, [ref]$pid)
-                  [void]$hits.Add([pscustomobject]@{Title=$title; Pid=$pid})
+                  $procId = 0
+                  [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
+                  [void]$hits.Add([pscustomobject]@{Title=$title; ProcId=$procId})
               }
               return $true
           }
-          [void][WD]::EnumWindows($proc, [IntPtr]::Zero)
+          [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
           foreach ($hit in $hits) {
-              Write-Host "Killing blocker '$($hit.Title)' (PID $($hit.Pid))"
-              Stop-Process -Id $hit.Pid -Force -ErrorAction SilentlyContinue
+              Write-Host "Killing blocker '$($hit.Title)' (PID $($hit.ProcId))"
+              Stop-Process -Id $hit.ProcId -Force -ErrorAction SilentlyContinue
           }
           if ($hits.Count -eq 0) { Write-Host "No blocker popups found" }
       - name: Run Linux E2E
