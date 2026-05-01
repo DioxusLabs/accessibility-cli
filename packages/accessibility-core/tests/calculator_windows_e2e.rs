@@ -437,6 +437,15 @@ async fn test_calculator_mouse_click() {
 
         // Use low-level mouse click via AccessibilityReader
         let mut input = WindowsAccessibility::new().expect("Failed to create accessibility reader");
+
+        // Bring Calculator to the foreground so the absolute-coord click lands on it.
+        // `activate_app()` runs before connect, but subsequent UIA queries can shuffle
+        // focus on Windows-on-ARM CI; force it back via SetForegroundWindow + UIA SetFocus.
+        input
+            .focus_window(calc.pid)
+            .expect("Failed to focus Calculator");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         input
             .mouse_click_at(None, center.x, center.y, MouseButton::Left)
             .await
