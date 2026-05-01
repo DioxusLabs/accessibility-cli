@@ -49,8 +49,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
     SetForegroundWindow,
 };
 use windows::core::BSTR;
@@ -943,8 +943,31 @@ impl AccessibilityReader for WindowsAccessibility {
         y: f64,
         button: MouseButton,
     ) -> Result<()> {
-        // Windows doesn't support process-targeted input like macOS, so pid is ignored
-        self.mouse_move(None, x, y).await?;
+        // `SendInput` with `MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK` is silently
+        // unreliable in non-interactive sessions (CI runners, RDP without input
+        // forwarding) — the API call returns success but the cursor never moves,
+        // so the subsequent click lands wherever the cursor was previously. Drive
+        // the cursor with `SetCursorPos` instead, which is synchronous and works
+        // across session types. Verify the move actually took effect before
+        // dispatching the click so callers get a real error instead of a silent
+        // miss. Then send the click as a normal `SendInput` button event.
+        unsafe { SetCursorPos(x as i32, y as i32) }
+            .map_err(|e| anyhow::anyhow!("SetCursorPos({}, {}) failed: {:?}", x, y, e))?;
+
+        let mut actual = windows::Win32::Foundation::POINT::default();
+        unsafe { GetCursorPos(&mut actual) }
+            .map_err(|e| anyhow::anyhow!("GetCursorPos failed: {:?}", e))?;
+        let (target_x, target_y) = (x as i32, y as i32);
+        if (actual.x - target_x).abs() > 2 || (actual.y - target_y).abs() > 2 {
+            bail!(
+                "Cursor failed to move to ({}, {}); landed at ({}, {})",
+                target_x,
+                target_y,
+                actual.x,
+                actual.y
+            );
+        }
+
         self.mouse_click_internal(button)
     }
 
