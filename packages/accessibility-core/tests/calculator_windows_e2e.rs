@@ -136,6 +136,51 @@ impl CalculatorGuard {
             .status();
     }
 
+    /// Kill UWP popups (e.g. "Microsoft account" sign-in) that float above
+    /// Calculator on the windows-11-arm runner image and intercept synthetic
+    /// clicks at calculator's coordinates. The CI workflow does this once at
+    /// startup, but the popup respawns during the cargo build, so the
+    /// SendInput-based test needs to clear it again right before clicking.
+    fn dismiss_blocking_popups() {
+        let script = r#"
+            Add-Type -TypeDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+            using System.Text;
+            public class WD {
+                public delegate bool EnumProc(IntPtr h, IntPtr l);
+                [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+                [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+                public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+                [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+                [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            }
+'@ -ErrorAction SilentlyContinue
+            $blockers = @('Microsoft account')
+            $hits = New-Object System.Collections.ArrayList
+            $callback = [WD+EnumProc]{
+                param($h, $l)
+                if (-not [WD]::IsWindowVisible($h)) { return $true }
+                $sb = New-Object System.Text.StringBuilder 512
+                [void][WD]::GetWindowTextW($h, $sb, 512)
+                $title = $sb.ToString()
+                if ($blockers -contains $title) {
+                    $procId = 0
+                    [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
+                    [void]$hits.Add($procId)
+                }
+                return $true
+            }
+            [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
+            foreach ($procId in $hits) {
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            }
+        "#;
+        let _ = Command::new("powershell")
+            .args(["-Command", script])
+            .status();
+    }
+
     /// Close Calculator app.
     fn close_calculator() {
         let script = r#"
@@ -437,6 +482,11 @@ async fn test_calculator_mouse_click() {
 
         // Use low-level mouse click via AccessibilityReader
         let mut input = WindowsAccessibility::new().expect("Failed to create accessibility reader");
+
+        // Kill any "Microsoft account" UWP popup that may have respawned during
+        // the cargo build/run window — on the windows-11-arm runner it z-stacks
+        // above Calculator at the click point and eats the synthetic click.
+        CalculatorGuard::dismiss_blocking_popups();
 
         // Bring Calculator to the foreground so the absolute-coord click lands on it.
         // `activate_app()` runs before connect, but subsequent UIA queries can shuffle
