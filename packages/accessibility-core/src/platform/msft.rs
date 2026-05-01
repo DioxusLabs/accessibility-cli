@@ -49,9 +49,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetForegroundWindow,
+    SetForegroundWindow, WindowFromPoint,
 };
 use windows::core::BSTR;
 
@@ -943,12 +943,10 @@ impl AccessibilityReader for WindowsAccessibility {
         y: f64,
         button: MouseButton,
     ) -> Result<()> {
-        // Move + down + up dispatched as separate `SendInput` calls is unreliable
-        // for UWP apps: a previous move can be coalesced or processed out of order,
-        // so the down event arrives without the OS believing the cursor is over
-        // the target window, and the click never reaches the hosted XAML island.
-        // Encode the absolute target on every event and send all three in a single
-        // `SendInput` batch so the OS processes them atomically.
+        // Send move + down + up as one atomic `SendInput` batch with absolute
+        // coordinates on every event. Separate calls are flaky on UWP hosts
+        // because the OS can coalesce or reorder them, dispatching the down
+        // event before the cursor-tracking state has caught up.
         let screen_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f64;
         let screen_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f64;
         let screen_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
@@ -960,6 +958,34 @@ impl AccessibilityReader for WindowsAccessibility {
                 screen_height
             );
         }
+
+        let target_pt = POINT {
+            x: x as i32,
+            y: y as i32,
+        };
+        let target_hwnd = unsafe { WindowFromPoint(target_pt) };
+        let foreground_hwnd = unsafe { GetForegroundWindow() };
+        let mut target_pid: u32 = 0;
+        let mut foreground_pid: u32 = 0;
+        if !target_hwnd.is_invalid() {
+            unsafe { GetWindowThreadProcessId(target_hwnd, Some(&mut target_pid)) };
+        }
+        if !foreground_hwnd.is_invalid() {
+            unsafe { GetWindowThreadProcessId(foreground_hwnd, Some(&mut foreground_pid)) };
+        }
+        eprintln!(
+            "[mouse_click_at] target=({}, {}) virtdesk=({}x{} @ {},{}) WindowFromPoint=hwnd:{:?} pid:{} foreground=hwnd:{:?} pid:{}",
+            x,
+            y,
+            screen_width,
+            screen_height,
+            screen_x,
+            screen_y,
+            target_hwnd.0,
+            target_pid,
+            foreground_hwnd.0,
+            foreground_pid,
+        );
 
         let norm_x = ((x - screen_x) * 65535.0 / screen_width) as i32;
         let norm_y = ((y - screen_y) * 65535.0 / screen_height) as i32;
@@ -983,11 +1009,7 @@ impl AccessibilityReader for WindowsAccessibility {
                 },
             },
         };
-        let inputs = [
-            make(MOUSEEVENTF_MOVE),
-            make(down_flag),
-            make(up_flag),
-        ];
+        let inputs = [make(MOUSEEVENTF_MOVE), make(down_flag), make(up_flag)];
 
         let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if inserted as usize != inputs.len() {
@@ -995,6 +1017,14 @@ impl AccessibilityReader for WindowsAccessibility {
                 "SendInput inserted {}/{} mouse events",
                 inserted,
                 inputs.len()
+            );
+        }
+
+        let mut cursor = POINT::default();
+        if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+            eprintln!(
+                "[mouse_click_at] post-click cursor=({}, {})",
+                cursor.x, cursor.y
             );
         }
         Ok(())
