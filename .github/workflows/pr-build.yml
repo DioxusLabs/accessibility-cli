@@ -189,52 +189,6 @@ jobs:
             Write-Error "Failed to install Windows Calculator"
             exit 1
           }
-      - name: Dismiss Windows blocker popups
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # The windows-11-arm runner image often boots with a "Microsoft
-          # account" sign-in popup floating above the desktop (from OOBE / Store
-          # flows). It z-orders above Calculator and steals synthetic clicks at
-          # the calculator's coordinates, which breaks `mouse_click_at` tests
-          # while leaving UI Automation tests unaffected. Enumerate top-level
-          # visible windows and kill the host process for any whose title
-          # matches a known blocker.
-          Add-Type -TypeDefinition @'
-          using System;
-          using System.Runtime.InteropServices;
-          using System.Text;
-          public class WD {
-              public delegate bool EnumProc(IntPtr h, IntPtr l);
-              [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
-              [DllImport("user32.dll", CharSet=CharSet.Unicode)]
-              public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-              [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-              [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-          }
-          '@
-          $blockers = @('Microsoft account')
-          $hits = New-Object System.Collections.ArrayList
-          # Note: $pid is a PowerShell automatic read-only variable; use $procId.
-          $callback = [WD+EnumProc]{
-              param($h, $l)
-              if (-not [WD]::IsWindowVisible($h)) { return $true }
-              $sb = New-Object System.Text.StringBuilder 512
-              [void][WD]::GetWindowTextW($h, $sb, 512)
-              $title = $sb.ToString()
-              if ($blockers -contains $title) {
-                  $procId = 0
-                  [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
-                  [void]$hits.Add([pscustomobject]@{Title=$title; ProcId=$procId})
-              }
-              return $true
-          }
-          [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
-          foreach ($hit in $hits) {
-              Write-Host "Killing blocker '$($hit.Title)' (PID $($hit.ProcId))"
-              Stop-Process -Id $hit.ProcId -Force -ErrorAction SilentlyContinue
-          }
-          if ($hits.Count -eq 0) { Write-Host "No blocker popups found" }
       - name: Run Linux E2E
         if: runner.os == 'Linux'
         run: |

@@ -16,14 +16,99 @@
 use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader, ListenerConfig};
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
-use accessibility_core::platform::msft::{
-    BlockerSpec, WindowsAccessibility, hide_blockers_at_point, hide_top_level_blockers,
-};
+use accessibility_core::platform::msft::WindowsAccessibility;
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetWindowTextW, IsWindowVisible, SW_HIDE,
+    ShowWindow, WindowFromPoint,
+};
+
+// ============================================================================
+// CI-only blocker dismissal
+// ============================================================================
+//
+// The windows-11-arm runner image floats OOBE / "Microsoft account" sign-in
+// windows above the desktop that intercept synthetic clicks at calculator's
+// coordinates. They come from a few processes (Shell_OOBEProxy host,
+// UserOOBEWindowClass with empty title, Windows.UI.Core.CoreWindow titled
+// "Microsoft account") and uncover each other as we hide them. We hide them
+// (rather than killing the host process) so the OS doesn't immediately respawn
+// a fresh popup. Two passes — one over all top-level windows, one driven by
+// what's actually under the click pixel — to handle the layered z-order.
+
+/// A window matches if its title equals any string in `titles` OR its class
+/// equals any string in `classes`.
+struct BlockerSpec<'a> {
+    titles: &'a [&'a str],
+    classes: &'a [&'a str],
+}
+
+fn window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn matches_blocker(hwnd: HWND, spec: &BlockerSpec<'_>) -> bool {
+    spec.titles.iter().any(|t| *t == window_title(hwnd))
+        || spec.classes.iter().any(|c| *c == window_class(hwnd))
+}
+
+/// Hide every visible top-level window matching `spec`.
+fn hide_top_level_blockers(spec: &BlockerSpec<'_>) -> usize {
+    struct Ctx<'a> {
+        spec: &'a BlockerSpec<'a>,
+        hidden: usize,
+    }
+    let mut ctx = Ctx { spec, hidden: 0 };
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let ctx = unsafe { &mut *(lparam.0 as *mut Ctx) };
+        if unsafe { IsWindowVisible(hwnd).as_bool() } && matches_blocker(hwnd, ctx.spec) {
+            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            ctx.hidden += 1;
+        }
+        true.into()
+    }
+    let lparam = LPARAM(&mut ctx as *mut _ as isize);
+    let _ = unsafe { EnumWindows(Some(enum_proc), lparam) };
+    ctx.hidden
+}
+
+/// Repeatedly probe the window directly under `(x, y)` and hide its top-level
+/// root if it matches `spec`. Stops once the window at the point is no longer
+/// a blocker, or after six attempts.
+fn hide_blockers_at_point(x: f64, y: f64, spec: &BlockerSpec<'_>) -> usize {
+    let pt = POINT {
+        x: x as i32,
+        y: y as i32,
+    };
+    let mut hidden = 0;
+    for _ in 0..6 {
+        let hwnd = unsafe { WindowFromPoint(pt) };
+        if hwnd.is_invalid() {
+            break;
+        }
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let to_hide = if root.is_invalid() { hwnd } else { root };
+        if !matches_blocker(to_hide, spec) && !matches_blocker(hwnd, spec) {
+            break;
+        }
+        let _ = unsafe { ShowWindow(to_hide, SW_HIDE) };
+        hidden += 1;
+    }
+    hidden
+}
 
 // ============================================================================
 // Helper Functions

@@ -49,10 +49,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_HIDE, SetForegroundWindow, ShowWindow, WindowFromPoint,
+    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetForegroundWindow,
 };
 use windows::core::BSTR;
 
@@ -92,24 +91,12 @@ impl WindowsAccessibility {
         let element = self.find_root_for_pid(pid)?;
         let native_hwnd = unsafe { element.CurrentNativeWindowHandle()? };
         let hwnd = HWND(native_hwnd.0 as *mut _);
-        eprintln!(
-            "[focus_window] pid={} picked={}",
-            pid,
-            describe_window(hwnd)
-        );
 
         // Set focus via UI Automation first
-        let set_focus_res = unsafe { element.SetFocus() };
+        let _ = unsafe { element.SetFocus() };
 
         // Then bring window to foreground
-        let set_fg_res = unsafe { SetForegroundWindow(hwnd) };
-        let after_fg = unsafe { GetForegroundWindow() };
-        eprintln!(
-            "[focus_window] uia_set_focus_ok={} set_foreground={:?} foreground_now={}",
-            set_focus_res.is_ok(),
-            set_fg_res.as_bool(),
-            describe_window(after_fg)
-        );
+        let _ = unsafe { SetForegroundWindow(hwnd) };
 
         Ok(())
     }
@@ -970,25 +957,6 @@ impl AccessibilityReader for WindowsAccessibility {
             );
         }
 
-        let target_pt = POINT {
-            x: x as i32,
-            y: y as i32,
-        };
-        let target_hwnd = unsafe { WindowFromPoint(target_pt) };
-        let foreground_hwnd = unsafe { GetForegroundWindow() };
-        eprintln!(
-            "[mouse_click_at] target=({}, {}) virtdesk=({}x{} @ {},{})",
-            x, y, screen_width, screen_height, screen_x, screen_y
-        );
-        eprintln!(
-            "[mouse_click_at] WindowFromPoint pre={}",
-            describe_window(target_hwnd)
-        );
-        eprintln!(
-            "[mouse_click_at] foreground   pre={}",
-            describe_window(foreground_hwnd)
-        );
-
         let norm_x = ((x - screen_x) * 65535.0 / screen_width) as i32;
         let norm_y = ((y - screen_y) * 65535.0 / screen_height) as i32;
         let abs_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
@@ -1021,29 +989,6 @@ impl AccessibilityReader for WindowsAccessibility {
                 inputs.len()
             );
         }
-
-        // Re-check cursor + foreground + WindowFromPoint after the click to see
-        // whether the click landed where we asked, whether focus shifted, and
-        // whether anything (a popup, a hover panel) covered the calculator.
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
-            eprintln!("[mouse_click_at] post cursor=({}, {})", cursor.x, cursor.y);
-        }
-        let post_target = unsafe { WindowFromPoint(target_pt) };
-        let post_at_cursor = unsafe { WindowFromPoint(cursor) };
-        let post_foreground = unsafe { GetForegroundWindow() };
-        eprintln!(
-            "[mouse_click_at] WindowFromPoint(target) post={}",
-            describe_window(post_target)
-        );
-        eprintln!(
-            "[mouse_click_at] WindowFromPoint(cursor) post={}",
-            describe_window(post_at_cursor)
-        );
-        eprintln!(
-            "[mouse_click_at] foreground          post={}",
-            describe_window(post_foreground)
-        );
         Ok(())
     }
 
@@ -1355,147 +1300,6 @@ fn send_key_event(vk: VIRTUAL_KEY, key_up: bool) -> Result<()> {
         bail!("SendInput failed to insert keyboard event");
     }
     Ok(())
-}
-
-/// Format a window handle's class, title, PID, visibility and ancestor for diagnostics.
-///
-/// CI failures on `windows-11-arm` show synthetic clicks landing at the right
-/// pixel without registering on the calculator button; this helper lets the
-/// diagnostic output identify exactly which window the click is hitting.
-fn describe_window(hwnd: HWND) -> String {
-    if hwnd.is_invalid() {
-        return "<null>".to_string();
-    }
-    let mut class_buf = [0u16; 256];
-    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buf) } as usize;
-    let class = String::from_utf16_lossy(&class_buf[..class_len]);
-
-    let mut title_buf = [0u16; 256];
-    let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) } as usize;
-    let title = String::from_utf16_lossy(&title_buf[..title_len]);
-
-    let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-
-    let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-    let iconic = unsafe { IsIconic(hwnd).as_bool() };
-
-    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    let root_str = if root.is_invalid() || root.0 == hwnd.0 {
-        String::new()
-    } else {
-        let mut root_class_buf = [0u16; 256];
-        let root_class_len = unsafe { GetClassNameW(root, &mut root_class_buf) } as usize;
-        let root_class = String::from_utf16_lossy(&root_class_buf[..root_class_len]);
-        format!(" root=hwnd:{:?} class:'{}'", root.0, root_class)
-    };
-
-    format!(
-        "hwnd:{:?} class:'{}' title:'{}' pid:{} visible:{} iconic:{}{}",
-        hwnd.0, class, title, pid, visible, iconic, root_str
-    )
-}
-
-/// Spec for matching a "blocker" window — used by the helpers below to decide
-/// whether a given hwnd should be hidden. A window matches if its title equals
-/// any string in `titles` OR its class equals any string in `classes`.
-pub struct BlockerSpec<'a> {
-    pub titles: &'a [&'a str],
-    pub classes: &'a [&'a str],
-}
-
-fn window_class(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..len])
-}
-
-fn window_title(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..len])
-}
-
-fn matches_blocker(hwnd: HWND, spec: &BlockerSpec<'_>) -> bool {
-    let title = window_title(hwnd);
-    if spec.titles.iter().any(|t| *t == title) {
-        return true;
-    }
-    let class = window_class(hwnd);
-    spec.classes.iter().any(|c| *c == class)
-}
-
-/// Hide every visible top-level window matching `spec` by calling
-/// `ShowWindow(SW_HIDE)`. Returns the number of windows that were hidden.
-///
-/// `ShowWindow(SW_HIDE)` is preferable to terminating the host process: a hidden
-/// window stops being returned by `WindowFromPoint`, so synthetic clicks land on
-/// the underlying app, but the host stays alive and the OS does not respawn a
-/// fresh popup. Runs entirely from the calling thread (no PowerShell), so it
-/// completes in microseconds — important when the popup respawns within a few
-/// hundred milliseconds of being killed (as observed on the windows-11-arm
-/// runner image).
-pub fn hide_top_level_blockers(spec: &BlockerSpec<'_>) -> usize {
-    struct Ctx<'a> {
-        spec: &'a BlockerSpec<'a>,
-        hidden: usize,
-    }
-    let mut ctx = Ctx { spec, hidden: 0 };
-    unsafe extern "system" fn enum_proc(
-        hwnd: HWND,
-        lparam: windows::Win32::Foundation::LPARAM,
-    ) -> windows::core::BOOL {
-        let ctx = unsafe { &mut *(lparam.0 as *mut Ctx) };
-        if !unsafe { IsWindowVisible(hwnd).as_bool() } {
-            return true.into();
-        }
-        if matches_blocker(hwnd, ctx.spec) {
-            eprintln!("[hide_top_level_blockers] hiding {}", describe_window(hwnd));
-            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-            ctx.hidden += 1;
-        }
-        true.into()
-    }
-    let lparam = windows::Win32::Foundation::LPARAM(&mut ctx as *mut _ as isize);
-    let _ = unsafe { EnumWindows(Some(enum_proc), lparam) };
-    ctx.hidden
-}
-
-/// Repeatedly probe the window directly under `point` and hide it (via its
-/// top-level root) if it matches `spec`. Retries until the window at `point`
-/// is no longer a blocker or six attempts have run.
-///
-/// Necessary because the windows-11-arm runner has multiple OOBE windows in
-/// different classes/processes (Shell_OOBEProxy, UserOOBEWindowClass,
-/// Windows.UI.Core.CoreWindow titled "Microsoft account") layered over the
-/// click target — they don't all show up in a single EnumWindows pass and
-/// uncovering one reveals another. Driving the dismissal by what's actually
-/// under the click pixel handles them in z-order.
-pub fn hide_blockers_at_point(point_x: f64, point_y: f64, spec: &BlockerSpec<'_>) -> usize {
-    let target_pt = POINT {
-        x: point_x as i32,
-        y: point_y as i32,
-    };
-    let mut hidden = 0;
-    for _ in 0..6 {
-        let hwnd = unsafe { WindowFromPoint(target_pt) };
-        if hwnd.is_invalid() {
-            break;
-        }
-        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let to_test = if root.is_invalid() { hwnd } else { root };
-        if !matches_blocker(to_test, spec) && !matches_blocker(hwnd, spec) {
-            break;
-        }
-        let to_hide = to_test;
-        eprintln!(
-            "[hide_blockers_at_point] hiding {}",
-            describe_window(to_hide)
-        );
-        let _ = unsafe { ShowWindow(to_hide, SW_HIDE) };
-        hidden += 1;
-    }
-    hidden
 }
 
 /// Get the PID of the foreground window.
