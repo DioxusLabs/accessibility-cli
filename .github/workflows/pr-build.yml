@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,20 +33,18 @@ jobs:
       - run: cargo test -p accessibility-cli --test cli_smoke
 
   build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact_name: accessibility-cli-aarch64-unknown-linux-gnu
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            artifact_name: accessibility-cli-aarch64-pc-windows-msvc.exe
           - os: macos-15
             target: aarch64-apple-darwin
-            artifact_name: accessibility-cli-aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,21 +59,77 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
       - run: cargo build --release --target ${{ matrix.target }} -p accessibility-cli --bin accessibility-cli
-      - name: Rename binary (Unix)
+      - name: Stage binary (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/accessibility-cli dist/${{ matrix.artifact_name }}
-      - name: Rename binary (Windows)
+          cp "target/${{ matrix.target }}/release/accessibility-cli" \
+             "dist/accessibility-cli-${{ matrix.target }}"
+      - name: Stage binary (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/accessibility-cli.exe dist/${{ matrix.artifact_name }}
+          cp "target/${{ matrix.target }}/release/accessibility-cli.exe" \
+             "dist/accessibility-cli-${{ matrix.target }}.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/${{ matrix.artifact_name }}
+          path: dist/accessibility-cli-${{ matrix.target }}*
           if-no-files-found: error
+          retention-days: 7
+
+  publish-main-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Set release vars
+        id: vars
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "commit_tag=main-$short_sha" >> "$GITHUB_OUTPUT"
+      - name: Publish immutable main commit release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.commit_tag }}
+          target_commitish: ${{ github.sha }}
+          name: "main ${{ steps.vars.outputs.short_sha }}"
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            accessibility-cli built from main commit ${{ github.sha }}.
+      - name: Move rolling main tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: main
+          SHA: ${{ github.sha }}
+        run: |
+          if gh api --method PATCH "repos/${{ github.repository }}/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh api --method POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA"
+      - name: Publish rolling main release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: main
+          target_commitish: ${{ github.sha }}
+          name: "main (rolling)"
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            accessibility-cli — latest build from main.
 
   e2e:
     strategy:
@@ -108,12 +162,10 @@ jobs:
             gnome-calculator \
             dbus-x11 \
             libgtk-3-0
-      # Windows setup: Ensure Calculator is available (windows-2025 has winget pre-installed)
       - name: Setup Windows Calculator
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Check if Windows Calculator is installed
           $calc = Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction SilentlyContinue
           if ($calc) {
             Write-Host "Windows Calculator is already installed: $($calc.Version)"
@@ -122,10 +174,8 @@ jobs:
 
           Write-Host "Windows Calculator not found, installing via winget..."
 
-          # Install via winget from msstore (winget 1.3+ can install free Store apps without auth)
           winget install 9WZDNCRFHVN5 -s msstore --disable-interactivity --accept-source-agreements --accept-package-agreements
 
-          # Verify installation
           $calc = Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction SilentlyContinue
           if ($calc) {
             Write-Host "Windows Calculator installed successfully: $($calc.Version)"
