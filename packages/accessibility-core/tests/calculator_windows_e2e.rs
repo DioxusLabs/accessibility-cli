@@ -141,6 +141,10 @@ impl CalculatorGuard {
     /// clicks at calculator's coordinates. The CI workflow does this once at
     /// startup, but the popup respawns during the cargo build, so the
     /// SendInput-based test needs to clear it again right before clicking.
+    ///
+    /// Loops until either no blocker windows remain or 5 attempts have run —
+    /// the popup may respawn quickly, but each kill buys a window large enough
+    /// to dispatch a click.
     fn dismiss_blocking_popups() {
         let script = r#"
             Add-Type -TypeDefinition @'
@@ -157,23 +161,38 @@ impl CalculatorGuard {
             }
 '@ -ErrorAction SilentlyContinue
             $blockers = @('Microsoft account')
-            $hits = New-Object System.Collections.ArrayList
-            $callback = [WD+EnumProc]{
-                param($h, $l)
-                if (-not [WD]::IsWindowVisible($h)) { return $true }
-                $sb = New-Object System.Text.StringBuilder 512
-                [void][WD]::GetWindowTextW($h, $sb, 512)
-                $title = $sb.ToString()
-                if ($blockers -contains $title) {
-                    $procId = 0
-                    [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
-                    [void]$hits.Add($procId)
+            $blockerProcessNames = @('AccountsControlHost', 'WindowsHelloUI', 'CloudExperienceHostBroker')
+            for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                $hits = New-Object System.Collections.ArrayList
+                $callback = [WD+EnumProc]{
+                    param($h, $l)
+                    if (-not [WD]::IsWindowVisible($h)) { return $true }
+                    $sb = New-Object System.Text.StringBuilder 512
+                    [void][WD]::GetWindowTextW($h, $sb, 512)
+                    $title = $sb.ToString()
+                    if ($blockers -contains $title) {
+                        $procId = 0
+                        [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
+                        [void]$hits.Add(@{Title=$title; ProcId=$procId})
+                    }
+                    return $true
                 }
-                return $true
-            }
-            [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
-            foreach ($procId in $hits) {
-                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
+                foreach ($name in $blockerProcessNames) {
+                    Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+                        Write-Host "[dismiss_blocking_popups] killing process '$($_.Name)' (PID $($_.Id))"
+                        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                foreach ($hit in $hits) {
+                    Write-Host "[dismiss_blocking_popups] killing '$($hit.Title)' (PID $($hit.ProcId))"
+                    Stop-Process -Id $hit.ProcId -Force -ErrorAction SilentlyContinue
+                }
+                if ($hits.Count -eq 0) {
+                    if ($attempt -eq 0) { Write-Host "[dismiss_blocking_popups] no blockers found" }
+                    break
+                }
+                Start-Sleep -Milliseconds 150
             }
         "#;
         let _ = Command::new("powershell")
