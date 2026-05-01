@@ -1450,10 +1450,7 @@ pub fn hide_top_level_blockers(spec: &BlockerSpec<'_>) -> usize {
             return true.into();
         }
         if matches_blocker(hwnd, ctx.spec) {
-            eprintln!(
-                "[hide_top_level_blockers] hiding {}",
-                describe_window(hwnd)
-            );
+            eprintln!("[hide_top_level_blockers] hiding {}", describe_window(hwnd));
             let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
             ctx.hidden += 1;
         }

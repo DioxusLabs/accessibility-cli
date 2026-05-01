@@ -138,7 +138,6 @@ impl CalculatorGuard {
             .status();
     }
 
-
     /// Close Calculator app.
     fn close_calculator() {
         let script = r#"
