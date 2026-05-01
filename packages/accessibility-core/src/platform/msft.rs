@@ -49,8 +49,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
+    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetForegroundWindow,
 };
 use windows::core::BSTR;
@@ -943,32 +943,61 @@ impl AccessibilityReader for WindowsAccessibility {
         y: f64,
         button: MouseButton,
     ) -> Result<()> {
-        // `SendInput` with `MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK` is silently
-        // unreliable in non-interactive sessions (CI runners, RDP without input
-        // forwarding) — the API call returns success but the cursor never moves,
-        // so the subsequent click lands wherever the cursor was previously. Drive
-        // the cursor with `SetCursorPos` instead, which is synchronous and works
-        // across session types. Verify the move actually took effect before
-        // dispatching the click so callers get a real error instead of a silent
-        // miss. Then send the click as a normal `SendInput` button event.
-        unsafe { SetCursorPos(x as i32, y as i32) }
-            .map_err(|e| anyhow::anyhow!("SetCursorPos({}, {}) failed: {:?}", x, y, e))?;
-
-        let mut actual = windows::Win32::Foundation::POINT::default();
-        unsafe { GetCursorPos(&mut actual) }
-            .map_err(|e| anyhow::anyhow!("GetCursorPos failed: {:?}", e))?;
-        let (target_x, target_y) = (x as i32, y as i32);
-        if (actual.x - target_x).abs() > 2 || (actual.y - target_y).abs() > 2 {
+        // Move + down + up dispatched as separate `SendInput` calls is unreliable
+        // for UWP apps: a previous move can be coalesced or processed out of order,
+        // so the down event arrives without the OS believing the cursor is over
+        // the target window, and the click never reaches the hosted XAML island.
+        // Encode the absolute target on every event and send all three in a single
+        // `SendInput` batch so the OS processes them atomically.
+        let screen_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f64;
+        let screen_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f64;
+        let screen_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
+        let screen_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f64;
+        if screen_width <= 0.0 || screen_height <= 0.0 {
             bail!(
-                "Cursor failed to move to ({}, {}); landed at ({}, {})",
-                target_x,
-                target_y,
-                actual.x,
-                actual.y
+                "Virtual desktop reports non-positive dimensions ({} x {})",
+                screen_width,
+                screen_height
             );
         }
 
-        self.mouse_click_internal(button)
+        let norm_x = ((x - screen_x) * 65535.0 / screen_width) as i32;
+        let norm_y = ((y - screen_y) * 65535.0 / screen_height) as i32;
+        let abs_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        let (down_flag, up_flag) = match button {
+            MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        };
+
+        let make = |flags| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: norm_x,
+                    dy: norm_y,
+                    mouseData: 0,
+                    dwFlags: flags | abs_flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let inputs = [
+            make(MOUSEEVENTF_MOVE),
+            make(down_flag),
+            make(up_flag),
+        ];
+
+        let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if inserted as usize != inputs.len() {
+            bail!(
+                "SendInput inserted {}/{} mouse events",
+                inserted,
+                inputs.len()
+            );
+        }
+        Ok(())
     }
 
     async fn press_key(&mut self, _pid: Option<u32>, key: Code) -> Result<()> {
