@@ -1442,6 +1442,44 @@ pub fn hide_top_level_windows_by_title(blocker_titles: &[&str]) -> usize {
     ctx.hidden
 }
 
+/// Repeatedly probe the window directly under `point` and hide it (via its
+/// top-level root) if its title matches a blocker. Retries until the window at
+/// `point` is no longer a blocker or `max_attempts` is reached.
+///
+/// Necessary because the windows-11-arm runner has multiple "Microsoft account"
+/// windows in different processes (Shell_OOBEProxy + Windows.UI.Core.CoreWindow)
+/// that aren't all caught by a single EnumWindows pass — one becomes visible
+/// after another is hidden. Driving the dismissal by what's actually under the
+/// click point is more reliable than enumerating top-level windows.
+pub fn hide_blockers_at_point(point_x: f64, point_y: f64, blocker_titles: &[&str]) -> usize {
+    let target_pt = POINT {
+        x: point_x as i32,
+        y: point_y as i32,
+    };
+    let mut hidden = 0;
+    for _ in 0..6 {
+        let hwnd = unsafe { WindowFromPoint(target_pt) };
+        if hwnd.is_invalid() {
+            break;
+        }
+        let mut title_buf = [0u16; 256];
+        let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) } as usize;
+        let title = String::from_utf16_lossy(&title_buf[..title_len]);
+        if !blocker_titles.iter().any(|b| *b == title) {
+            break;
+        }
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let to_hide = if root.is_invalid() { hwnd } else { root };
+        eprintln!(
+            "[hide_blockers_at_point] hiding {}",
+            describe_window(to_hide)
+        );
+        let _ = unsafe { ShowWindow(to_hide, SW_HIDE) };
+        hidden += 1;
+    }
+    hidden
+}
+
 /// Get the PID of the foreground window.
 pub fn get_foreground_pid() -> Option<u32> {
     let hwnd = unsafe { GetForegroundWindow() };

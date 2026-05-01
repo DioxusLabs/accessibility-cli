@@ -16,7 +16,9 @@
 use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader, ListenerConfig};
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
-use accessibility_core::platform::msft::{WindowsAccessibility, hide_top_level_windows_by_title};
+use accessibility_core::platform::msft::{
+    WindowsAccessibility, hide_blockers_at_point, hide_top_level_windows_by_title,
+};
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -449,14 +451,25 @@ async fn test_calculator_mouse_click() {
         // The windows-11-arm runner image floats a "Microsoft account" UWP
         // popup above the desktop that aggressively respawns within ~500ms of
         // being killed. PowerShell-based dismissal is too slow to win the race
-        // (the popup re-emerges before SendInput dispatches), so hide any
-        // matching top-level windows in-process instead — `ShowWindow(SW_HIDE)`
-        // doesn't terminate the host so the OS doesn't trigger a fresh popup.
-        let hidden = hide_top_level_windows_by_title(&["Microsoft account"]);
-        if hidden > 0 {
-            println!("Hid {} blocker popup(s) before click", hidden);
+        // (the popup re-emerges before SendInput dispatches), so hide blockers
+        // in-process instead. Two passes: first hide any visible top-level
+        // window with a matching title (catches popups not yet under the
+        // cursor), then walk the window directly under the click point and
+        // hide whatever's there if its title still matches a blocker — there
+        // are multiple "Microsoft account" windows in different processes
+        // (Shell_OOBEProxy + Windows.UI.Core.CoreWindow) that don't all show
+        // up in a single EnumWindows pass.
+        let blockers = ["Microsoft account"];
+        let pre_hidden = hide_top_level_windows_by_title(&blockers);
+        let point_hidden = hide_blockers_at_point(center.x, center.y, &blockers);
+        if pre_hidden + point_hidden > 0 {
+            println!(
+                "Hid {} blocker popup(s) before click ({} via title enum, {} at click point)",
+                pre_hidden + point_hidden,
+                pre_hidden,
+                point_hidden
+            );
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         input
             .mouse_click_at(None, center.x, center.y, MouseButton::Left)
