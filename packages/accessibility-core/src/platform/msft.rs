@@ -49,10 +49,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetForegroundWindow, WindowFromPoint,
+    EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SW_HIDE, SetForegroundWindow, ShowWindow, WindowFromPoint,
 };
 use windows::core::BSTR;
 
@@ -1394,6 +1394,52 @@ fn describe_window(hwnd: HWND) -> String {
         "hwnd:{:?} class:'{}' title:'{}' pid:{} visible:{} iconic:{}{}",
         hwnd.0, class, title, pid, visible, iconic, root_str
     )
+}
+
+/// Hide every visible top-level window whose title matches one of the supplied
+/// blockers by calling `ShowWindow(SW_HIDE)`. Returns the number of windows
+/// that were hidden.
+///
+/// `ShowWindow(SW_HIDE)` is preferable to terminating the host process: a hidden
+/// window stops being returned by `WindowFromPoint`, so synthetic clicks land on
+/// the underlying app, but the host stays alive and the OS does not respawn a
+/// fresh popup. Runs entirely from the calling thread (no PowerShell), so it
+/// completes in microseconds — important when the popup respawns within a few
+/// hundred milliseconds of being killed (as observed on the windows-11-arm
+/// runner image).
+pub fn hide_top_level_windows_by_title(blocker_titles: &[&str]) -> usize {
+    struct Ctx<'a> {
+        blockers: &'a [&'a str],
+        hidden: usize,
+    }
+    let mut ctx = Ctx {
+        blockers: blocker_titles,
+        hidden: 0,
+    };
+    unsafe extern "system" fn enum_proc(
+        hwnd: HWND,
+        lparam: windows::Win32::Foundation::LPARAM,
+    ) -> windows::core::BOOL {
+        let ctx = unsafe { &mut *(lparam.0 as *mut Ctx) };
+        if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+            return true.into();
+        }
+        let mut buf = [0u16; 256];
+        let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
+        let title = String::from_utf16_lossy(&buf[..len]);
+        if ctx.blockers.iter().any(|b| *b == title) {
+            eprintln!(
+                "[hide_top_level_windows_by_title] hiding {}",
+                describe_window(hwnd)
+            );
+            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            ctx.hidden += 1;
+        }
+        true.into()
+    }
+    let lparam = windows::Win32::Foundation::LPARAM(&mut ctx as *mut _ as isize);
+    let _ = unsafe { EnumWindows(Some(enum_proc), lparam) };
+    ctx.hidden
 }
 
 /// Get the PID of the foreground window.

@@ -16,7 +16,7 @@
 use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader, ListenerConfig};
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
-use accessibility_core::platform::msft::WindowsAccessibility;
+use accessibility_core::platform::msft::{WindowsAccessibility, hide_top_level_windows_by_title};
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -136,69 +136,6 @@ impl CalculatorGuard {
             .status();
     }
 
-    /// Kill UWP popups (e.g. "Microsoft account" sign-in) that float above
-    /// Calculator on the windows-11-arm runner image and intercept synthetic
-    /// clicks at calculator's coordinates. The CI workflow does this once at
-    /// startup, but the popup respawns during the cargo build, so the
-    /// SendInput-based test needs to clear it again right before clicking.
-    ///
-    /// Loops until either no blocker windows remain or 5 attempts have run —
-    /// the popup may respawn quickly, but each kill buys a window large enough
-    /// to dispatch a click.
-    fn dismiss_blocking_popups() {
-        let script = r#"
-            Add-Type -TypeDefinition @'
-            using System;
-            using System.Runtime.InteropServices;
-            using System.Text;
-            public class WD {
-                public delegate bool EnumProc(IntPtr h, IntPtr l);
-                [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
-                [DllImport("user32.dll", CharSet=CharSet.Unicode)]
-                public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-                [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-                [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-            }
-'@ -ErrorAction SilentlyContinue
-            $blockers = @('Microsoft account')
-            $blockerProcessNames = @('AccountsControlHost', 'WindowsHelloUI', 'CloudExperienceHostBroker')
-            for ($attempt = 0; $attempt -lt 5; $attempt++) {
-                $hits = New-Object System.Collections.ArrayList
-                $callback = [WD+EnumProc]{
-                    param($h, $l)
-                    if (-not [WD]::IsWindowVisible($h)) { return $true }
-                    $sb = New-Object System.Text.StringBuilder 512
-                    [void][WD]::GetWindowTextW($h, $sb, 512)
-                    $title = $sb.ToString()
-                    if ($blockers -contains $title) {
-                        $procId = 0
-                        [void][WD]::GetWindowThreadProcessId($h, [ref]$procId)
-                        [void]$hits.Add(@{Title=$title; ProcId=$procId})
-                    }
-                    return $true
-                }
-                [void][WD]::EnumWindows($callback, [IntPtr]::Zero)
-                foreach ($name in $blockerProcessNames) {
-                    Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
-                        Write-Host "[dismiss_blocking_popups] killing process '$($_.Name)' (PID $($_.Id))"
-                        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-                    }
-                }
-                foreach ($hit in $hits) {
-                    Write-Host "[dismiss_blocking_popups] killing '$($hit.Title)' (PID $($hit.ProcId))"
-                    Stop-Process -Id $hit.ProcId -Force -ErrorAction SilentlyContinue
-                }
-                if ($hits.Count -eq 0) {
-                    if ($attempt -eq 0) { Write-Host "[dismiss_blocking_popups] no blockers found" }
-                    break
-                }
-                Start-Sleep -Milliseconds 150
-            }
-        "#;
-        let _ = Command::new("powershell")
-            .args(["-Command", script])
-            .status();
-    }
 
     /// Close Calculator app.
     fn close_calculator() {
@@ -502,18 +439,24 @@ async fn test_calculator_mouse_click() {
         // Use low-level mouse click via AccessibilityReader
         let mut input = WindowsAccessibility::new().expect("Failed to create accessibility reader");
 
-        // Kill any "Microsoft account" UWP popup that may have respawned during
-        // the cargo build/run window — on the windows-11-arm runner it z-stacks
-        // above Calculator at the click point and eats the synthetic click.
-        CalculatorGuard::dismiss_blocking_popups();
-
         // Bring Calculator to the foreground so the absolute-coord click lands on it.
         // `activate_app()` runs before connect, but subsequent UIA queries can shuffle
         // focus on Windows-on-ARM CI; force it back via SetForegroundWindow + UIA SetFocus.
         input
             .focus_window(calc.pid)
             .expect("Failed to focus Calculator");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The windows-11-arm runner image floats a "Microsoft account" UWP
+        // popup above the desktop that aggressively respawns within ~500ms of
+        // being killed. PowerShell-based dismissal is too slow to win the race
+        // (the popup re-emerges before SendInput dispatches), so hide any
+        // matching top-level windows in-process instead — `ShowWindow(SW_HIDE)`
+        // doesn't terminate the host so the OS doesn't trigger a fresh popup.
+        let hidden = hide_top_level_windows_by_title(&["Microsoft account"]);
+        if hidden > 0 {
+            println!("Hid {} blocker popup(s) before click", hidden);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         input
             .mouse_click_at(None, center.x, center.y, MouseButton::Left)
