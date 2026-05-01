@@ -39,10 +39,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+          - os: macos-15
+            target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
     steps:
@@ -53,11 +59,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install musl-tools
+        if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
+          sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }} -p accessibility-cli --bin accessibility-cli
       - name: Stage binary (Unix)
         if: runner.os != 'Windows'
