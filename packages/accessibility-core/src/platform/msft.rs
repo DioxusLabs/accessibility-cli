@@ -1027,10 +1027,7 @@ impl AccessibilityReader for WindowsAccessibility {
         // whether anything (a popup, a hover panel) covered the calculator.
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
-            eprintln!(
-                "[mouse_click_at] post cursor=({}, {})",
-                cursor.x, cursor.y
-            );
+            eprintln!("[mouse_click_at] post cursor=({}, {})", cursor.x, cursor.y);
         }
         let post_target = unsafe { WindowFromPoint(target_pt) };
         let post_at_cursor = unsafe { WindowFromPoint(cursor) };
