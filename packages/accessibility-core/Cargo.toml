@@ -1,0 +1,90 @@
+[package]
+name = "accessibility-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cross-platform accessibility tree reading, querying, screenshots, and input automation for macOS, Windows, Linux, iOS Simulator, and Android."
+readme = "../../README.md"
+keywords = ["accessibility", "automation", "ui", "ax", "ui-automation"]
+categories = ["accessibility", "gui", "os"]
+
+[dependencies]
+ab_glyph.workspace = true
+accesskit.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+cssparser.workspace = true
+euclid.workspace = true
+image.workspace = true
+imageproc.workspace = true
+keyboard-types.workspace = true
+quick-xml.workspace = true
+selectors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slotmap.workspace = true
+tokio.workspace = true
+viuer.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = [
+    "CFString",
+    "CFArray",
+    "CFCGTypes",
+    "CFBase",
+    "CFRunLoop",
+] }
+objc2-application-services = { version = "0.3", features = [
+    "AXUIElement",
+    "AXValue",
+    "AXError",
+    "libc",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGDirectDisplay",
+    "CGWindow",
+    "CGImage",
+    "CGColorSpace",
+    "CGDataProvider",
+    "CGBitmapContext",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
+    "libc",
+] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi.workspace = true
+atspi-common.workspace = true
+futures-lite.workspace = true
+x11rb.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tokio.workspace = true

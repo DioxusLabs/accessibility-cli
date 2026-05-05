@@ -1,0 +1,22 @@
+[package]
+name = "accessibility-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform accessibility tree inspection and automation CLI"
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+accessibility-core.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[[bin]]
+name = "accessibility-cli"
+path = "src/main.rs"
