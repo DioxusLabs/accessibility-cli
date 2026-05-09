@@ -96,43 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Apple private-framework usage
-
-Some platform backends call into Apple frameworks that are not part of the
-public SDK and may break or be denied at runtime under future macOS / Xcode
-releases:
-
-- **macOS**: `SkyLight.framework` is used (via `dlopen`/`dlsym`) to post
-  per-process keyboard and mouse events without moving the shared cursor.
-  When the symbol is unavailable, code falls back to public CoreGraphics
-  paths.
-- **iOS Simulator**: `AccessibilityPlatformTranslation.framework`,
-  `CoreSimulator.framework`, and the SimulatorKit Indigo HID symbols are
-  loaded from the active Xcode toolchain. The simulator backend will not
-  start without Xcode installed and at least one booted simulator runtime.
-
-These backends are best treated as **experimental** — pin a known-good
-Xcode / macOS combination if you depend on them in CI, and expect to
-revisit them on each major OS release.
-
-## Safety and privacy
-
-`accessibility-cli` is a powerful automation tool. It can:
-
-- Read the full accessibility tree of any application you have permission
-  to inspect (titles, values, descriptions of every element).
-- Capture window or screen screenshots.
-- Inject keyboard, mouse, and touch input into target applications.
-
-Because of this, the OS treats it like an assistive technology and gates it
-behind permission prompts (macOS Accessibility, Linux AT-SPI, Android ADB
-debugging). Only run it against applications and devices you control.
-
-The CLI does **not** send telemetry, phone home, or open any network
-connections of its own. It only talks to the OS-level accessibility APIs,
-to ADB on Android, and to local Apple frameworks for the iOS Simulator
-backend.
-
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build/test instructions and
