@@ -20,7 +20,7 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPro
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CGRect};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGImage,
+    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventType, CGImage,
     CGMainDisplayID, CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption,
     CGWindowListOption,
 };
@@ -401,13 +401,21 @@ impl MacOSAccessibility {
         );
     }
 
-    fn post_event(pid: Option<u32>, event: &CGEvent) {
-        if let Some(pid) = pid {
-            Self::set_event_target_pid(event, pid);
-            CGEvent::post_to_pid(pid as libc::pid_t, Some(event));
-        } else {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+    /// Deliver a synthetic CGEvent to a specific process via SkyLight.
+    ///
+    /// SkyLight per-PID delivery is the only public-ish path that doesn't
+    /// steal focus. The public CGEvent post APIs silently activate the
+    /// target, so falling back to them would mask focus-stealing regressions
+    /// — we bail instead. Callers must pass a concrete pid; global delivery
+    /// isn't supported here.
+    fn post_event(pid: Option<u32>, event: &CGEvent) -> Result<()> {
+        let pid = pid.ok_or_else(|| {
+            anyhow!("post_event requires a target pid on macOS (SkyLight has no global path)")
+        })?;
+        if !Self::post_event_to_pid_via_skylight(pid, event) {
+            bail!("SkyLight SLEventPostToPid is unavailable; refusing to fall back to a focus-stealing post");
         }
+        Ok(())
     }
 
     fn post_event_to_pid_via_skylight(pid: u32, event: &CGEvent) -> bool {
@@ -434,21 +442,12 @@ impl MacOSAccessibility {
             .ok_or_else(|| anyhow!("Failed to create keyboard event"))?;
         CGEvent::set_flags(Some(&event), Self::modifier_flags(modifiers));
 
-        // Prefer SkyLight per-process delivery for symmetry with mouse events
-        // and so apps that respect per-process key routing receive the event.
-        // Note: even with SkyLight delivery, AppKit-based apps will drop key
-        // events that arrive while they are not frontmost — that's an OS-level
-        // policy we can't override here. Callers driving a backgrounded app
-        // should invoke the equivalent action (e.g. click the Equals button)
-        // rather than send a key like Return.
-        if let Some(pid) = pid
-            && Self::post_event_to_pid_via_skylight(pid, &event)
-        {
-            return Ok(());
-        }
-
-        Self::post_event(pid, &event);
-        Ok(())
+        // Even with SkyLight per-PID delivery, AppKit-based apps drop key
+        // events that arrive while they are not frontmost — that's an
+        // OS-level policy we can't override. Callers driving a backgrounded
+        // app should invoke the equivalent action (e.g. click the Equals
+        // button) rather than send a key like Return.
+        Self::post_event(pid, &event)
     }
 
     fn post_keystroke(pid: Option<u32>, code: Code, modifiers: Modifiers) -> Result<()> {
@@ -538,16 +537,7 @@ impl MacOSAccessibility {
         let event = CGEvent::new_mouse_event(None, event_type, point, button)
             .ok_or_else(|| anyhow!("Failed to create mouse event"))?;
         Self::configure_mouse_event(&event, pid, input_button, click_state, pressure);
-
-        if let Some(pid) = pid {
-            if Self::post_event_to_pid_via_skylight(pid, &event) {
-                return Ok(());
-            }
-            CGEvent::post_to_pid(pid as libc::pid_t, Some(&event));
-        } else {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-        }
-        Ok(())
+        Self::post_event(pid, &event)
     }
 
     fn post_chromium_activation_primer(pid: Option<u32>) -> Result<()> {
@@ -1256,6 +1246,29 @@ impl AccessibilityReader for MacOSAccessibility {
                 return Ok(());
             }
 
+            // AXPress on a menu goes through AppKit's menu-tracking path and
+            // promotes the owning app to key. Deliver a synthetic mouse click
+            // via the SkyLight per-PID path instead, which keeps focus put.
+            if matches!(action, Action::Click)
+                && let Some(element) = self.cache.get(id)
+                && matches!(
+                    element.role,
+                    Role::Menu | Role::MenuItem | Role::MenuBar
+                )
+                && let Some(bounds) = element.bounds
+                && let Some(pid) = unsafe { Self::get_pid_for_element(handle) }
+            {
+                let x = bounds.origin.x + bounds.size.width / 2.0;
+                let y = bounds.origin.y + bounds.size.height / 2.0;
+                return Self::post_mouse_click_sequence(
+                    Some(pid),
+                    x,
+                    y,
+                    crate::input::MouseButton::Left,
+                    1,
+                );
+            }
+
             // Safety: We're calling AXUIElement methods with valid handles
             unsafe {
                 // Map action to AX action string
@@ -1475,8 +1488,7 @@ impl AccessibilityReader for MacOSAccessibility {
                 0,
             )
             .ok_or_else(|| anyhow!("Failed to create scroll event"))?;
-            Self::post_event(pid, &event);
-            Ok(())
+            Self::post_event(pid, &event)
         })();
 
         std::future::ready(result)

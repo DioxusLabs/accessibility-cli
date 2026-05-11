@@ -520,6 +520,32 @@ async fn test_calculator_mouse_click() {
     }
 }
 
+/// Mouse scroll against a backgrounded app must not steal focus.
+///
+/// Regression guard for the SkyLight routing fix in `post_event`: scroll
+/// events used to bypass `SLEventPostToPid` and go through the public
+/// `CGEvent::post_to_pid`, which activates the target.
+#[tokio::test]
+#[serial_test::file_serial(calculator)]
+async fn test_calculator_mouse_scroll_keeps_focus() {
+    let calc = CalculatorGuard::launch().await;
+
+    let mut accessibility =
+        MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
+
+    // A handful of scrolls so a missed SkyLight delivery would have a clear
+    // chance to promote Calculator to key.
+    for _ in 0..3 {
+        accessibility
+            .mouse_scroll(Some(calc.pid), 0.0, -3.0)
+            .await
+            .expect("mouse_scroll failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    calc.assert_foreground_unchanged();
+}
+
 /// Test finding elements by various properties using locators.
 #[tokio::test]
 #[serial_test::file_serial(calculator)]
