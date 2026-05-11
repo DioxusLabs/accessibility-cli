@@ -365,6 +365,11 @@ async fn handle_common_operations(
         return perform_element_action(adapter, tree, target, "click").await;
     }
 
+    // Handle press (alias for click)
+    if let Some(ref target) = args.press {
+        return perform_element_action(adapter, tree, target, "press").await;
+    }
+
     // Handle focus
     if let Some(ref target) = args.focus {
         return perform_element_action_focus(adapter, tree, target).await;
@@ -915,6 +920,7 @@ async fn handle_event_listening(
 fn operation_supports_timeout(args: &CommonArgs) -> bool {
     args.query.is_some()
         || args.click.is_some()
+        || args.press.is_some()
         || args.focus.is_some()
         || args.blur.is_some()
         || args.type_value.is_some()
@@ -1096,10 +1102,6 @@ pub struct Cli {
     /// Test framework loading only (iOS only)
     #[arg(long)]
     pub test_load: bool,
-
-    /// Press element by ID (iOS accessibility)
-    #[arg(long)]
-    pub press: Option<u64>,
 
     /// Tap at coordinates via accessibility (x,y) (iOS only)
     #[arg(long, value_parser = parse_coords)]
@@ -1307,6 +1309,11 @@ pub struct CommonArgs {
     #[arg(long)]
     click: Option<String>,
 
+    /// Press element by query (alias for --click)
+    /// Examples: --press "Button", --press "[title=Submit]"
+    #[arg(long)]
+    press: Option<String>,
+
     /// Focus element by query
     /// Examples: --focus "TextField", --focus "[title=Search]"
     #[arg(long)]
@@ -1501,7 +1508,7 @@ fn build_filter(common: &CommonArgs) -> TreeFilter {
 /// instead of running the requested tap — the iOS/HID/ADB flags are only
 /// consumed inside their respective platform arms.
 fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
-    let ios_only_set = cli.test_load || cli.press.is_some() || cli.tap.is_some();
+    let ios_only_set = cli.test_load || cli.tap.is_some();
     #[cfg(target_os = "macos")]
     let hid_set = cli.hid.hid_tap.is_some()
         || cli.hid.hid_swipe.is_some()
@@ -1531,7 +1538,7 @@ fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
 
     if (ios_only_set || hid_set) && cli.platform != PlatformType::IOS {
         return Err(
-            "iOS-only flags (--tap, --press, --test-load, --hid-*) require --platform ios".into(),
+            "iOS-only flags (--tap, --test-load, --hid-*) require --platform ios".into(),
         );
     }
     if adb_set && cli.platform != PlatformType::Android {
@@ -1790,25 +1797,16 @@ fn handle_ios_specific(adapter: &mut IOSSimulatorAccessibility, cli: &Cli) -> bo
 
     // Handle iOS-specific accessibility tap
     if let Some((x, y)) = cli.tap {
+        // tap() requires a dispatcher token that's only registered by get_tree().
+        if let Err(e) = adapter.get_tree(&TreeFilter::default()) {
+            eprintln!("Tap failed: could not register simulator token: {}", e);
+            std::process::exit(1);
+        }
         println!("Tapping at ({}, {})...", x, y);
         match adapter.tap(x, y) {
             Ok(()) => println!("Tap successful!"),
             Err(e) => {
                 eprintln!("Tap failed: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return true;
-    }
-
-    // Handle press by ID
-    if let Some(id) = cli.press {
-        println!("Pressing element {}...", id);
-        let key = accessibility_core::accessibility::ElementKey::from_ffi(id);
-        match adapter.press(key) {
-            Ok(()) => println!("Press successful!"),
-            Err(e) => {
-                eprintln!("Press failed: {}", e);
                 std::process::exit(1);
             }
         }

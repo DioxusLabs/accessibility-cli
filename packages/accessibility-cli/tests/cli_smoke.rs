@@ -132,3 +132,37 @@ fn adb_long_press_invalid_duration_rejected() {
         .failure()
         .stderr(predicate::str::contains("Invalid duration_ms"));
 }
+
+#[test]
+fn press_accepts_query_on_non_ios_platforms() {
+    // Regression: --press used to be iOS-only and take a numeric ID. After the
+    // refactor it accepts a query and is valid on every platform — selecting
+    // an absurd query just causes a not-found, not an iOS-only rejection.
+    let no_adb_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-no-adb");
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.env("PATH", &no_adb_path)
+        .args([
+            "--platform",
+            "android",
+            "--press",
+            "Button[title=\"definitely-not-here\"]",
+            "--timeout",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("iOS-only flags").not());
+}
+
+#[test]
+fn ios_only_error_message_no_longer_lists_press() {
+    // Regression: --press was iOS-only and used to be named in the rejection
+    // message. After the move into CommonArgs the message must drop --press.
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["--platform", "mac", "--tap", "100,100"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--press").not());
+}

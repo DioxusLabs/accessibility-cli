@@ -447,6 +447,54 @@ fn reset_calculator_display(pid: u32) {
     }
 }
 
+/// Regression: --press accepts a CSS-like query and drives the same AX action
+/// chain that --click does on macOS. Before the refactor --press took a numeric
+/// ID and was iOS-only, so this exact invocation would have been rejected with
+/// "iOS-only flags ... require --platform ios" before parsing the query.
+#[test]
+#[serial_test::file_serial(calculator)]
+fn press_with_query_clicks_calculator_button() {
+    let pid = launch_calculator_backgrounded();
+    reset_calculator_display(pid);
+
+    for desc in ["3", "Add", "4", "Equals"] {
+        TestCommand::cargo_bin("accessibility-cli")
+            .unwrap()
+            .args([
+                "--platform",
+                "mac",
+                "--pid",
+                &pid.to_string(),
+                "--press",
+                &format!("Button[description=\"{desc}\"]"),
+                "--timeout",
+                "5000",
+            ])
+            .assert()
+            .success();
+    }
+
+    let assert = TestCommand::cargo_bin("accessibility-cli")
+        .unwrap()
+        .args([
+            "--platform",
+            "mac",
+            "--pid",
+            &pid.to_string(),
+            "--query",
+            "Text",
+            "--timeout",
+            "5000",
+        ])
+        .assert()
+        .success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        out.contains('7'),
+        "expected --press chain to compute 3+4=7 on backgrounded Calculator; got:\n{out}"
+    );
+}
+
 /// Bug 8: --focus on a Calculator button must not error with "Action Focus
 /// not supported on macOS".
 #[test]

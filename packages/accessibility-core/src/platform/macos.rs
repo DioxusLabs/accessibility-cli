@@ -1241,7 +1241,16 @@ impl AccessibilityReader for MacOSAccessibility {
                     };
                     let result = handle.set_attribute_value(&attr, value);
                     if result != AXError::Success {
-                        bail!("Failed to set AXFocused: {:?}", result);
+                        // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
+                        // "this element won't accept the focus write" — usually because the
+                        // platform routes blur through a different mechanism (e.g. AppKit
+                        // collapses focus when another window becomes key).
+                        let verb = if want_focus { "focus" } else { "blur" };
+                        bail!(
+                            "this element does not support programmatic {} on macOS ({:?})",
+                            verb,
+                            result
+                        );
                     }
                 }
                 return Ok(());
