@@ -94,3 +94,41 @@ fn operational_flags_parse_before_backend_startup() {
             .stderr(predicate::str::contains("ADB binary not found"));
     }
 }
+
+#[test]
+fn ios_only_flag_rejected_on_other_platform() {
+    // Regression for the silent-ignore bug: --tap is iOS-only, must error on mac.
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["--platform", "mac", "--tap", "100,100"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("iOS-only flags"));
+}
+
+#[test]
+fn adb_flag_rejected_on_non_android_platform() {
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["--platform", "mac", "--adb-back"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--adb-* flags require --platform android"));
+}
+
+#[test]
+fn adb_swipe_invalid_duration_rejected() {
+    // Regression for silently-defaulted duration: 'abc' must error, not run at 300ms.
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["--platform", "android", "--adb-swipe", "1,2,3,4,abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid duration_ms"));
+}
+
+#[test]
+fn adb_long_press_invalid_duration_rejected() {
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["--platform", "android", "--adb-long-press", "1,2,xyz"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid duration_ms"));
+}

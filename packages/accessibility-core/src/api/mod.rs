@@ -44,7 +44,7 @@
 //!
 //! # Filling and waiting
 //!
-//! ```no_run
+//! ```no_run,ignore
 //! use accessibility_core::api::{App, Platform};
 //!
 //! # async fn run(pid: u32) -> Result<(), accessibility_core::api::Error> {

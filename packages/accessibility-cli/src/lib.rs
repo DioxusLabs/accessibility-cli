@@ -692,7 +692,11 @@ fn parse_event_type(s: &str) -> Option<AccessibilityEventType> {
 }
 
 /// Handle event listening mode.
-async fn handle_event_listening(adapter: &mut TargetedAccessibility, args: &CommonArgs) {
+async fn handle_event_listening(
+    adapter: &mut TargetedAccessibility,
+    args: &CommonArgs,
+    target_pid: Option<u32>,
+) {
     if !adapter.supports_event_listening() {
         eprintln!(
             "Event listening is not supported on {}",
@@ -703,6 +707,12 @@ async fn handle_event_listening(adapter: &mut TargetedAccessibility, args: &Comm
 
     // Build config with optional event type filter
     let mut config = ListenerConfig::new().with_buffer_size(256);
+
+    // Honor --pid: start_listening reads the PID from ListenerConfig, not the
+    // adapter's target PID, so without this every process' events would stream in.
+    if let Some(pid) = target_pid {
+        config = config.with_pid(pid);
+    }
 
     if let Some(filter_strs) = &args.listen_filter {
         let event_types: Vec<AccessibilityEventType> = filter_strs
@@ -918,10 +928,11 @@ async fn run_platform(
     args: &CommonArgs,
     filter: &TreeFilter,
     hit_test_coords: Option<(f64, f64)>,
+    target_pid: Option<u32>,
 ) {
     // Handle event listening mode
     if args.listen {
-        handle_event_listening(adapter, args).await;
+        handle_event_listening(adapter, args, target_pid).await;
         return;
     }
 
@@ -946,13 +957,21 @@ async fn run_platform(
         let start = std::time::Instant::now();
 
         loop {
-            // Clear cache and get fresh tree
+            // Clear cache and get fresh tree. Transient tree-build failures
+            // are normal during animations / redraws — retry until timeout
+            // rather than exit, since the whole point of polling is to wait
+            // for the UI to stabilize.
             adapter.clear_cache();
             let tree = match adapter.get_tree(filter).await {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("Failed to get accessibility tree: {}", e);
-                    std::process::exit(1);
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    if elapsed >= timeout_ms {
+                        eprintln!("Failed to get accessibility tree after {}ms: {}", elapsed, e);
+                        std::process::exit(1);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                    continue;
                 }
             };
 
@@ -1407,7 +1426,13 @@ fn parse_swipe_coords(s: &str) -> Result<SwipeParams, String> {
     let y1 = parts[1].trim().parse().map_err(|_| "Invalid y1")?;
     let x2 = parts[2].trim().parse().map_err(|_| "Invalid x2")?;
     let y2 = parts[3].trim().parse().map_err(|_| "Invalid y2")?;
-    let duration_ms = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let duration_ms: u64 = match parts.get(4) {
+        Some(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid duration_ms".to_string())?,
+        None => 300,
+    };
     Ok(SwipeParams {
         start: (x1, y1),
         end: (x2, y2),
@@ -1435,7 +1460,13 @@ fn parse_long_press(s: &str) -> Result<(f64, f64, u64), String> {
         .trim()
         .parse()
         .map_err(|_| "Invalid y coordinate")?;
-    let duration_ms: u64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let duration_ms: u64 = match parts.get(2) {
+        Some(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid duration_ms".to_string())?,
+        None => 1000,
+    };
     Ok((x, y, duration_ms))
 }
 
@@ -1464,7 +1495,57 @@ fn build_filter(common: &CommonArgs) -> TreeFilter {
     }
 }
 
+/// Reject platform-specific flags that don't match `--platform`.
+///
+/// Without this, e.g. `--platform mac --tap 100,100` silently dumps the tree
+/// instead of running the requested tap — the iOS/HID/ADB flags are only
+/// consumed inside their respective platform arms.
+fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
+    let ios_only_set = cli.test_load || cli.press.is_some() || cli.tap.is_some();
+    #[cfg(target_os = "macos")]
+    let hid_set = cli.hid.hid_tap.is_some()
+        || cli.hid.hid_swipe.is_some()
+        || cli.hid.hid_home
+        || cli.hid.hid_lock
+        || cli.hid.hid_siri
+        || cli.hid.hid_side;
+    #[cfg(not(target_os = "macos"))]
+    let hid_set = false;
+
+    let adb = &cli.adb;
+    let adb_set = adb.adb_back
+        || adb.adb_home
+        || adb.adb_recent
+        || adb.adb_menu
+        || adb.adb_volume_up
+        || adb.adb_volume_down
+        || adb.adb_tap.is_some()
+        || adb.adb_swipe.is_some()
+        || adb.adb_long_press.is_some()
+        || adb.adb_launch.is_some()
+        || adb.adb_stop.is_some()
+        || adb.adb_notifications
+        || adb.adb_quick_settings
+        || adb.adb_wake
+        || adb.adb_sleep;
+
+    if (ios_only_set || hid_set) && cli.platform != PlatformType::IOS {
+        return Err(
+            "iOS-only flags (--tap, --press, --test-load, --hid-*) require --platform ios".into(),
+        );
+    }
+    if adb_set && cli.platform != PlatformType::Android {
+        return Err("--adb-* flags require --platform android".into());
+    }
+    Ok(())
+}
+
 pub async fn run_cli(cli: &Cli) {
+    if let Err(msg) = validate_platform_flags(cli) {
+        eprintln!("error: {}", msg);
+        std::process::exit(2);
+    }
+
     // Handle iOS test-load early (doesn't need adapter)
     #[cfg(target_os = "macos")]
     if cli.platform == PlatformType::IOS && cli.test_load {
@@ -1506,14 +1587,14 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
         }
 
         #[cfg(target_os = "macos")]
         PlatformType::IOS => {
             // For iOS-specific commands (HID, tap, press), use the raw adapter
             // Then create TargetedAccessibility for common operations
-            let ios_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
+            let mut ios_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create iOS Simulator adapter: {}", e);
@@ -1531,20 +1612,9 @@ pub async fn run_cli(cli: &Cli) {
                 println!("Connected to simulator: {}", ios_adapter.device_udid());
             }
 
-            // Handle iOS-specific commands (HID, tap, press) before common operations
-            // These require the raw IOSSimulatorAccessibility adapter
-            {
-                // Reborrow temporarily to check iOS-specific commands
-                let mut temp_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
-                    Ok(a) => a,
-                    Err(_) => {
-                        // Should not happen since we already created one
-                        std::process::exit(1);
-                    }
-                };
-                if handle_ios_specific(&mut temp_adapter, cli) {
-                    return;
-                }
+            // Handle iOS-specific commands (HID, tap, press) before common operations.
+            if handle_ios_specific(&mut ios_adapter, cli) {
+                return;
             }
 
             // For common operations, use TargetedAccessibility
@@ -1555,7 +1625,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, None).await;
+            run_platform(&mut adapter, &cli.common, &filter, None, None).await;
         }
 
         #[cfg(target_os = "windows")]
@@ -1567,7 +1637,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
         }
 
         #[cfg(target_os = "linux")]
@@ -1583,7 +1653,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
         }
 
         // Android works on all host platforms via ADB
@@ -1625,7 +1695,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, None).await;
+            run_platform(&mut adapter, &cli.common, &filter, None, None).await;
         }
 
         // Unsupported platform combinations

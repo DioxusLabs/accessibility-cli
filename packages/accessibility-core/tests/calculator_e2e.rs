@@ -20,7 +20,6 @@ use accessibility_core::accessibility::{
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
 use accessibility_core::platform::macos::MacOSAccessibility;
-use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -254,7 +253,7 @@ async fn wait_for_display_value(app: &App, expected: &str) -> Result<String, Str
 
 /// Test that we can read the accessibility tree from Calculator using the App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_accessibility_tree() {
     let calc = CalculatorGuard::launch().await;
 
@@ -286,7 +285,7 @@ async fn test_calculator_accessibility_tree() {
 
 /// Test performing accessibility actions to do arithmetic using the Playwright-like API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_perform_action() {
     let calc = CalculatorGuard::launch_for_input().await;
 
@@ -309,10 +308,14 @@ async fn test_calculator_perform_action() {
         .await
         .expect("Failed to click 3");
 
-    // Press Enter to calculate
-    calc.keystroke("enter")
+    // Compute. We click the Equals button instead of pressing Return because
+    // AppKit drops key events that arrive while the target app is not
+    // frontmost, and this library's whole point is to drive backgrounded
+    // apps. Clicking the equivalent UI control is the focus-free path.
+    calc.locator("Button[description='Equals']")
+        .click()
         .await
-        .expect("Failed to press enter");
+        .expect("Failed to click Equals");
 
     // Wait for the result to appear in display using poll_until
     let value = wait_for_display_value(&calc, "8")
@@ -327,22 +330,21 @@ async fn test_calculator_perform_action() {
     );
 }
 
-/// Test using keyboard input with the App API.
+/// Test using button clicks with the App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_input_controller() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    // Type "7*6" using keyboard shortcuts
-    calc.keystroke("7").await.expect("Failed to type 7");
-    // '*' requires Shift+8 on US keyboard
-    calc.keystroke("shift+8").await.expect("Failed to type *");
-    calc.keystroke("6").await.expect("Failed to type 6");
-
-    // Press Enter/Return to calculate
-    calc.keystroke("enter")
-        .await
-        .expect("Failed to press enter");
+    // Compute 7 * 6 by clicking buttons. We click rather than keystroke
+    // because backgrounded AppKit apps drop incoming key events.
+    for desc in ["7", "Multiply", "6", "Equals"] {
+        calc.locator(&format!("Button[description='{desc}']"))
+            .first()
+            .click()
+            .await
+            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
+    }
 
     // Wait for the result to appear
     let value = wait_for_display_value(&calc, "42")
@@ -357,19 +359,20 @@ async fn test_calculator_input_controller() {
     );
 }
 
-/// Test using type_text for easier text input.
+/// Test computing via button clicks (formerly via type_text/keystroke, which
+/// AppKit drops when the target is backgrounded).
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_type_text() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    // Use type_text to type "12+8"
-    calc.type_text("12+8").await.expect("Failed to type text");
-
-    // Press Enter
-    calc.keystroke("enter")
-        .await
-        .expect("Failed to press enter");
+    for desc in ["1", "2", "Add", "8", "Equals"] {
+        calc.locator(&format!("Button[description='{desc}']"))
+            .first()
+            .click()
+            .await
+            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
+    }
 
     // Wait for result
     let value = wait_for_display_value(&calc, "20")
@@ -386,7 +389,7 @@ async fn test_calculator_type_text() {
 
 /// Test screenshot capture functionality using App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_screenshot() {
     let calc = CalculatorGuard::launch().await;
 
@@ -484,7 +487,7 @@ async fn test_screen_screenshot() {
 
 /// Test mouse click operations at specific coordinates.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_mouse_click() {
     let calc = CalculatorGuard::launch().await;
 
@@ -519,7 +522,7 @@ async fn test_calculator_mouse_click() {
 
 /// Test finding elements by various properties using locators.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_find_elements() {
     let calc = CalculatorGuard::launch().await;
 
@@ -569,7 +572,7 @@ async fn test_calculator_find_elements() {
 
 /// Test locator options and filtering.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_locator_options() {
     let calc = CalculatorGuard::launch().await;
 
@@ -612,7 +615,7 @@ async fn test_calculator_locator_options() {
 
 /// Test event listening - verifies that accessibility events are received when Calculator changes.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_event_listening() {
     let calc = CalculatorGuard::launch_for_input().await;
 
@@ -679,10 +682,11 @@ async fn test_calculator_event_listening() {
         .await
         .expect("Failed to click 3");
 
-    println!("Pressing Enter...");
-    calc.keystroke("enter")
+    println!("Clicking Equals...");
+    calc.locator("Button[description='Equals']")
+        .click()
         .await
-        .expect("Failed to press enter");
+        .expect("Failed to click Equals");
 
     // Wait for display to show result before collecting events
     let _ = wait_for_display_value(&calc, "8").await;
@@ -772,7 +776,7 @@ async fn test_calculator_event_listening() {
 
 /// Test event listening with specific event type filtering.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_event_filtering() {
     let calc = CalculatorGuard::launch_for_input().await;
 

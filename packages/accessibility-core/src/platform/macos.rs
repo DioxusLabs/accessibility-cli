@@ -433,6 +433,20 @@ impl MacOSAccessibility {
         let event = CGEvent::new_keyboard_event(None, key_code, key_down)
             .ok_or_else(|| anyhow!("Failed to create keyboard event"))?;
         CGEvent::set_flags(Some(&event), Self::modifier_flags(modifiers));
+
+        // Prefer SkyLight per-process delivery for symmetry with mouse events
+        // and so apps that respect per-process key routing receive the event.
+        // Note: even with SkyLight delivery, AppKit-based apps will drop key
+        // events that arrive while they are not frontmost — that's an OS-level
+        // policy we can't override here. Callers driving a backgrounded app
+        // should invoke the equivalent action (e.g. click the Equals button)
+        // rather than send a key like Return.
+        if let Some(pid) = pid
+            && Self::post_event_to_pid_via_skylight(pid, &event)
+        {
+            return Ok(());
+        }
+
         Self::post_event(pid, &event);
         Ok(())
     }
@@ -757,6 +771,46 @@ impl MacOSAccessibility {
         children
     }
 
+    /// Get the windows of an application element.
+    ///
+    /// For a non-frontmost application, `AXChildren` typically omits the visible
+    /// windows. Empirically on macOS, `AXWindows` is *also* often empty for
+    /// backgrounded apps, but `AXMainWindow` still returns the focused window;
+    /// we use both so single-window apps still walk correctly when backgrounded.
+    /// The returned list is deduped by window title — macOS hands out fresh
+    /// `AXUIElement` wrappers per call so raw-pointer dedup doesn't work.
+    unsafe fn get_application_windows(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
+        let mut windows: Vec<CFRetained<AXUIElement>> = Vec::new();
+        let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let push = |w: CFRetained<AXUIElement>,
+                        windows: &mut Vec<CFRetained<AXUIElement>>,
+                        seen: &mut std::collections::HashSet<String>| {
+            let title =
+                unsafe { Self::get_string_attribute(&w, AX_TITLE) }.unwrap_or_default();
+            if title.is_empty() || seen.insert(title) {
+                windows.push(w);
+            }
+        };
+
+        if let Ok(value) = unsafe { Self::get_attribute(element, AX_WINDOWS) } {
+            let array: CFRetained<CFArray<AXUIElement>> =
+                unsafe { CFRetained::cast_unchecked(value) };
+            for i in 0..array.len() {
+                if let Some(w) = array.get(i) {
+                    push(w, &mut windows, &mut seen_titles);
+                }
+            }
+        }
+
+        if let Ok(value) = unsafe { Self::get_attribute(element, AX_MAIN_WINDOW) } {
+            let w: CFRetained<AXUIElement> = unsafe { CFRetained::cast_unchecked(value) };
+            push(w, &mut windows, &mut seen_titles);
+        }
+
+        windows
+    }
+
     /// Get available actions for an element.
     unsafe fn get_actions(element: &AXUIElement) -> Vec<String> {
         let mut names: *const CFArray = std::ptr::null();
@@ -864,8 +918,46 @@ impl MacOSAccessibility {
         element.focused = Self::get_bool_attribute(ax_element, AX_FOCUSED).unwrap_or(false);
         element.actions = Self::get_actions(ax_element);
 
-        // Check filter
-        if !filter.should_include(&element, depth) {
+        let self_matches = filter.should_include(&element, depth);
+
+        // Process children (subject to max_depth). We always recurse so that filters
+        // like --interactive / --visible don't prune containers whose descendants do
+        // match; the container is included below if any child survived.
+        let should_recurse = filter.max_depth.is_none_or(|max| depth < max);
+        if should_recurse {
+            let mut children = Self::get_children(ax_element);
+
+            // For backgrounded apps, AXChildren of the Application typically omits
+            // visible windows; AXWindows still returns them. Fall back to AXWindows
+            // only when AXChildren produced no Window-role child, since macOS hands
+            // out fresh AXUIElement wrappers per call (no cheap pointer dedup) and
+            // we want to avoid double-walking the same window.
+            if role == Role::Application {
+                let has_window_child = children.iter().any(|c| {
+                    Self::get_string_attribute(c, AX_ROLE)
+                        .map(|r| r == ROLE_WINDOW)
+                        .unwrap_or(false)
+                });
+                if !has_window_child {
+                    for window in unsafe { Self::get_application_windows(ax_element) } {
+                        children.push(window);
+                    }
+                }
+            }
+
+            for child in children {
+                if let Some(child_element) =
+                    self.build_element(&child, filter, depth + 1, element_count)
+                {
+                    element.children.push(child_element);
+                }
+            }
+        }
+
+        // Include this element if it matches the filter itself, has any kept
+        // descendants (so we don't drop containers), or is the root (so get_tree
+        // always has something to return).
+        if !self_matches && element.children.is_empty() && depth != 0 {
             return None;
         }
 
@@ -877,19 +969,6 @@ impl MacOSAccessibility {
         #[allow(deprecated)]
         self.cache.store_with_id(id, element.clone());
         *element_count += 1;
-
-        // Process children (if not at max depth)
-        let should_recurse = filter.max_depth.is_none_or(|max| depth < max);
-        if should_recurse {
-            let children = Self::get_children(ax_element);
-            for child in children {
-                if let Some(child_element) =
-                    self.build_element(&child, filter, depth + 1, element_count)
-                {
-                    element.children.push(child_element);
-                }
-            }
-        }
 
         Some(element)
     }
@@ -1077,6 +1156,10 @@ impl MacOSAccessibility {
 }
 
 impl AccessibilityReader for MacOSAccessibility {
+    fn platform_name(&self) -> &'static str {
+        "macOS"
+    }
+
     fn get_tree(
         &mut self,
         pid: Option<u32>,
@@ -1141,6 +1224,28 @@ impl AccessibilityReader for MacOSAccessibility {
                 .handles
                 .get(&id)
                 .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+
+            // Focus/Blur aren't AX actions on macOS — they're attribute writes.
+            if matches!(action, Action::Focus | Action::Blur) {
+                let want_focus = matches!(action, Action::Focus);
+                unsafe {
+                    let attr = CFString::from_str(AX_FOCUSED);
+                    let value: &CFType = if want_focus {
+                        objc2_core_foundation::kCFBooleanTrue
+                            .ok_or_else(|| anyhow!("kCFBooleanTrue unavailable"))?
+                            .as_ref()
+                    } else {
+                        objc2_core_foundation::kCFBooleanFalse
+                            .ok_or_else(|| anyhow!("kCFBooleanFalse unavailable"))?
+                            .as_ref()
+                    };
+                    let result = handle.set_attribute_value(&attr, value);
+                    if result != AXError::Success {
+                        bail!("Failed to set AXFocused: {:?}", result);
+                    }
+                }
+                return Ok(());
+            }
 
             // Safety: We're calling AXUIElement methods with valid handles
             unsafe {
