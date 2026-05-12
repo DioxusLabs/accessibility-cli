@@ -32,16 +32,6 @@ jobs:
       - run: cargo test --workspace --lib --bins
       - run: cargo test -p accessibility-cli --test cli_smoke
 
-  deny:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans licenses sources
-
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

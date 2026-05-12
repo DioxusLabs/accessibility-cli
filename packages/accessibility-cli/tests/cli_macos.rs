@@ -147,7 +147,10 @@ fn calculator_pid() -> Option<u32> {
             return ""
         end try
     "#;
-    let output = Command::new("osascript").args(["-e", script]).output().ok()?;
+    let output = Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
@@ -388,8 +391,7 @@ fn listen_pid_filter_scopes_event_stream() {
         ])
         .assert()
         .success();
-    let result_out =
-        String::from_utf8_lossy(&result_assert.get_output().stdout).into_owned();
+    let result_out = String::from_utf8_lossy(&result_assert.get_output().stdout).into_owned();
     assert!(
         result_out.contains('3'),
         "expected Calculator to display '3' after 1+2=; got:\n{result_out}"

@@ -111,7 +111,9 @@ fn adb_flag_rejected_on_non_android_platform() {
     cmd.args(["--platform", "mac", "--adb-back"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--adb-* flags require --platform android"));
+        .stderr(predicate::str::contains(
+            "--adb-* flags require --platform android",
+        ));
 }
 
 #[test]

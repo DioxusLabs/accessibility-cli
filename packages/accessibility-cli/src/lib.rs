@@ -973,7 +973,10 @@ async fn run_platform(
                 Err(e) => {
                     let elapsed = start.elapsed().as_millis() as u64;
                     if elapsed >= timeout_ms {
-                        eprintln!("Failed to get accessibility tree after {}ms: {}", elapsed, e);
+                        eprintln!(
+                            "Failed to get accessibility tree after {}ms: {}",
+                            elapsed, e
+                        );
                         std::process::exit(1);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -1537,9 +1540,7 @@ fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
         || adb.adb_sleep;
 
     if (ios_only_set || hid_set) && cli.platform != PlatformType::IOS {
-        return Err(
-            "iOS-only flags (--tap, --test-load, --hid-*) require --platform ios".into(),
-        );
+        return Err("iOS-only flags (--tap, --test-load, --hid-*) require --platform ios".into());
     }
     if adb_set && cli.platform != PlatformType::Android {
         return Err("--adb-* flags require --platform android".into());

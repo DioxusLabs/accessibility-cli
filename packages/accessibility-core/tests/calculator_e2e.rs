@@ -95,15 +95,10 @@ impl CalculatorGuard {
             .expect("Failed to connect to Calculator");
 
         // Wait for Calculator to be ready. This must happen before capturing the
-        // foreground snapshot — `open -g` returns before the app finishes launching,
-        // and a freshly-launched Calculator can grab focus during startup. Capturing
-        // the foreground only once the AX tree is queryable means subsequent tests
-        // assert against a stable post-launch state.
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
+        // foreground snapshot: `open -g` returns before the app finishes launching,
+        // and a freshly-launched Calculator can grab focus during startup. Polling
+        // through initial AX tree errors gives AppKit time to expose the full tree.
+        Self::wait_for_calculator_tree(&app).await;
 
         let foreground = ForegroundSnapshot::capture();
 
@@ -125,6 +120,23 @@ impl CalculatorGuard {
 
     fn assert_foreground_unchanged(&self) {
         self.foreground.assert_unchanged();
+    }
+
+    async fn wait_for_calculator_tree(app: &App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            if app.locator("Button").no_wait().count().await > 0 {
+                return;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "Calculator should expose a ready accessibility tree"
+            );
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Launch Calculator app and return its PID.
@@ -530,8 +542,7 @@ async fn test_calculator_mouse_click() {
 async fn test_calculator_mouse_scroll_keeps_focus() {
     let calc = CalculatorGuard::launch().await;
 
-    let mut accessibility =
-        MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
+    let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
 
     // A handful of scrolls so a missed SkyLight delivery would have a clear
     // chance to promote Calculator to key.

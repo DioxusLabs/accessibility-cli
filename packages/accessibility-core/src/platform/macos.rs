@@ -20,9 +20,8 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPro
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CGRect};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventType, CGImage,
-    CGMainDisplayID, CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption,
-    CGWindowListOption,
+    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventType, CGImage, CGMainDisplayID,
+    CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption, CGWindowListOption,
 };
 use objc2_foundation::NSDictionary;
 use std::collections::HashMap;
@@ -413,7 +412,9 @@ impl MacOSAccessibility {
             anyhow!("post_event requires a target pid on macOS (SkyLight has no global path)")
         })?;
         if !Self::post_event_to_pid_via_skylight(pid, event) {
-            bail!("SkyLight SLEventPostToPid is unavailable; refusing to fall back to a focus-stealing post");
+            bail!(
+                "SkyLight SLEventPostToPid is unavailable; refusing to fall back to a focus-stealing post"
+            );
         }
         Ok(())
     }
@@ -774,10 +775,9 @@ impl MacOSAccessibility {
         let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let push = |w: CFRetained<AXUIElement>,
-                        windows: &mut Vec<CFRetained<AXUIElement>>,
-                        seen: &mut std::collections::HashSet<String>| {
-            let title =
-                unsafe { Self::get_string_attribute(&w, AX_TITLE) }.unwrap_or_default();
+                    windows: &mut Vec<CFRetained<AXUIElement>>,
+                    seen: &mut std::collections::HashSet<String>| {
+            let title = unsafe { Self::get_string_attribute(&w, AX_TITLE) }.unwrap_or_default();
             if title.is_empty() || seen.insert(title) {
                 windows.push(w);
             }
@@ -1251,10 +1251,7 @@ impl AccessibilityReader for MacOSAccessibility {
             // via the SkyLight per-PID path instead, which keeps focus put.
             if matches!(action, Action::Click)
                 && let Some(element) = self.cache.get(id)
-                && matches!(
-                    element.role,
-                    Role::Menu | Role::MenuItem | Role::MenuBar
-                )
+                && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
                 && let Some(bounds) = element.bounds
                 && let Some(pid) = unsafe { Self::get_pid_for_element(handle) }
             {
