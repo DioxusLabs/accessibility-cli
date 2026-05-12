@@ -37,6 +37,7 @@ name = "accessibility-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "accessibility-macos-sys",
  "accesskit",
  "anyhow",
  "async-trait",
@@ -67,6 +68,21 @@ dependencies = [
  "windows",
  "x11rb",
  "zbus",
+]
+
+[[package]]
+name = "accessibility-macos-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "euclid",
+ "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-application-services",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation",
 ]
 
 [[package]]

@@ -15,11 +15,13 @@
 #![cfg(target_os = "macos")]
 
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, AccessibilityReader, ListenerConfig,
+    AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ListenerConfig,
+    TreeFilter,
 };
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
 use accessibility_core::platform::macos::MacOSAccessibility;
+use accesskit::{Action, Role};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -288,6 +290,34 @@ async fn wait_for_display_value(app: &App, expected: &str) -> Result<String, Str
     elem.value.ok_or_else(|| "Element has no value".to_string())
 }
 
+async fn click_calculator_buttons_fast(calc: &CalculatorGuard, sequence: &[&str]) {
+    let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
+    let tree = accessibility
+        .get_tree(Some(calc.pid), &TreeFilter::default())
+        .await
+        .expect("Failed to get Calculator accessibility tree");
+
+    for desc in sequence {
+        let button_id = tree
+            .find_all(|element| is_calculator_button(element, desc))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("Calculator button '{desc}' not found"))
+            .id;
+
+        accessibility
+            .perform_action(button_id, Action::Click)
+            .await
+            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
+    }
+
+    calc.assert_foreground_unchanged();
+}
+
+fn is_calculator_button(element: &Element, description: &str) -> bool {
+    element.role == Role::Button && element.description.as_deref() == Some(description)
+}
+
 /// Test that we can read the accessibility tree from Calculator using the App API.
 #[tokio::test]
 #[serial_test::file_serial(calculator)]
@@ -345,10 +375,7 @@ async fn test_calculator_perform_action() {
         .await
         .expect("Failed to click 3");
 
-    // Compute. We click the Equals button instead of pressing Return because
-    // AppKit drops key events that arrive while the target app is not
-    // frontmost, and this library's whole point is to drive backgrounded
-    // apps. Clicking the equivalent UI control is the focus-free path.
+    // Compute via the AX click path in this action-oriented test.
     calc.locator("Button[description='Equals']")
         .click()
         .await
@@ -373,15 +400,8 @@ async fn test_calculator_perform_action() {
 async fn test_calculator_input_controller() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    // Compute 7 * 6 by clicking buttons. We click rather than keystroke
-    // because backgrounded AppKit apps drop incoming key events.
-    for desc in ["7", "Multiply", "6", "Equals"] {
-        calc.locator(&format!("Button[description='{desc}']"))
-            .first()
-            .click()
-            .await
-            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
-    }
+    // Resolve Calculator's buttons once, then click the cached AX handles.
+    click_calculator_buttons_fast(&calc, &["7", "Multiply", "6", "Equals"]).await;
 
     // Wait for the result to appear
     let value = wait_for_display_value(&calc, "42")
@@ -396,20 +416,13 @@ async fn test_calculator_input_controller() {
     );
 }
 
-/// Test computing via button clicks (formerly via type_text/keystroke, which
-/// AppKit drops when the target is backgrounded).
+/// Test computing via fast button clicks.
 #[tokio::test]
 #[serial_test::file_serial(calculator)]
 async fn test_calculator_type_text() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    for desc in ["1", "2", "Add", "8", "Equals"] {
-        calc.locator(&format!("Button[description='{desc}']"))
-            .first()
-            .click()
-            .await
-            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
-    }
+    click_calculator_buttons_fast(&calc, &["1", "2", "Add", "8", "Equals"]).await;
 
     // Wait for result
     let value = wait_for_display_value(&calc, "20")

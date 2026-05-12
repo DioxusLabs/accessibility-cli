@@ -1,0 +1,56 @@
+[package]
+name = "accessibility-macos-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Safe low-level wrappers around macOS accessibility, CoreGraphics, and AppKit APIs for accessibility-cli."
+readme = "../../README.md"
+keywords = ["accessibility", "macos", "ax", "coregraphics", "automation"]
+categories = ["accessibility", "api-bindings", "os::macos-apis"]
+
+[dependencies]
+anyhow.workspace = true
+euclid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = [
+    "CFString",
+    "CFArray",
+    "CFCGTypes",
+    "CFBase",
+    "CFRunLoop",
+    "CFDate",
+    "CFNumber",
+] }
+objc2-application-services = { version = "0.3", features = [
+    "AXUIElement",
+    "AXValue",
+    "AXError",
+    "libc",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGDirectDisplay",
+    "CGError",
+    "CGWindow",
+    "CGImage",
+    "CGColorSpace",
+    "CGDataProvider",
+    "CGBitmapContext",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
+    "libc",
+] }

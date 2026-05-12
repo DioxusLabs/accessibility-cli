@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "packages/accessibility-macos-sys",
     "packages/accessibility-core",
     "packages/accessibility-cli",
 ]
@@ -15,6 +16,7 @@ homepage = "https://github.com/DioxusLabs/accessibility-cli"
 [workspace.dependencies]
 accessibility-core = { path = "packages/accessibility-core", version = "0.1.0" }
 accessibility-cli = { path = "packages/accessibility-cli", version = "0.1.0" }
+accessibility-macos-sys = { path = "packages/accessibility-macos-sys", version = "0.1.0" }
 ab_glyph = "0.2"
 accesskit = { version = "0.22", features = ["enumn", "schemars", "serde"] }
 anyhow = "1.0.100"
