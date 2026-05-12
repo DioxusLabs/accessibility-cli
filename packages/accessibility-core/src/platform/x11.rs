@@ -527,17 +527,14 @@ impl LinuxAccessibility {
 
             if let Ok(proxy) =
                 Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
+                && let Ok(states) = proxy.get_state().await
             {
-                if let Ok(states) = proxy.get_state().await {
-                    // Check for Active or Focused state
-                    if states.contains(atspi::State::Active)
-                        || states.contains(atspi::State::Focused)
-                    {
-                        let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
-                            .await
-                            .unwrap_or(0);
-                        return Some((handle, pid));
-                    }
+                // Check for Active or Focused state
+                if states.contains(atspi::State::Active) || states.contains(atspi::State::Focused) {
+                    let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
+                        .await
+                        .unwrap_or(0);
+                    return Some((handle, pid));
                 }
             }
         }
@@ -545,16 +542,16 @@ impl LinuxAccessibility {
         // Fallback: return first application with a valid PID
         for child_ref in &children {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid > 0 {
-                    return Some((
-                        NativeHandle {
-                            bus_name,
-                            object_path: child_ref.path_as_str().to_string(),
-                        },
-                        pid,
-                    ));
-                }
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid > 0
+            {
+                return Some((
+                    NativeHandle {
+                        bus_name,
+                        object_path: child_ref.path_as_str().to_string(),
+                    },
+                    pid,
+                ));
             }
         }
 
@@ -644,44 +641,41 @@ impl LinuxAccessibility {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
 
             // Check PID
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid == target_pid {
-                    // Get the application's first window with bounds
-                    let handle = NativeHandle {
-                        bus_name: bus_name.clone(),
-                        object_path: child_ref.path_as_str().to_string(),
-                    };
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid == target_pid
+            {
+                // Get the application's first window with bounds
+                let handle = NativeHandle {
+                    bus_name: bus_name.clone(),
+                    object_path: child_ref.path_as_str().to_string(),
+                };
 
-                    if let Ok(proxy) =
-                        Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path)
+                if let Ok(proxy) =
+                    Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
+                {
+                    // Try to find a window child with bounds
+                    if let Ok(app_children) = proxy.get_children().await {
+                        for win_ref in app_children {
+                            let win_handle = NativeHandle {
+                                bus_name: win_ref.name_as_str().unwrap_or_default().to_string(),
+                                object_path: win_ref.path_as_str().to_string(),
+                            };
+
+                            if let Ok(component) = Self::create_component_proxy(
+                                conn,
+                                &win_handle.bus_name,
+                                &win_handle.object_path,
+                            )
                             .await
-                    {
-                        // Try to find a window child with bounds
-                        if let Ok(app_children) = proxy.get_children().await {
-                            for win_ref in app_children {
-                                let win_handle = NativeHandle {
-                                    bus_name: win_ref.name_as_str().unwrap_or_default().to_string(),
-                                    object_path: win_ref.path_as_str().to_string(),
-                                };
-
-                                if let Ok(component) = Self::create_component_proxy(
-                                    conn,
-                                    &win_handle.bus_name,
-                                    &win_handle.object_path,
-                                )
-                                .await
-                                {
-                                    if let Ok((x, y, width, height)) =
-                                        component.get_extents(CoordType::Screen).await
-                                    {
-                                        if width > 0 && height > 0 {
-                                            return Some(Rect::new(
-                                                Point::new(x as f64, y as f64),
-                                                Size::new(width as f64, height as f64),
-                                            ));
-                                        }
-                                    }
-                                }
+                                && let Ok((x, y, width, height)) =
+                                    component.get_extents(CoordType::Screen).await
+                                && width > 0
+                                && height > 0
+                            {
+                                return Some(Rect::new(
+                                    Point::new(x as f64, y as f64),
+                                    Size::new(width as f64, height as f64),
+                                ));
                             }
                         }
                     }
@@ -757,28 +751,28 @@ impl LinuxAccessibility {
             )
             .ok()?
             .reply()
+            && reply.value_len == 1
+            && reply.format == 32
         {
-            if reply.value_len == 1 && reply.format == 32 {
-                let window_pid = u32::from_ne_bytes([
-                    reply.value[0],
-                    reply.value[1],
-                    reply.value[2],
-                    reply.value[3],
-                ]);
-                if window_pid == target_pid {
-                    // Get window geometry
-                    if let Ok(geom) = conn.get_geometry(window).ok()?.reply() {
-                        // Translate coordinates to root window
-                        if let Ok(trans) = conn
-                            .translate_coordinates(window, conn.setup().roots[0].root, 0, 0)
-                            .ok()?
-                            .reply()
-                        {
-                            return Some(Rect::new(
-                                Point::new(trans.dst_x as f64, trans.dst_y as f64),
-                                Size::new(geom.width as f64, geom.height as f64),
-                            ));
-                        }
+            let window_pid = u32::from_ne_bytes([
+                reply.value[0],
+                reply.value[1],
+                reply.value[2],
+                reply.value[3],
+            ]);
+            if window_pid == target_pid {
+                // Get window geometry
+                if let Ok(geom) = conn.get_geometry(window).ok()?.reply() {
+                    // Translate coordinates to root window
+                    if let Ok(trans) = conn
+                        .translate_coordinates(window, conn.setup().roots[0].root, 0, 0)
+                        .ok()?
+                        .reply()
+                    {
+                        return Some(Rect::new(
+                            Point::new(trans.dst_x as f64, trans.dst_y as f64),
+                            Size::new(geom.width as f64, geom.height as f64),
+                        ));
                     }
                 }
             }
@@ -955,23 +949,21 @@ impl AccessibilityReader for LinuxAccessibility {
         // Try EditableText interface first (for text fields)
         if let Ok(editable) =
             Self::create_editable_text_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && editable.set_text_contents(&value).await.is_ok()
         {
-            if editable.set_text_contents(&value).await.is_ok() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         // Fallback to Value interface (for sliders, spin buttons)
         if let Ok(value_proxy) =
             Self::create_value_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && let Ok(numeric_value) = value.parse::<f64>()
         {
-            if let Ok(numeric_value) = value.parse::<f64>() {
-                value_proxy
-                    .set_current_value(numeric_value)
-                    .await
-                    .map_err(|e| anyhow!("Failed to set value: {}", e))?;
-                return Ok(());
-            }
+            value_proxy
+                .set_current_value(numeric_value)
+                .await
+                .map_err(|e| anyhow!("Failed to set value: {}", e))?;
+            return Ok(());
         }
 
         bail!("Element does not support setting value")
@@ -1002,60 +994,57 @@ impl AccessibilityReader for LinuxAccessibility {
 
             if let Ok(component) =
                 Self::create_component_proxy(&conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok(accessible_ref) = component
+                && let Ok(accessible_ref) = component
                     .get_accessible_at_point(x as i32, y as i32, CoordType::Screen)
                     .await
-                {
-                    // Check if we got a valid object (not null path)
-                    if accessible_ref.path_as_str() != "/org/a11y/atspi/null" {
-                        let hit_handle = NativeHandle {
-                            bus_name: accessible_ref.name_as_str().unwrap_or_default().to_string(),
-                            object_path: accessible_ref.path_as_str().to_string(),
-                        };
+            {
+                // Check if we got a valid object (not null path)
+                if accessible_ref.path_as_str() != "/org/a11y/atspi/null" {
+                    let hit_handle = NativeHandle {
+                        bus_name: accessible_ref.name_as_str().unwrap_or_default().to_string(),
+                        object_path: accessible_ref.path_as_str().to_string(),
+                    };
 
-                        if let Ok(proxy) = Self::create_accessible_proxy(
+                    if let Ok(proxy) = Self::create_accessible_proxy(
+                        &conn,
+                        &hit_handle.bus_name,
+                        &hit_handle.object_path,
+                    )
+                    .await
+                        && let Ok(interfaces) = proxy.get_interfaces().await
+                    {
+                        // Build element with placeholder ID (will be assigned when stored)
+                        let placeholder_key = ElementKey::from_ffi(1);
+                        if let Some(element) = Self::build_single_element(
                             &conn,
-                            &hit_handle.bus_name,
-                            &hit_handle.object_path,
+                            &proxy,
+                            &hit_handle,
+                            interfaces,
+                            placeholder_key,
                         )
                         .await
                         {
-                            if let Ok(interfaces) = proxy.get_interfaces().await {
-                                // Build element with placeholder ID (will be assigned when stored)
-                                let placeholder_key = ElementKey::from_ffi(1);
-                                if let Some(element) = Self::build_single_element(
-                                    &conn,
-                                    &proxy,
-                                    &hit_handle,
-                                    interfaces,
-                                    placeholder_key,
-                                )
-                                .await
-                                {
-                                    // Store in cache using store_with_clone to assign proper ID
-                                    let (id, _) = self.cache.store_with_clone(|id| Element {
-                                        id,
-                                        role: element.role,
-                                        title: element.title.clone(),
-                                        description: element.description.clone(),
-                                        value: element.value.clone(),
-                                        url: element.url.clone(),
-                                        help: element.help.clone(),
-                                        role_description: element.role_description.clone(),
-                                        identifier: element.identifier.clone(),
-                                        bounds: element.bounds,
-                                        enabled: element.enabled,
-                                        focused: element.focused,
-                                        actions: element.actions.clone(),
-                                        children: vec![], // hit_test returns a single element without children
-                                    });
+                            // Store in cache using store_with_clone to assign proper ID
+                            let (id, _) = self.cache.store_with_clone(|id| Element {
+                                id,
+                                role: element.role,
+                                title: element.title.clone(),
+                                description: element.description.clone(),
+                                value: element.value.clone(),
+                                url: element.url.clone(),
+                                help: element.help.clone(),
+                                role_description: element.role_description.clone(),
+                                identifier: element.identifier.clone(),
+                                bounds: element.bounds,
+                                enabled: element.enabled,
+                                focused: element.focused,
+                                actions: element.actions.clone(),
+                                children: vec![], // hit_test returns a single element without children
+                            });
 
-                                    // Store the handle
-                                    self.handles.insert(id, hit_handle);
-                                    return Ok(Some(id));
-                                }
-                            }
+                            // Store the handle
+                            self.handles.insert(id, hit_handle);
+                            return Ok(Some(id));
                         }
                     }
                 }
