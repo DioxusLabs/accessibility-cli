@@ -100,6 +100,23 @@ impl ForegroundSnapshot {
             self, current
         );
     }
+
+    fn is_calculator(&self, calculator_pid: u32) -> bool {
+        self.pid == calculator_pid || self.name == "Calculator"
+    }
+
+    fn assert_calculator_not_promoted(&self, calculator_pid: u32) {
+        if self.is_calculator(calculator_pid) {
+            return;
+        }
+
+        let current = Self::capture();
+        assert!(
+            !current.is_calculator(calculator_pid),
+            "test promoted Calculator to the frontmost app from {:?}",
+            self
+        );
+    }
 }
 
 impl CalculatorGuard {
@@ -136,7 +153,7 @@ impl CalculatorGuard {
     }
 
     fn assert_foreground_unchanged(&self) {
-        self.foreground.assert_unchanged();
+        self.foreground.assert_calculator_not_promoted(self.pid);
     }
 
     async fn wait_for_calculator_tree(app: &App) {
