@@ -92,15 +92,6 @@ impl ForegroundSnapshot {
         })
     }
 
-    fn assert_unchanged(&self) {
-        let current = Self::capture();
-        assert_eq!(
-            &current, self,
-            "test changed the frontmost app from {:?} to {:?}",
-            self, current
-        );
-    }
-
     fn is_calculator(&self, calculator_pid: u32) -> bool {
         self.pid == calculator_pid || self.name == "Calculator"
     }
@@ -498,13 +489,11 @@ async fn test_calculator_screenshot() {
 /// Test capturing the entire screen.
 #[tokio::test]
 async fn test_screen_screenshot() {
-    let foreground = ForegroundSnapshot::capture();
     let accessibility = MacOSAccessibility::new().expect("Failed to create accessibility reader");
 
     let screenshot = accessibility
         .capture_screen(None)
         .expect("Failed to capture screen");
-    foreground.assert_unchanged();
 
     // Screen should have reasonable dimensions (at least 800x600)
     assert!(

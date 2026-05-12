@@ -316,10 +316,10 @@ impl LinuxAccessibility {
 
             while let Some(entry) = stack.pop() {
                 // Check element count limit
-                if let Some(max) = filter.max_elements {
-                    if element_count >= max {
-                        continue;
-                    }
+                if let Some(max) = filter.max_elements
+                    && element_count >= max
+                {
+                    continue;
                 }
 
                 // Allocate temporary ID (will be remapped later)
@@ -360,32 +360,29 @@ impl LinuxAccessibility {
                 handles_to_insert.push((temp_id, entry.handle.clone()));
 
                 // Get children if we should recurse
-                let should_recurse = filter.max_depth.map_or(true, |max| entry.depth < max);
-                if should_recurse {
-                    if let Ok(children) = proxy.get_children().await {
-                        // Push children to stack in reverse order so first child is processed first
-                        for child_ref in children.into_iter().rev() {
-                            let child_handle = NativeHandle {
-                                bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
-                                object_path: child_ref.path_as_str().to_string(),
-                            };
+                let should_recurse = filter.max_depth.is_none_or(|max| entry.depth < max);
+                if should_recurse && let Ok(children) = proxy.get_children().await {
+                    // Push children to stack in reverse order so first child is processed first
+                    for child_ref in children.into_iter().rev() {
+                        let child_handle = NativeHandle {
+                            bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
+                            object_path: child_ref.path_as_str().to_string(),
+                        };
 
-                            if let Ok(child_proxy) = Self::create_accessible_proxy(
-                                &conn,
-                                &child_handle.bus_name,
-                                &child_handle.object_path,
-                            )
-                            .await
-                            {
-                                if let Ok(child_interfaces) = child_proxy.get_interfaces().await {
-                                    stack.push(StackEntry {
-                                        handle: child_handle,
-                                        interfaces: child_interfaces,
-                                        parent_temp_id: Some(temp_id),
-                                        depth: entry.depth + 1,
-                                    });
-                                }
-                            }
+                        if let Ok(child_proxy) = Self::create_accessible_proxy(
+                            &conn,
+                            &child_handle.bus_name,
+                            &child_handle.object_path,
+                        )
+                        .await
+                            && let Ok(child_interfaces) = child_proxy.get_interfaces().await
+                        {
+                            stack.push(StackEntry {
+                                handle: child_handle,
+                                interfaces: child_interfaces,
+                                parent_temp_id: Some(temp_id),
+                                depth: entry.depth + 1,
+                            });
                         }
                     }
                 }
@@ -498,16 +495,16 @@ impl LinuxAccessibility {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
 
             // Get PID from D-Bus
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid == target_pid {
-                    return Some((
-                        NativeHandle {
-                            bus_name,
-                            object_path: child_ref.path_as_str().to_string(),
-                        },
-                        pid,
-                    ));
-                }
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid == target_pid
+            {
+                return Some((
+                    NativeHandle {
+                        bus_name,
+                        object_path: child_ref.path_as_str().to_string(),
+                    },
+                    pid,
+                ));
             }
         }
 
@@ -1047,7 +1044,7 @@ impl AccessibilityReader for LinuxAccessibility {
                                         help: element.help.clone(),
                                         role_description: element.role_description.clone(),
                                         identifier: element.identifier.clone(),
-                                        bounds: element.bounds.clone(),
+                                        bounds: element.bounds,
                                         enabled: element.enabled,
                                         focused: element.focused,
                                         actions: element.actions.clone(),
@@ -1080,10 +1077,10 @@ impl AccessibilityReader for LinuxAccessibility {
     // Platform adapter methods (merged from LinuxAdapter)
 
     fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
-        if let Some(pid) = pid {
-            if let Ok(screenshot) = self.capture_window(pid) {
-                return Ok(screenshot);
-            }
+        if let Some(pid) = pid
+            && let Ok(screenshot) = self.capture_window(pid)
+        {
+            return Ok(screenshot);
         }
         LinuxAccessibility::capture_screen(self)
     }
@@ -1278,60 +1275,55 @@ async fn run_linux_event_loop(
     }
 
     // Register for focus events if enabled
-    if config.should_capture(AccessibilityEventType::FocusChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::FocusChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::focus::FocusEvent>()
             .await
-        {
-            eprintln!("Warning: Failed to register for focus events: {}", e);
-        }
+    {
+        eprintln!("Warning: Failed to register for focus events: {}", e);
     }
 
     // Register for object events
-    if config.should_capture(AccessibilityEventType::StructureChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::StructureChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::object::ChildrenChangedEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for children changed events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for children changed events: {}",
+            e
+        );
     }
 
-    if config.should_capture(AccessibilityEventType::ValueChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::ValueChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::object::TextChangedEvent>()
             .await
-        {
-            eprintln!("Warning: Failed to register for text changed events: {}", e);
-        }
+    {
+        eprintln!("Warning: Failed to register for text changed events: {}", e);
     }
 
     // Register for window events
-    if config.should_capture(AccessibilityEventType::WindowCreated) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::WindowCreated)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::window::CreateEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for window create events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for window create events: {}",
+            e
+        );
     }
 
-    if config.should_capture(AccessibilityEventType::WindowDestroyed) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::WindowDestroyed)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::window::DestroyEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for window destroy events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for window destroy events: {}",
+            e
+        );
     }
 
     // Get the event stream
