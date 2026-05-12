@@ -9,16 +9,12 @@ use crate::accessibility::{
     StopReason, TreeFilter,
 };
 use crate::input::{Code, Modifiers, MouseButton, code_from_char};
-use accesskit::{Action, Role};
-use anyhow::{Result, bail};
-use slotmap::SecondaryMap;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::System::Com::{
+use accessibility_windows_sys::windows;
+use accessibility_windows_sys::windows::Win32::Foundation::{HWND, POINT, RECT};
+use accessibility_windows_sys::windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
-use windows::Win32::UI::Accessibility::{
+use accessibility_windows_sys::windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
     IUIAutomationValuePattern, TreeScope_Children, UIA_ButtonControlTypeId,
     UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
@@ -32,7 +28,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_TitleBarControlTypeId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
     UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
+use accessibility_windows_sys::windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
@@ -48,12 +44,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE,
     VK_VOLUME_UP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
+use accessibility_windows_sys::windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetForegroundWindow,
 };
-use windows::core::BSTR;
+use accessibility_windows_sys::windows::core::BSTR;
+use accesskit::{Action, Role};
+use anyhow::{Result, bail};
+use slotmap::SecondaryMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 /// Windows accessibility reader using UI Automation.
 pub struct WindowsAccessibility {
@@ -420,11 +421,13 @@ impl WindowsAccessibility {
 
     /// Capture a screenshot of a specific window.
     pub fn capture_window(&self, pid: u32) -> Result<Screenshot> {
-        use windows::Win32::Graphics::Gdi::{
+        use accessibility_windows_sys::windows::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
             DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
         };
-        use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+        use accessibility_windows_sys::windows::Win32::Storage::Xps::{
+            PRINT_WINDOW_FLAGS, PrintWindow,
+        };
 
         // Find the window for this PID
         let element = self.find_root_for_pid(pid)?;
@@ -556,7 +559,7 @@ impl WindowsAccessibility {
 
     /// Capture the entire screen.
     pub fn capture_screen(&self) -> Result<Screenshot> {
-        use windows::Win32::Graphics::Gdi::{
+        use accessibility_windows_sys::windows::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
             CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
             ReleaseDC, SRCCOPY, SelectObject,
@@ -1265,7 +1268,9 @@ fn is_extended_key(vk: VIRTUAL_KEY) -> bool {
 
 /// Send a keyboard event.
 fn send_key_event(vk: VIRTUAL_KEY, key_up: bool) -> Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{MAP_VIRTUAL_KEY_TYPE, MapVirtualKeyW};
+    use accessibility_windows_sys::windows::Win32::UI::Input::KeyboardAndMouse::{
+        MAP_VIRTUAL_KEY_TYPE, MapVirtualKeyW,
+    };
 
     let mut flags = KEYBD_EVENT_FLAGS(0);
     if key_up {
@@ -1392,8 +1397,10 @@ fn run_windows_event_loop(
     callback: Arc<Mutex<EventCallback>>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-    use windows::Win32::UI::WindowsAndMessaging::{
+    use accessibility_windows_sys::windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+    };
+    use accessibility_windows_sys::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, TranslateMessage,
     };
 

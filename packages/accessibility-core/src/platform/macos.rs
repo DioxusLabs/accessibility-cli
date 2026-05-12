@@ -1097,10 +1097,10 @@ impl AccessibilityReader for MacOSAccessibility {
             };
             self.last_tree_pid = Some(actual_pid);
             let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
-            if !Self::wait_for_accessibility_materialization(actual_pid, &app_element) {
-                if Self::enable_full_accessibility_for_app(&app_element) {
-                    std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
-                }
+            if !Self::wait_for_accessibility_materialization(actual_pid, &app_element)
+                && Self::enable_full_accessibility_for_app(&app_element)
+            {
+                std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
             }
             Self::prime_accessibility_roots(&app_element);
 

@@ -1,0 +1,15 @@
+[package]
+name = "accessibility-android-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Low-level ADB wrappers used by accessibility-cli's Android backend."
+readme = "../../README.md"
+keywords = ["accessibility", "android", "adb", "automation"]
+categories = ["accessibility", "api-bindings", "os"]
+
+[dependencies]
+anyhow.workspace = true
+keyboard-types.workspace = true

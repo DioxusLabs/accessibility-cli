@@ -19,6 +19,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
+name = "accessibility-android-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyboard-types",
+]
+
+[[package]]
 name = "accessibility-cli"
 version = "0.1.0"
 dependencies = [
@@ -37,26 +45,19 @@ name = "accessibility-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "accessibility-android-sys",
+ "accessibility-ios-sys",
+ "accessibility-linux-sys",
  "accessibility-macos-sys",
+ "accessibility-windows-sys",
  "accesskit",
  "anyhow",
  "async-trait",
- "atspi",
- "atspi-common",
- "block2",
  "cssparser",
  "euclid",
- "futures-lite",
  "image",
  "imageproc",
  "keyboard-types",
- "libc",
- "objc2",
- "objc2-app-kit",
- "objc2-application-services",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation",
  "quick-xml 0.37.5",
  "selectors",
  "serde",
@@ -65,7 +66,29 @@ dependencies = [
  "slotmap",
  "tokio",
  "viuer",
- "windows",
+]
+
+[[package]]
+name = "accessibility-ios-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "block2",
+ "libc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "accessibility-linux-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atspi",
+ "atspi-common",
+ "futures-lite",
+ "tokio",
  "x11rb",
  "zbus",
 ]
@@ -83,6 +106,16 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
+]
+
+[[package]]
+name = "accessibility-windows-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "keyboard-types",
+ "windows",
 ]
 
 [[package]]

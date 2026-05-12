@@ -1,0 +1,28 @@
+[package]
+name = "accessibility-windows-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Safe low-level wrappers around Windows UI Automation, GDI, and input APIs used by accessibility-cli."
+readme = "../../README.md"
+keywords = ["accessibility", "windows", "uia", "automation"]
+categories = ["accessibility", "api-bindings", "os::windows-apis"]
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+keyboard-types.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+] }
+

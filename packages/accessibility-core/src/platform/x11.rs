@@ -8,22 +8,25 @@ use crate::accessibility::{
     ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
     StopReason, StructureChangeType, TreeFilter,
 };
+use accessibility_linux_sys::atspi::proxy::accessible::AccessibleProxy;
+use accessibility_linux_sys::atspi::proxy::action::ActionProxy;
+use accessibility_linux_sys::atspi::proxy::component::ComponentProxy;
+use accessibility_linux_sys::atspi::proxy::editable_text::EditableTextProxy;
+use accessibility_linux_sys::atspi::proxy::text::TextProxy;
+use accessibility_linux_sys::atspi::proxy::value::ValueProxy;
+use accessibility_linux_sys::atspi::{
+    InterfaceSet, Role as AtspiRole, connection::AccessibilityConnection,
+};
+use accessibility_linux_sys::atspi_common::CoordType;
+use accessibility_linux_sys::zbus::fdo::DBusProxy;
+use accessibility_linux_sys::zbus::proxy::CacheProperties;
+use accessibility_linux_sys::{atspi, x11rb, zbus};
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
-use atspi::proxy::accessible::AccessibleProxy;
-use atspi::proxy::action::ActionProxy;
-use atspi::proxy::component::ComponentProxy;
-use atspi::proxy::editable_text::EditableTextProxy;
-use atspi::proxy::text::TextProxy;
-use atspi::proxy::value::ValueProxy;
-use atspi::{InterfaceSet, Role as AtspiRole, connection::AccessibilityConnection};
-use atspi_common::CoordType;
 use slotmap::SecondaryMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use zbus::fdo::DBusProxy;
-use zbus::proxy::CacheProperties;
 
 /// Macro to generate D-Bus proxy factory functions with consistent error handling.
 macro_rules! create_proxy_fn {
@@ -87,7 +90,7 @@ impl LinuxAccessibility {
 
     /// Get the PID of a D-Bus bus name owner.
     async fn get_pid_for_bus_name(conn: &zbus::Connection, bus_name: &str) -> Option<u32> {
-        use zbus::names::BusName;
+        use accessibility_linux_sys::zbus::names::BusName;
         let dbus_proxy = DBusProxy::new(conn).await.ok()?;
         let bus_name = BusName::try_from(bus_name).ok()?;
         dbus_proxy
@@ -690,7 +693,7 @@ impl LinuxAccessibility {
     ///
     /// Returns screen coordinates and dimensions.
     pub fn get_global_screen_bounds() -> Result<Rect> {
-        use x11rb::connection::Connection;
+        use accessibility_linux_sys::x11rb::connection::Connection;
 
         // Connect to X11 display
         let (conn, screen_num) =
@@ -711,8 +714,8 @@ impl LinuxAccessibility {
     ///
     /// Searches through X11 windows to find one matching the PID.
     pub fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::ConnectionExt as _;
+        use accessibility_linux_sys::x11rb::connection::Connection;
+        use accessibility_linux_sys::x11rb::protocol::xproto::ConnectionExt as _;
 
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let screen = &conn.setup().roots[screen_num];
@@ -737,7 +740,7 @@ impl LinuxAccessibility {
         pid_atom: u32,
         target_pid: u32,
     ) -> Option<Rect> {
-        use x11rb::protocol::xproto::ConnectionExt as _;
+        use accessibility_linux_sys::x11rb::protocol::xproto::ConnectionExt as _;
 
         // Check if this window has the target PID
         if let Ok(reply) = conn
@@ -1227,7 +1230,7 @@ async fn run_linux_event_loop(
     callback: Arc<Mutex<EventCallback>>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    use futures_lite::StreamExt;
+    use accessibility_linux_sys::futures_lite::StreamExt;
 
     // Create a new accessibility connection for event listening
     let atspi_conn = match AccessibilityConnection::new().await {
