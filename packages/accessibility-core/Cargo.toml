@@ -38,6 +38,7 @@ objc2-core-foundation = { version = "0.3", features = [
     "CFCGTypes",
     "CFBase",
     "CFRunLoop",
+    "CFDate",
 ] }
 objc2-application-services = { version = "0.3", features = [
     "AXUIElement",

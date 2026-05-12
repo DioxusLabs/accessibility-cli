@@ -17,8 +17,12 @@ use anyhow::{Result, anyhow, bail};
 use keyboard_types::{Code, Modifiers};
 use objc2::{AnyThread, runtime::AnyObject};
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
-use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CGRect};
+use objc2_application_services::{
+    AXError, AXIsProcessTrusted, AXObserver, AXUIElement, AXValue, AXValueType,
+};
+use objc2_core_foundation::{
+    CFArray, CFIndex, CFRetained, CFRunLoop, CFString, CFType, CGRect, kCFRunLoopDefaultMode,
+};
 use objc2_core_graphics::{
     CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventType, CGImage, CGMainDisplayID,
     CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption, CGWindowListOption,
@@ -48,7 +52,65 @@ const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_WINDOWS: &str = "AXWindows";
 const AX_MAIN_WINDOW: &str = "AXMainWindow";
 const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
+const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
 const AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY: Duration = Duration::from_millis(2100);
+const AX_VISIBLE_CHILDREN: &str = "AXVisibleChildren";
+const AX_CHILDREN_IN_NAVIGATION_ORDER: &str = "AXChildrenInNavigationOrder";
+const AX_CONTENTS: &str = "AXContents";
+const AX_ROWS: &str = "AXRows";
+const AX_COLUMNS: &str = "AXColumns";
+const AX_TABS: &str = "AXTabs";
+const AX_TOOLBAR: &str = "AXToolbar";
+const AX_SPLITTERS: &str = "AXSplitters";
+const AX_SELECTED_CHILDREN: &str = "AXSelectedChildren";
+const AX_SELECTED_ROWS: &str = "AXSelectedRows";
+const AX_SELECTED_COLUMNS: &str = "AXSelectedColumns";
+const AX_CREATED_NOTIFICATION: &str = "AXCreated";
+const AX_LOAD_COMPLETE_NOTIFICATION: &str = "AXLoadComplete";
+const AX_LAYOUT_COMPLETE_NOTIFICATION: &str = "AXLayoutComplete";
+const AX_CHILDREN_CHANGED_NOTIFICATION: &str = "AXChildrenChanged";
+const AX_VALUE_CHANGED_NOTIFICATION: &str = "AXValueChanged";
+const AX_TITLE_CHANGED_NOTIFICATION: &str = "AXTitleChanged";
+const AX_WINDOW_CREATED_NOTIFICATION: &str = "AXWindowCreated";
+const AX_MAIN_WINDOW_CHANGED_NOTIFICATION: &str = "AXMainWindowChanged";
+const AX_FOCUSED_WINDOW_CHANGED_NOTIFICATION: &str = "AXFocusedWindowChanged";
+const AX_FOCUSED_UI_ELEMENT_CHANGED_NOTIFICATION: &str = "AXFocusedUIElementChanged";
+const AX_ROW_COUNT_CHANGED_NOTIFICATION: &str = "AXRowCountChanged";
+const AX_SELECTED_CHILDREN_CHANGED_NOTIFICATION: &str = "AXSelectedChildrenChanged";
+const AX_LIVE_REGION_CREATED_NOTIFICATION: &str = "AXLiveRegionCreated";
+const AX_LIVE_REGION_CHANGED_NOTIFICATION: &str = "AXLiveRegionChanged";
+
+const AX_CHILD_ATTRIBUTES: &[&str] = &[
+    AX_CHILDREN,
+    AX_VISIBLE_CHILDREN,
+    AX_CHILDREN_IN_NAVIGATION_ORDER,
+    AX_CONTENTS,
+    AX_ROWS,
+    AX_COLUMNS,
+    AX_TABS,
+    AX_TOOLBAR,
+    AX_SPLITTERS,
+    AX_SELECTED_CHILDREN,
+    AX_SELECTED_ROWS,
+    AX_SELECTED_COLUMNS,
+];
+
+const AX_MATERIALIZATION_NOTIFICATIONS: &[&str] = &[
+    AX_CREATED_NOTIFICATION,
+    AX_LOAD_COMPLETE_NOTIFICATION,
+    AX_LAYOUT_COMPLETE_NOTIFICATION,
+    AX_CHILDREN_CHANGED_NOTIFICATION,
+    AX_VALUE_CHANGED_NOTIFICATION,
+    AX_TITLE_CHANGED_NOTIFICATION,
+    AX_WINDOW_CREATED_NOTIFICATION,
+    AX_MAIN_WINDOW_CHANGED_NOTIFICATION,
+    AX_FOCUSED_WINDOW_CHANGED_NOTIFICATION,
+    AX_FOCUSED_UI_ELEMENT_CHANGED_NOTIFICATION,
+    AX_ROW_COUNT_CHANGED_NOTIFICATION,
+    AX_SELECTED_CHILDREN_CHANGED_NOTIFICATION,
+    AX_LIVE_REGION_CREATED_NOTIFICATION,
+    AX_LIVE_REGION_CHANGED_NOTIFICATION,
+];
 
 // AX Action constants
 const AX_PRESS: &str = "AXPress";
@@ -159,6 +221,17 @@ fn ax_ui_element_get_window() -> Option<AXUIElementGetWindowFn> {
             ))
         }
     })
+}
+
+unsafe extern "C-unwind" fn ax_materialization_callback(
+    _observer: NonNull<AXObserver>,
+    _element: NonNull<AXUIElement>,
+    _notification: NonNull<CFString>,
+    refcon: *mut c_void,
+) {
+    if let Some(notified) = unsafe { (refcon as *const AtomicBool).as_ref() } {
+        notified.store(true, Ordering::SeqCst);
+    }
 }
 
 /// macOS accessibility reader using AXUIElement API.
@@ -675,52 +748,192 @@ impl MacOSAccessibility {
         }
     }
 
-    /// Ask the target app to expose its enhanced accessibility interface.
-    ///
-    /// Chromium handles this private attribute before forwarding to AppKit's
-    /// default setter, so an AX error can be returned even when the request was
-    /// observed by the app.
-    unsafe fn enable_enhanced_user_interface(app: &AXUIElement) -> bool {
-        let attr = CFString::from_str(AX_ENHANCED_USER_INTERFACE);
-        if let Some(value) = objc2_core_foundation::kCFBooleanTrue {
-            let _ = app.set_attribute_value(&attr, value.as_ref());
-            true
+    unsafe fn set_bool_attribute(element: &AXUIElement, attribute: &str, enabled: bool) -> bool {
+        Self::set_bool_attribute_result(element, attribute, enabled) == AXError::Success
+    }
+
+    unsafe fn set_bool_attribute_result(
+        element: &AXUIElement,
+        attribute: &str,
+        enabled: bool,
+    ) -> AXError {
+        let attr = CFString::from_str(attribute);
+        let value = if enabled {
+            objc2_core_foundation::kCFBooleanTrue
         } else {
-            false
+            objc2_core_foundation::kCFBooleanFalse
+        };
+
+        if let Some(value) = value {
+            element.set_attribute_value(&attr, value.as_ref())
+        } else {
+            AXError::Failure
         }
     }
 
-    unsafe fn enable_enhanced_user_interface_for_app(app: &AXUIElement) -> bool {
-        let mut requested = Self::enable_enhanced_user_interface(app);
-
-        if let Ok(value) = Self::get_attribute(app, AX_MAIN_WINDOW) {
-            let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(value);
-            requested |= Self::enable_enhanced_user_interface(&window);
+    unsafe fn has_attribute_name(element: &AXUIElement, attribute: &str) -> bool {
+        let mut names: *const CFArray = std::ptr::null();
+        let result = element.copy_attribute_names(NonNull::new(&mut names).unwrap());
+        if result != AXError::Success || names.is_null() {
+            return false;
         }
 
-        if let Ok(value) = Self::get_attribute(app, AX_WINDOWS) {
-            let windows: CFRetained<CFArray<AXUIElement>> = CFRetained::cast_unchecked(value);
-            for i in 0..windows.len() {
-                if let Some(window) = windows.get(i) {
-                    requested |= Self::enable_enhanced_user_interface(&window);
-                }
+        let names = NonNull::new(names as *mut CFArray as *mut CFArray<CFString>).unwrap();
+        let array: CFRetained<CFArray<CFString>> = CFRetained::from_raw(names);
+        for i in 0..array.len() {
+            if array
+                .get(i)
+                .is_some_and(|name| name.to_string() == attribute)
+            {
+                return true;
             }
         }
 
-        requested
+        false
     }
 
-    fn needs_enhanced_user_interface_settle_delay(app_name: Option<&str>) -> bool {
-        let Some(app_name) = app_name else {
+    /// Ask the target application to expose its full accessibility interface.
+    ///
+    /// Chromium's macOS screen-reader detection is wired to the application-level
+    /// AX element. Electron apps additionally honor AXManualAccessibility.
+    unsafe fn enable_full_accessibility_for_app(app: &AXUIElement) -> bool {
+        let _ = Self::get_attribute(app, AX_ROLE);
+        let manual = Self::set_bool_attribute(app, AX_MANUAL_ACCESSIBILITY, true);
+        let _ = Self::set_bool_attribute(app, AX_ENHANCED_USER_INTERFACE, false);
+        let enhanced = Self::set_bool_attribute(app, AX_ENHANCED_USER_INTERFACE, true);
+        manual || enhanced
+    }
+
+    unsafe fn prime_accessibility_roots(app: &AXUIElement) {
+        let _ = Self::get_attribute(app, AX_FOCUSED_UI_ELEMENT);
+        let _ = Self::get_children(app);
+
+        for window in Self::get_application_windows(app) {
+            let _ = Self::get_children(&window);
+            let _ = Self::get_attribute(&window, AX_FOCUSED_UI_ELEMENT);
+        }
+    }
+
+    unsafe fn observe_materialization_notifications(
+        observer: &AXObserver,
+        element: &AXUIElement,
+        notified: &AtomicBool,
+    ) {
+        for notification in AX_MATERIALIZATION_NOTIFICATIONS {
+            let notification = CFString::from_str(notification);
+            let _ = observer.add_notification(
+                element,
+                &notification,
+                notified as *const AtomicBool as *mut c_void,
+            );
+        }
+    }
+
+    unsafe fn wait_for_accessibility_materialization(pid: u32, app: &AXUIElement) -> bool {
+        let mut observer_ptr: *mut AXObserver = std::ptr::null_mut();
+        let Some(out_observer) = NonNull::new(&mut observer_ptr as *mut *mut AXObserver) else {
             return false;
         };
-        let app_name = app_name.to_ascii_lowercase();
 
-        [
-            "chrome", "chromium", "brave", "edge", "opera", "vivaldi", "arc",
-        ]
-        .iter()
-        .any(|browser| app_name.contains(browser))
+        let result = AXObserver::create(
+            pid as libc::pid_t,
+            Some(ax_materialization_callback),
+            out_observer,
+        );
+        if result != AXError::Success {
+            return false;
+        }
+
+        let Some(observer_ptr) = NonNull::new(observer_ptr) else {
+            return false;
+        };
+
+        let observer = CFRetained::from_raw(observer_ptr);
+        let notified = AtomicBool::new(false);
+        Self::observe_materialization_notifications(&observer, app, &notified);
+
+        let Some(run_loop) = CFRunLoop::current() else {
+            return false;
+        };
+        let source = observer.run_loop_source();
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        run_loop.add_source(Some(&source), mode);
+
+        let requested = Self::enable_full_accessibility_for_app(app);
+        Self::prime_accessibility_roots(app);
+        if !requested && !Self::has_attribute_name(app, AX_ENHANCED_USER_INTERFACE) {
+            run_loop.remove_source(Some(&source), mode);
+            return false;
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if Self::has_materialized_web_area(app) {
+                run_loop.remove_source(Some(&source), mode);
+                return true;
+            }
+            CFRunLoop::run_in_mode(mode, 0.1, true);
+            if notified.swap(false, Ordering::SeqCst) {
+                Self::prime_accessibility_roots(app);
+            }
+        }
+
+        run_loop.remove_source(Some(&source), mode);
+        Self::has_materialized_web_area(app)
+    }
+
+    unsafe fn has_materialized_web_area(element: &AXUIElement) -> bool {
+        fn walk(
+            element: &AXUIElement,
+            depth: usize,
+            seen: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if depth > 24 {
+                return false;
+            }
+            let signature = MacOSAccessibility::element_signature(element);
+            if !seen.insert(signature) {
+                return false;
+            }
+
+            let role = unsafe { MacOSAccessibility::get_string_attribute(element, AX_ROLE) };
+            let children = unsafe { MacOSAccessibility::get_children(element) };
+            if role.as_deref() == Some(ROLE_WEB_AREA) && !children.is_empty() {
+                return true;
+            }
+
+            children.iter().any(|child| walk(child, depth + 1, seen))
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        walk(element, 0, &mut seen)
+    }
+
+    fn element_signature(element: &AXUIElement) -> String {
+        let pid = unsafe { Self::get_pid_for_element(element) };
+        let role = unsafe { Self::get_string_attribute(element, AX_ROLE) };
+        let title = unsafe { Self::get_string_attribute(element, AX_TITLE) };
+        let description = unsafe { Self::get_string_attribute(element, AX_DESCRIPTION) };
+        let bounds = unsafe { Self::get_bounds(element) }.map(|bounds| {
+            (
+                bounds.origin.x.round() as i64,
+                bounds.origin.y.round() as i64,
+                bounds.size.width.round() as i64,
+                bounds.size.height.round() as i64,
+            )
+        });
+
+        format!("{pid:?}|{role:?}|{title:?}|{description:?}|{bounds:?}")
+    }
+
+    unsafe fn push_unique_element(
+        elements: &mut Vec<CFRetained<AXUIElement>>,
+        seen: &mut std::collections::HashSet<String>,
+        element: CFRetained<AXUIElement>,
+    ) {
+        if seen.insert(Self::element_signature(&element)) {
+            elements.push(element);
+        }
     }
 
     /// Get a string attribute value.
@@ -794,22 +1007,78 @@ impl MacOSAccessibility {
 
     /// Get the children of an element.
     unsafe fn get_children(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
-        let value = match unsafe { Self::get_attribute(element, AX_CHILDREN) } {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-
-        // The returned value is a CFArray of AXUIElements
-        // Use cast_unchecked to convert CFType to CFArray<AXUIElement>
-        let array: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(value) };
-
         let mut children = Vec::new();
-        for i in 0..array.len() {
-            if let Some(child) = array.get(i) {
-                children.push(child);
+        let mut seen = std::collections::HashSet::new();
+
+        for attribute in AX_CHILD_ATTRIBUTES {
+            for child in Self::get_array_attribute_values(element, attribute) {
+                Self::push_unique_element(&mut children, &mut seen, child);
+            }
+
+            let value = match unsafe { Self::get_attribute(element, attribute) } {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match value.downcast::<CFArray>() {
+                Ok(array) => {
+                    let array: CFRetained<CFArray<AXUIElement>> =
+                        unsafe { CFRetained::cast_unchecked(array) };
+                    for i in 0..array.len() {
+                        if let Some(child) = array.get(i) {
+                            Self::push_unique_element(&mut children, &mut seen, child);
+                        }
+                    }
+                }
+                Err(value) => {
+                    let child: CFRetained<AXUIElement> =
+                        unsafe { CFRetained::cast_unchecked(value) };
+                    Self::push_unique_element(&mut children, &mut seen, child);
+                }
             }
         }
+
         children
+    }
+
+    unsafe fn get_array_attribute_values(
+        element: &AXUIElement,
+        attribute: &str,
+    ) -> Vec<CFRetained<AXUIElement>> {
+        let attribute = CFString::from_str(attribute);
+        let mut count: CFIndex = 0;
+        let result = element.attribute_value_count(&attribute, NonNull::new(&mut count).unwrap());
+        if result != AXError::Success || count <= 0 {
+            return Vec::new();
+        }
+
+        let mut values = Vec::new();
+        let mut index: CFIndex = 0;
+        while index < count {
+            let max_values = (count - index).min(256);
+            let mut array: *const CFArray = std::ptr::null();
+            let result = element.copy_attribute_values(
+                &attribute,
+                index,
+                max_values,
+                NonNull::new(&mut array).unwrap(),
+            );
+            if result != AXError::Success || array.is_null() {
+                break;
+            }
+
+            let array = NonNull::new(array as *mut CFArray as *mut CFArray<AXUIElement>).unwrap();
+            let array: CFRetained<CFArray<AXUIElement>> = CFRetained::from_raw(array);
+            for i in 0..array.len() {
+                if let Some(child) = array.get(i) {
+                    values.push(child);
+                }
+            }
+
+            index += max_values;
+        }
+
+        values
     }
 
     /// Get the windows of an application element.
@@ -1081,7 +1350,7 @@ impl MacOSAccessibility {
     /// Get the main window for a given PID using accessibility APIs.
     unsafe fn get_window_for_pid(pid: u32) -> Option<CFRetained<AXUIElement>> {
         let app = AXUIElement::new_application(pid as i32);
-        Self::enable_enhanced_user_interface_for_app(&app);
+        Self::enable_full_accessibility_for_app(&app);
 
         if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
             let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
@@ -1230,11 +1499,12 @@ impl AccessibilityReader for MacOSAccessibility {
             self.last_tree_pid = Some(actual_pid);
             let app_name = unsafe { Self::get_string_attribute(&app_element, AX_TITLE) };
             unsafe {
-                if Self::enable_enhanced_user_interface_for_app(&app_element)
-                    && Self::needs_enhanced_user_interface_settle_delay(app_name.as_deref())
-                {
-                    std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
+                if !Self::wait_for_accessibility_materialization(actual_pid, &app_element) {
+                    if Self::enable_full_accessibility_for_app(&app_element) {
+                        std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
+                    }
                 }
+                Self::prime_accessibility_roots(&app_element);
             }
 
             // Build the tree
