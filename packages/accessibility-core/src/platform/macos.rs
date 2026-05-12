@@ -47,6 +47,8 @@ const AX_FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
 const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_WINDOWS: &str = "AXWindows";
 const AX_MAIN_WINDOW: &str = "AXMainWindow";
+const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
+const AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY: Duration = Duration::from_millis(2100);
 
 // AX Action constants
 const AX_PRESS: &str = "AXPress";
@@ -673,6 +675,54 @@ impl MacOSAccessibility {
         }
     }
 
+    /// Ask the target app to expose its enhanced accessibility interface.
+    ///
+    /// Chromium handles this private attribute before forwarding to AppKit's
+    /// default setter, so an AX error can be returned even when the request was
+    /// observed by the app.
+    unsafe fn enable_enhanced_user_interface(app: &AXUIElement) -> bool {
+        let attr = CFString::from_str(AX_ENHANCED_USER_INTERFACE);
+        if let Some(value) = objc2_core_foundation::kCFBooleanTrue {
+            let _ = app.set_attribute_value(&attr, value.as_ref());
+            true
+        } else {
+            false
+        }
+    }
+
+    unsafe fn enable_enhanced_user_interface_for_app(app: &AXUIElement) -> bool {
+        let mut requested = Self::enable_enhanced_user_interface(app);
+
+        if let Ok(value) = Self::get_attribute(app, AX_MAIN_WINDOW) {
+            let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(value);
+            requested |= Self::enable_enhanced_user_interface(&window);
+        }
+
+        if let Ok(value) = Self::get_attribute(app, AX_WINDOWS) {
+            let windows: CFRetained<CFArray<AXUIElement>> = CFRetained::cast_unchecked(value);
+            for i in 0..windows.len() {
+                if let Some(window) = windows.get(i) {
+                    requested |= Self::enable_enhanced_user_interface(&window);
+                }
+            }
+        }
+
+        requested
+    }
+
+    fn needs_enhanced_user_interface_settle_delay(app_name: Option<&str>) -> bool {
+        let Some(app_name) = app_name else {
+            return false;
+        };
+        let app_name = app_name.to_ascii_lowercase();
+
+        [
+            "chrome", "chromium", "brave", "edge", "opera", "vivaldi", "arc",
+        ]
+        .iter()
+        .any(|browser| app_name.contains(browser))
+    }
+
     /// Get a string attribute value.
     unsafe fn get_string_attribute(element: &AXUIElement, attribute: &str) -> Option<String> {
         Self::get_attribute(element, attribute)
@@ -1031,6 +1081,7 @@ impl MacOSAccessibility {
     /// Get the main window for a given PID using accessibility APIs.
     unsafe fn get_window_for_pid(pid: u32) -> Option<CFRetained<AXUIElement>> {
         let app = AXUIElement::new_application(pid as i32);
+        Self::enable_enhanced_user_interface_for_app(&app);
 
         if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
             let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
@@ -1177,6 +1228,14 @@ impl AccessibilityReader for MacOSAccessibility {
                 }
             };
             self.last_tree_pid = Some(actual_pid);
+            let app_name = unsafe { Self::get_string_attribute(&app_element, AX_TITLE) };
+            unsafe {
+                if Self::enable_enhanced_user_interface_for_app(&app_element)
+                    && Self::needs_enhanced_user_interface_settle_delay(app_name.as_deref())
+                {
+                    std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
+                }
+            }
 
             // Build the tree
             let mut element_count = 0;
@@ -1184,9 +1243,6 @@ impl AccessibilityReader for MacOSAccessibility {
                 self.build_element(&app_element, filter, 0, &mut element_count)
                     .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?
             };
-
-            // Try to get app name
-            let app_name = unsafe { Self::get_string_attribute(&app_element, AX_TITLE) };
 
             Ok(ElementTree {
                 version,
