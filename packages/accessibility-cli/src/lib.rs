@@ -915,6 +915,50 @@ async fn handle_event_listening(
     println!("\nEvent listener stopped. Total events received: {}", total);
 }
 
+/// Print a passive list of visible windows/applications for PID discovery.
+async fn handle_list_windows(adapter: &TargetedAccessibility, args: &CommonArgs) {
+    let windows = adapter.list_windows().await;
+
+    if args.json {
+        let rows = windows
+            .iter()
+            .map(|(pid, app_name, window_title, focused)| {
+                serde_json::json!({
+                    "pid": pid,
+                    "app_name": app_name,
+                    "window_title": window_title,
+                    "focused": focused,
+                })
+            })
+            .collect::<Vec<_>>();
+        match serde_json::to_string_pretty(&rows) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Failed to serialize window list: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if windows.is_empty() {
+        println!("No windows found.");
+        return;
+    }
+
+    println!("{:<8} {:<8} {:<28} Window", "PID", "Focused", "App");
+    for (pid, app_name, window_title, focused) in windows {
+        let focused = if focused { "*" } else { "" };
+        println!(
+            "{:<8} {:<8} {:<28} {}",
+            pid,
+            focused,
+            truncate(&app_name, 28),
+            window_title
+        );
+    }
+}
+
 /// Check if this operation type supports timeout polling.
 /// Only element-targeting operations (query, click, focus, blur, type, key) support polling.
 fn operation_supports_timeout(args: &CommonArgs) -> bool {
@@ -936,6 +980,11 @@ async fn run_platform(
     hit_test_coords: Option<(f64, f64)>,
     target_pid: Option<u32>,
 ) {
+    if args.list_windows {
+        handle_list_windows(adapter, args).await;
+        return;
+    }
+
     // Handle event listening mode
     if args.listen {
         handle_event_listening(adapter, args, target_pid).await;
@@ -1262,6 +1311,10 @@ pub struct CommonArgs {
     /// Only show visible elements
     #[arg(long)]
     visible: bool,
+
+    /// List windows/applications and their PIDs without activating them
+    #[arg(long)]
+    list_windows: bool,
 
     /// Output as JSON
     #[arg(long)]

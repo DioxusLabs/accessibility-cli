@@ -211,68 +211,57 @@ impl LinuxAccessibility {
         }
 
         // Get bounds from Component interface if available
-        if interfaces.contains(atspi::Interface::Component) {
-            if let Ok(component) =
+        if interfaces.contains(atspi::Interface::Component)
+            && let Ok(component) =
                 Self::create_component_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await {
-                    element.bounds = Some(Rect::new(
-                        Point::new(x as f64, y as f64),
-                        Size::new(width as f64, height as f64),
-                    ));
-                }
-            }
+            && let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
+        {
+            element.bounds = Some(Rect::new(
+                Point::new(x as f64, y as f64),
+                Size::new(width as f64, height as f64),
+            ));
         }
 
         // Get actions from Action interface if available
         // NOTE: Some older GTK applications (like Ubuntu 20.04's gnome-calculator) have
         // a buggy GetActions implementation that crashes when called. We use NActions
         // and GetName instead which work correctly.
-        if interfaces.contains(atspi::Interface::Action) {
-            if let Ok(action_proxy) =
+        if interfaces.contains(atspi::Interface::Action)
+            && let Ok(action_proxy) =
                 Self::create_action_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                // Use nactions + get_name instead of get_actions for compatibility
-                if let Ok(n_actions) = action_proxy.nactions().await {
-                    let mut actions = Vec::new();
-                    for i in 0..n_actions {
-                        if let Ok(name) = action_proxy.get_name(i).await {
-                            actions.push(name);
-                        }
-                    }
-                    element.actions = actions;
+            && let Ok(n_actions) = action_proxy.nactions().await
+        {
+            // Use nactions + get_name instead of get_actions for compatibility
+            let mut actions = Vec::new();
+            for i in 0..n_actions {
+                if let Ok(name) = action_proxy.get_name(i).await {
+                    actions.push(name);
                 }
             }
+            element.actions = actions;
         }
 
         // Get value if Value interface is available
-        if interfaces.contains(atspi::Interface::Value) {
-            if let Ok(value_proxy) =
+        if interfaces.contains(atspi::Interface::Value)
+            && let Ok(value_proxy) =
                 Self::create_value_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok(value) = value_proxy.current_value().await {
-                    element.value = Some(value.to_string());
-                }
-            }
+            && let Ok(value) = value_proxy.current_value().await
+        {
+            element.value = Some(value.to_string());
         }
 
         // Get text content if Text interface is available (for text inputs)
         // Only read if we don't already have a value from Value interface
-        if element.value.is_none() && interfaces.contains(atspi::Interface::Text) {
-            if let Ok(text_proxy) =
+        if element.value.is_none()
+            && interfaces.contains(atspi::Interface::Text)
+            && let Ok(text_proxy) =
                 Self::create_text_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                // Get character count first, then read all text
-                if let Ok(char_count) = text_proxy.character_count().await {
-                    if char_count > 0 {
-                        if let Ok(text) = text_proxy.get_text(0, char_count).await {
-                            if !text.is_empty() {
-                                element.value = Some(text);
-                            }
-                        }
-                    }
-                }
-            }
+            && let Ok(char_count) = text_proxy.character_count().await
+            && char_count > 0
+            && let Ok(text) = text_proxy.get_text(0, char_count).await
+            && !text.is_empty()
+        {
+            element.value = Some(text);
         }
 
         Some(element)
@@ -1212,22 +1201,33 @@ async fn build_element_from_event(
     }
 
     // Try to get bounds from Component interface
-    if let Ok(interfaces) = proxy.get_interfaces().await {
-        if interfaces.contains(atspi::Interface::Component) {
-            if let Ok(component) =
-                LinuxAccessibility::create_component_proxy(conn, bus_name, object_path).await
-            {
-                if let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await {
-                    element.bounds = Some(Rect::new(
-                        Point::new(x as f64, y as f64),
-                        Size::new(width as f64, height as f64),
-                    ));
-                }
-            }
-        }
+    if let Ok(interfaces) = proxy.get_interfaces().await
+        && interfaces.contains(atspi::Interface::Component)
+        && let Ok(component) =
+            LinuxAccessibility::create_component_proxy(conn, bus_name, object_path).await
+        && let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
+    {
+        element.bounds = Some(Rect::new(
+            Point::new(x as f64, y as f64),
+            Size::new(width as f64, height as f64),
+        ));
     }
 
     Some(element)
+}
+
+async fn event_matches_target_pid(
+    conn: &zbus::Connection,
+    bus_name: &str,
+    target_pid: Option<u32>,
+) -> bool {
+    match target_pid {
+        Some(pid) => match LinuxAccessibility::get_pid_for_bus_name(conn, bus_name).await {
+            Some(event_pid) => event_pid == pid,
+            None => true,
+        },
+        None => true,
+    }
 }
 
 /// Run the Linux event loop using AT-SPI D-Bus signals.
@@ -1361,14 +1361,8 @@ async fn run_linux_event_loop(
             atspi::Event::Focus(atspi::events::FocusEvents::Focus(focus_event)) => {
                 // Check PID if filtering
                 let bus_name = focus_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1385,14 +1379,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Object(atspi::events::ObjectEvents::ChildrenChanged(children_event)) => {
                 let bus_name = children_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let parent =
@@ -1414,14 +1402,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Object(atspi::events::ObjectEvents::TextChanged(text_event)) => {
                 let bus_name = text_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1437,14 +1419,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Window(atspi::events::WindowEvents::Create(create_event)) => {
                 let bus_name = create_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1462,14 +1438,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Window(atspi::events::WindowEvents::Destroy(destroy_event)) => {
                 let bus_name = destroy_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let event_pid = LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await;

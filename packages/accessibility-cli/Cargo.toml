@@ -11,6 +11,7 @@ homepage.workspace = true
 accessibility-core.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

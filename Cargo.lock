@@ -27,6 +27,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "predicates",
+ "serde_json",
  "serial_test",
  "tokio",
 ]

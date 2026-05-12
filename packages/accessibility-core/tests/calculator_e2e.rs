@@ -43,6 +43,25 @@ struct ForegroundSnapshot {
 
 impl ForegroundSnapshot {
     fn capture() -> Self {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_error;
+
+        loop {
+            match Self::try_capture() {
+                Ok(snapshot) => return snapshot,
+                Err(error) => last_error = error,
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "Failed to query frontmost process: {last_error}"
+            );
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn try_capture() -> Result<Self, String> {
         let script = r#"
             tell application "System Events"
                 set frontmostProcess to first application process whose frontmost is true
@@ -52,27 +71,25 @@ impl ForegroundSnapshot {
         let output = Command::new("osascript")
             .args(["-e", script])
             .output()
-            .expect("Failed to query frontmost process");
+            .map_err(|e| format!("failed to run osascript: {e}"))?;
 
-        assert!(
-            output.status.success(),
-            "Failed to query frontmost process: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut parts = stdout.trim().split(", ");
-        let name = parts
-            .next()
-            .expect("frontmost process name missing")
-            .to_string();
-        let pid = parts
-            .next()
-            .expect("frontmost process PID missing")
-            .parse()
-            .expect("frontmost process PID should parse");
+        let Some(name) = parts.next().filter(|name| !name.is_empty()) else {
+            return Err("frontmost process name missing".to_string());
+        };
+        let Some(pid) = parts.next().and_then(|pid| pid.parse().ok()) else {
+            return Err("frontmost process PID missing".to_string());
+        };
 
-        Self { name, pid }
+        Ok(Self {
+            name: name.to_string(),
+            pid,
+        })
     }
 
     fn assert_unchanged(&self) {
