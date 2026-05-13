@@ -25,6 +25,7 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "dialog" => Some(Role::Dialog),
         "image" | "img" => Some(Role::Image),
         "group" => Some(Role::Group),
+        "tree" => Some(Role::Tree),
         "list" => Some(Role::List),
         "listitem" | "item" => Some(Role::ListItem),
         "toolbar" => Some(Role::Toolbar),
@@ -53,6 +54,7 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "document" => Some(Role::Document),
         "webview" => Some(Role::WebView),
         "article" => Some(Role::Article),
+        "unknown" => Some(Role::Unknown),
         "*" => None, // Universal selector
         _ => None,
     }
@@ -145,14 +147,16 @@ mod tests {
         assert_eq!(parse_role_name("MenuCheck"), Some(Role::MenuItemCheckBox));
         assert_eq!(parse_role_name("MenuRadio"), Some(Role::MenuItemRadio));
         assert_eq!(parse_role_name("Item"), Some(Role::ListItem));
+        assert_eq!(parse_role_name("Tree"), Some(Role::Tree));
         assert_eq!(parse_role_name("Nav"), Some(Role::Navigation));
         assert_eq!(parse_role_name("Header"), Some(Role::Heading));
         assert_eq!(parse_role_name("Document"), Some(Role::Document));
         assert_eq!(parse_role_name("WebView"), Some(Role::WebView));
+        assert_eq!(parse_role_name("Unknown"), Some(Role::Unknown));
         assert_eq!(parse_role_name("Aside"), Some(Role::Complementary));
         assert_eq!(parse_role_name("Footer"), Some(Role::ContentInfo));
         assert_eq!(parse_role_name("*"), None);
-        assert_eq!(parse_role_name("unknown"), None);
+        assert_eq!(parse_role_name("notarole"), None);
     }
 
     #[test]

@@ -96,6 +96,14 @@ impl AxAttributeValues {
 
         success.then_some(Size::new(size.width, size.height))
     }
+
+    pub fn elements(&self, index: usize) -> Vec<AxElement> {
+        let Some(value) = self.values.get(index).and_then(Clone::clone) else {
+            return Vec::new();
+        };
+
+        ax_elements_from_value(value)
+    }
 }
 
 fn is_ax_error_value(value: &CFType) -> bool {
@@ -103,6 +111,33 @@ fn is_ax_error_value(value: &CFType) -> bool {
         let value_type = unsafe { value.r#type() };
         value_type == AXValueType::AXError
     })
+}
+
+fn ax_elements_from_value(value: CFRetained<CFType>) -> Vec<AxElement> {
+    if value.downcast_ref::<CFNull>().is_some() || is_ax_error_value(&value) {
+        return Vec::new();
+    }
+
+    let mut elements = Vec::new();
+
+    match value.downcast::<CFArray>() {
+        Ok(array) => {
+            let array: CFRetained<CFArray<AXUIElement>> =
+                unsafe { CFRetained::cast_unchecked(array) };
+            for i in 0..array.len() {
+                if let Some(element) = array.get(i) {
+                    elements.push(AxElement::new(element));
+                }
+            }
+        }
+        Err(value) => {
+            if let Ok(element) = value.downcast::<AXUIElement>() {
+                elements.push(AxElement::new(element));
+            }
+        }
+    }
+
+    elements
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +240,12 @@ impl AxElement {
         self.inner.as_ref() as *const AXUIElement as usize
     }
 
+    pub fn is_same_element(&self, other: &Self) -> bool {
+        let lhs: &CFType = self.inner.as_ref();
+        let rhs: &CFType = other.inner.as_ref();
+        lhs == rhs
+    }
+
     pub fn pid(&self) -> Option<u32> {
         let mut pid: libc::pid_t = 0;
         let pid_ptr = NonNull::new(&mut pid as *mut libc::pid_t)?;
@@ -302,6 +343,15 @@ impl AxElement {
         Some(AxAttributeValues { values })
     }
 
+    pub fn attribute_element_values(&self, attributes: &[&str]) -> Option<Vec<Vec<AxElement>>> {
+        let values = self.attribute_values(attributes)?;
+        Some(
+            (0..attributes.len())
+                .map(|index| values.elements(index))
+                .collect(),
+        )
+    }
+
     pub fn attribute_string(&self, attribute: &str) -> Option<String> {
         self.copy_attribute_value(attribute)
             .ok()
@@ -363,26 +413,7 @@ impl AxElement {
             Err(_) => return Vec::new(),
         };
 
-        let mut elements = Vec::new();
-
-        match value.downcast::<CFArray>() {
-            Ok(array) => {
-                let array: CFRetained<CFArray<AXUIElement>> =
-                    unsafe { CFRetained::cast_unchecked(array) };
-                for i in 0..array.len() {
-                    if let Some(element) = array.get(i) {
-                        elements.push(Self::new(element));
-                    }
-                }
-            }
-            Err(value) => {
-                if let Ok(element) = value.downcast::<AXUIElement>() {
-                    elements.push(Self::new(element));
-                }
-            }
-        }
-
-        elements
+        ax_elements_from_value(value)
     }
 
     pub fn ui_elements_for_search_predicate(

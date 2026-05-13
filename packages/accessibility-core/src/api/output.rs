@@ -203,6 +203,7 @@ fn format_role_query_name(role: Role) -> &'static str {
         Role::TextRun => "TextRun",
         Role::Label => "Label",
         Role::Group => "Group",
+        Role::Tree => "Tree",
         Role::List => "List",
         Role::ListItem => "ListItem",
         Role::Cell => "Cell",
@@ -223,6 +224,7 @@ fn format_role_query_name(role: Role) -> &'static str {
         Role::Document => "Document",
         Role::WebView => "WebView",
         Role::Heading => "Heading",
+        Role::Unknown => "Unknown",
         _ => "*",
     }
 }
@@ -1230,13 +1232,14 @@ impl SelectorAttr {
 
     fn removal_cost(&self, is_target: bool) -> u16 {
         match self.kind {
-            SelectorAttrKind::Actions | SelectorAttrKind::Url => 800,
+            SelectorAttrKind::Url => 800,
             SelectorAttrKind::Title
             | SelectorAttrKind::Description
             | SelectorAttrKind::Value
             | SelectorAttrKind::Help
             | SelectorAttrKind::Identifier
-            | SelectorAttrKind::RoleDescription => {
+            | SelectorAttrKind::RoleDescription
+            | SelectorAttrKind::Actions => {
                 if is_target {
                     100
                 } else {
@@ -1255,6 +1258,7 @@ impl SelectorAttr {
                 | SelectorAttrKind::Help
                 | SelectorAttrKind::Identifier
                 | SelectorAttrKind::RoleDescription
+                | SelectorAttrKind::Actions
         )
     }
 
@@ -1514,38 +1518,29 @@ fn collect_llm_query_tree_lines(root: &Element, structure_only: bool) -> Vec<Css
         return lines;
     }
 
-    let mut windows: Vec<&Element> = Vec::new();
-    let mut menubar: Option<&Element> = None;
-    let mut other_interactive: Vec<&Element> = Vec::new();
-
     for child in &root.children {
-        match child.role {
-            Role::Window | Role::Dialog => windows.push(child),
-            Role::MenuBar => menubar = Some(child),
-            _ => {
-                collect_interactive(child, &mut other_interactive);
-            }
-        }
+        collect_full_node_css_lines(child, 1, &mut lines);
     }
-
-    for window in &windows {
-        collect_window_css_lines(window, 1, &mut lines);
-    }
-
-    if let Some(mb) = menubar {
-        collect_menubar_css_lines(mb, 1, &mut lines);
-    }
-
-    if !other_interactive.is_empty() {
-        for elem in other_interactive {
-            lines.push(CssTreeLine {
-                element: elem,
-                depth: 1,
-            });
-        }
-    }
-
     lines
+}
+
+fn collect_full_node_css_lines<'a>(
+    element: &'a Element,
+    depth: usize,
+    lines: &mut Vec<CssTreeLine<'a>>,
+) {
+    let mut stack = vec![(element, depth)];
+
+    while let Some((current, current_depth)) = stack.pop() {
+        lines.push(CssTreeLine {
+            element: current,
+            depth: current_depth,
+        });
+
+        for child in current.children.iter().rev() {
+            stack.push((child, current_depth + 1));
+        }
+    }
 }
 
 fn render_css_tree_lines(
@@ -1702,128 +1697,6 @@ fn has_structural_descendants(element: &Element) -> bool {
         }
     }
     false
-}
-
-fn count_interactive_descendants(element: &Element) -> usize {
-    let mut count = 0;
-    let mut stack = vec![element];
-    while let Some(current) = stack.pop() {
-        if is_llm_relevant(current) {
-            count += 1;
-        }
-        for child in current.children.iter().rev() {
-            stack.push(child);
-        }
-    }
-    count
-}
-
-fn collect_window_css_lines<'a>(
-    window: &'a Element,
-    depth: usize,
-    lines: &mut Vec<CssTreeLine<'a>>,
-) {
-    let mut all_interactive: Vec<&Element> = Vec::new();
-    for child in &window.children {
-        collect_interactive(child, &mut all_interactive);
-    }
-
-    lines.push(CssTreeLine {
-        element: window,
-        depth,
-    });
-
-    if !all_interactive.is_empty() {
-        for child in &window.children {
-            collect_element_hierarchical_css_lines(child, depth + 1, lines);
-        }
-    }
-}
-
-fn collect_element_hierarchical_css_lines<'a>(
-    element: &'a Element,
-    depth: usize,
-    lines: &mut Vec<CssTreeLine<'a>>,
-) {
-    let mut stack = vec![(element, depth)];
-
-    while let Some((current, current_depth)) = stack.pop() {
-        let is_container = is_meaningful_container(current);
-        let interactive_children = count_interactive_descendants(current);
-
-        if is_container && interactive_children > 0 {
-            lines.push(CssTreeLine {
-                element: current,
-                depth: current_depth,
-            });
-
-            for child in current.children.iter().rev() {
-                stack.push((child, current_depth + 1));
-            }
-        } else if is_llm_relevant(current) {
-            lines.push(CssTreeLine {
-                element: current,
-                depth: current_depth,
-            });
-        } else {
-            for child in current.children.iter().rev() {
-                stack.push((child, current_depth));
-            }
-        }
-    }
-}
-
-fn is_meaningful_container(elem: &Element) -> bool {
-    let is_grouping_role = matches!(
-        elem.role,
-        Role::Group
-            | Role::List
-            | Role::ListItem
-            | Role::Toolbar
-            | Role::TabList
-            | Role::Menu
-            | Role::Dialog
-            | Role::Form
-            | Role::Article
-            | Role::Region
-            | Role::Navigation
-            | Role::Banner
-            | Role::Complementary
-            | Role::ContentInfo
-            | Role::Main
-            | Role::Search
-            | Role::Section
-    );
-
-    if !is_grouping_role {
-        return false;
-    }
-
-    let has_label = elem.title.as_ref().is_some_and(|t| !t.is_empty())
-        || elem.description.as_ref().is_some_and(|d| !d.is_empty());
-
-    let interactive_count = count_interactive_descendants(elem);
-
-    has_label || interactive_count >= 2
-}
-
-fn collect_menubar_css_lines<'a>(
-    menubar: &'a Element,
-    depth: usize,
-    lines: &mut Vec<CssTreeLine<'a>>,
-) {
-    lines.push(CssTreeLine {
-        element: menubar,
-        depth,
-    });
-    for item in &menubar.children {
-        if item.role == Role::MenuItem {
-            lines.push(CssTreeLine {
-                element: item,
-                depth: depth + 1,
-            });
-        }
-    }
 }
 
 fn collect_interactive<'a>(element: &'a Element, result: &mut Vec<&'a Element>) {
@@ -2053,7 +1926,7 @@ mod tests {
 
         assert_eq!(
             minimal_selector_for(&tree, 4_294_967_299),
-            "MenuItem[title=\"Apple\"]"
+            "MenuItem[title=\"Apple\"][actions=\"cancel click pick\"]"
         );
     }
 
@@ -2062,8 +1935,25 @@ mod tests {
         let tree = make_output_round_trip_tree();
         let selector = minimal_selector_for(&tree, 5);
 
-        assert_eq!(selector, "Button[title=\"Run\"]");
+        assert_eq!(selector, "Button[title=\"Run\"][actions=\"click\"]");
         assert!(!selector.contains("data-id"));
+    }
+
+    #[test]
+    fn minimal_selector_keeps_actions_for_action_bearing_groups() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut group = Element::new(ElementKey::from_ffi(2), Role::Group);
+        group.actions = vec!["AXPress".to_string()];
+        root.children.push(group);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 2,
+        };
+
+        assert_eq!(minimal_selector_for(&tree, 2), "Group[actions=\"click\"]");
     }
 
     #[test]
@@ -2143,7 +2033,7 @@ mod tests {
         };
 
         let selector = minimal_selector_for(&tree, 3);
-        assert_eq!(selector, "Window > *:nth-child(1)");
+        assert_eq!(selector, "Unknown:nth-child(1)");
         assert!(!selector.contains("data-id"));
     }
 
@@ -2174,7 +2064,7 @@ mod tests {
         let parsed = parse_query(&selector).unwrap();
         let matches = find_matches(&parsed, &tree);
 
-        assert_eq!(selector, "Group:nth-child(1) > *");
+        assert_eq!(selector, "Group:nth-child(1) > Unknown");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, ElementKey::from_ffi(4));
         assert!(!selector.contains("data-id"));
@@ -2260,6 +2150,7 @@ mod tests {
             Role::TextRun,
             Role::Label,
             Role::Group,
+            Role::Tree,
             Role::List,
             Role::ListItem,
             Role::Cell,
@@ -2336,15 +2227,58 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "        Button[title=\"Run\"] {}")
+                .any(|line| line == "        Button[title=\"Run\"][actions=\"click\"] {}")
         );
         assert!(lines.iter().any(|line| line == "  MenuBar {"));
         assert!(
             lines
                 .iter()
-                .any(|line| line == "    MenuItem[title=\"Apple\"] {}")
+                .any(|line| line == "    MenuItem[title=\"Apple\"][actions=\"click pick\"] {}")
         );
         assert_eq!(lines.last().map(String::as_str), Some("}"));
+    }
+
+    #[test]
+    fn llm_query_output_preserves_children_of_interactive_ancestors() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        root.title = Some("Test App".to_string());
+
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+        window.title = Some("Main Window".to_string());
+
+        let mut button = Element::new(ElementKey::from_ffi(3), Role::Button);
+        button.description = Some("Avatar button".to_string());
+        button.actions = vec!["AXPress".to_string()];
+
+        let mut image = Element::new(ElementKey::from_ffi(4), Role::Image);
+        image.description = Some("Avatar".to_string());
+
+        button.children.push(image);
+        window.children.push(button);
+        root.children.push(window);
+
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: Some("Test App".to_string()),
+            root,
+            element_count: 4,
+        };
+
+        let lines = format_llm_query_lines(&tree, false);
+
+        assert!(
+            lines.iter().any(
+                |line| line == "    Button[description=\"Avatar button\"][actions=\"click\"] {"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "      Image[description=\"Avatar\"] {}"),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -2354,7 +2288,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.trim() == "Button[title=\"Needle\"] {}"),
+                .any(|line| line.trim() == "Button[title=\"Needle\"][actions=\"click\"] {}"),
             "{lines:?}"
         );
     }

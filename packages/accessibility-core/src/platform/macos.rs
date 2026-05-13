@@ -22,7 +22,7 @@ use accessibility_macos_sys::{
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
 use keyboard_types::{Code, Modifiers};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -182,37 +182,50 @@ const ROLE_ROW: &str = "AXRow";
 const ROLE_COLUMN: &str = "AXColumn";
 const ROLE_CELL: &str = "AXCell";
 
-#[derive(Clone, Copy, Debug)]
-struct ChildDiscovery {
-    include_search_descendants: bool,
+#[derive(Clone, Debug)]
+struct BuildSeed {
+    ax_element: AxElement,
+    children: Option<Vec<BuildSeed>>,
 }
 
+impl BuildSeed {
+    fn descend(ax_element: AxElement) -> Self {
+        Self {
+            ax_element,
+            children: None,
+        }
+    }
+
+    fn with_children(ax_element: AxElement, children: Vec<BuildSeed>) -> Self {
+        Self {
+            ax_element,
+            children: Some(children),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChildDiscovery;
+
 impl ChildDiscovery {
-    const STRUCTURAL_ONLY: Self = Self {
-        include_search_descendants: false,
-    };
-    const ENRICHED: Self = Self {
-        include_search_descendants: true,
-    };
+    const STRUCTURAL_ONLY: Self = Self;
+    const ENRICHED: Self = Self;
 
     fn discover(self, element: &AxElement) -> Vec<AxElement> {
-        let mut children = self.structural_children(element);
-        if !self.should_include_search_descendants(element) {
-            return children;
-        }
-
-        let mut seen = HashSet::new();
-        self.collect_structural_signatures(element, &mut seen, 0);
-        for child in self.search_predicate_children(element) {
-            MacOSAccessibility::push_unique_element(&mut children, &mut seen, child);
-        }
-
-        children
+        self.structural_children(element)
     }
 
     fn structural_children(self, element: &AxElement) -> Vec<AxElement> {
-        let mut children = Vec::new();
-        let mut seen = HashSet::new();
+        if let Some(attribute_children) = element.attribute_element_values(AX_CHILD_ATTRIBUTES) {
+            for children_for_attribute in attribute_children {
+                if !children_for_attribute.is_empty() {
+                    return children_for_attribute;
+                }
+            }
+
+            return Vec::new();
+        }
+
         let attribute_names = element.attribute_names();
 
         for attribute in AX_CHILD_ATTRIBUTES {
@@ -221,48 +234,13 @@ impl ChildDiscovery {
                 continue;
             }
 
-            for child in element.attribute_elements(attribute) {
-                MacOSAccessibility::push_unique_element(&mut children, &mut seen, child);
+            let children = element.attribute_elements(attribute);
+            if !children.is_empty() {
+                return children;
             }
         }
 
-        children
-    }
-
-    fn should_include_search_descendants(self, element: &AxElement) -> bool {
-        if !self.include_search_descendants {
-            return false;
-        }
-
-        MacOSAccessibility::get_string_attribute(element, AX_ROLE).as_deref() == Some(ROLE_WEB_AREA)
-            && element.supports_ui_elements_for_search_predicate()
-    }
-
-    fn search_predicate_children(self, element: &AxElement) -> Vec<AxElement> {
-        element.ui_elements_for_search_predicate(AxSearchPredicate::new(
-            AX_WEB_SEARCH_KEYS,
-            AX_WEB_SEARCH_RESULTS_LIMIT,
-        ))
-    }
-
-    fn collect_structural_signatures(
-        self,
-        element: &AxElement,
-        seen: &mut HashSet<String>,
-        depth: usize,
-    ) {
-        let mut stack = vec![(element.clone(), depth)];
-        while let Some((current, current_depth)) = stack.pop() {
-            if current_depth > 24 {
-                continue;
-            }
-
-            for child in self.structural_children(&current).into_iter().rev() {
-                if seen.insert(MacOSAccessibility::element_signature(&child)) {
-                    stack.push((child, current_depth + 1));
-                }
-            }
-        }
+        Vec::new()
     }
 }
 
@@ -759,7 +737,7 @@ impl MacOSAccessibility {
     }
 
     fn enable_full_accessibility_for_app(app: &AxElement) -> bool {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = Vec::new();
         let mut requested = Self::enable_full_accessibility_for_subtree(
             app,
             AX_FULL_ACCESSIBILITY_PRIME_DEPTH,
@@ -780,11 +758,12 @@ impl MacOSAccessibility {
     fn enable_full_accessibility_for_subtree(
         element: &AxElement,
         remaining_depth: usize,
-        seen: &mut std::collections::HashSet<String>,
+        seen: &mut Vec<AxElement>,
     ) -> bool {
-        if !seen.insert(Self::element_signature(element)) {
+        if seen.iter().any(|seen| seen.is_same_element(element)) {
             return false;
         }
+        seen.push(element.clone());
 
         let mut requested = Self::enable_full_accessibility(element);
         if remaining_depth == 0 {
@@ -913,18 +892,19 @@ impl MacOSAccessibility {
         false
     }
 
-    fn element_signature(element: &AxElement) -> String {
-        fn normalized_attribute(element: &AxElement, attribute: &str) -> Option<String> {
-            MacOSAccessibility::get_string_attribute(element, attribute)
-                .filter(|value| !value.is_empty())
+    fn format_element_signature(
+        pid: Option<u32>,
+        role: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        value: Option<&str>,
+        bounds: Option<&Rect>,
+    ) -> String {
+        fn normalized_attribute(value: Option<&str>) -> Option<&str> {
+            value.filter(|value| !value.is_empty())
         }
 
-        let pid = Self::get_pid_for_element(element);
-        let role = normalized_attribute(element, AX_ROLE);
-        let title = normalized_attribute(element, AX_TITLE);
-        let description = normalized_attribute(element, AX_DESCRIPTION);
-        let value = normalized_attribute(element, AX_VALUE);
-        let bounds = Self::get_bounds(element).map(|bounds| {
+        let bounds = bounds.map(|bounds| {
             (
                 bounds.origin.x.round() as i64,
                 bounds.origin.y.round() as i64,
@@ -932,18 +912,51 @@ impl MacOSAccessibility {
                 bounds.size.height.round() as i64,
             )
         });
+        let role = normalized_attribute(role);
+        let title = normalized_attribute(title);
+        let description = normalized_attribute(description);
+        let value = normalized_attribute(value);
 
         format!("{pid:?}|{role:?}|{title:?}|{description:?}|{value:?}|{bounds:?}")
     }
 
-    fn push_unique_element(
-        elements: &mut Vec<AxElement>,
-        seen: &mut std::collections::HashSet<String>,
-        element: AxElement,
-    ) {
-        if seen.insert(Self::element_signature(&element)) {
-            elements.push(element);
-        }
+    fn element_signature(element: &AxElement) -> String {
+        let pid = Self::get_pid_for_element(element);
+        let attributes = element.attribute_values(AX_ELEMENT_ATTRIBUTE_BATCH);
+        let (role, title, description, value, bounds) =
+            if let Some(attributes) = attributes.as_ref() {
+                let bounds = attributes
+                    .point(AX_BATCH_POSITION)
+                    .zip(attributes.size(AX_BATCH_SIZE))
+                    .map(|(position, size)| {
+                        Rect::new(sys_point(position), Size::new(size.width, size.height))
+                    });
+
+                (
+                    attributes.string(AX_BATCH_ROLE),
+                    attributes.string(AX_BATCH_TITLE),
+                    attributes.string(AX_BATCH_DESCRIPTION),
+                    attributes.string(AX_BATCH_VALUE),
+                    bounds,
+                )
+            } else {
+                (
+                    Self::get_string_attribute(element, AX_ROLE),
+                    Self::get_string_attribute(element, AX_TITLE),
+                    Self::get_string_attribute(element, AX_DESCRIPTION),
+                    Self::get_string_attribute(element, AX_VALUE),
+                    Self::get_bounds(element),
+                )
+            };
+
+        Self::format_element_signature(
+            pid,
+            role.as_deref(),
+            title.as_deref(),
+            description.as_deref(),
+            value.as_deref(),
+            bounds.as_ref(),
+        )
     }
 
     /// Get a string attribute value.
@@ -984,6 +997,114 @@ impl MacOSAccessibility {
     /// Get tree-building children for an element.
     fn get_children(element: &AxElement) -> Vec<AxElement> {
         Self::discover_children(element, ChildDiscovery::ENRICHED)
+    }
+
+    fn search_predicate_children(element: &AxElement) -> Vec<AxElement> {
+        element.ui_elements_for_search_predicate(AxSearchPredicate::new(
+            AX_WEB_SEARCH_KEYS,
+            AX_WEB_SEARCH_RESULTS_LIMIT,
+        ))
+    }
+
+    fn web_search_child_seeds(
+        web_element: &AxElement,
+        search_children: Vec<AxElement>,
+    ) -> Vec<BuildSeed> {
+        struct SearchNode {
+            element: AxElement,
+            parent: Option<AxElement>,
+            children: Vec<usize>,
+        }
+
+        fn build_seed(nodes: &[SearchNode], index: usize) -> BuildSeed {
+            let children = nodes[index]
+                .children
+                .iter()
+                .copied()
+                .map(|child| build_seed(nodes, child))
+                .collect();
+            BuildSeed::with_children(nodes[index].element.clone(), children)
+        }
+
+        fn nearest_search_parent_index(
+            web_element: &AxElement,
+            nodes: &[SearchNode],
+            parent: Option<&AxElement>,
+        ) -> Option<usize> {
+            let mut current = parent?.clone();
+            let mut seen = Vec::new();
+
+            loop {
+                if web_element.is_same_element(&current) {
+                    return None;
+                }
+
+                if seen
+                    .iter()
+                    .any(|element: &AxElement| element.is_same_element(&current))
+                {
+                    return None;
+                }
+                seen.push(current.clone());
+
+                if let Some(index) = nodes
+                    .iter()
+                    .position(|candidate| candidate.element.is_same_element(&current))
+                {
+                    return Some(index);
+                }
+
+                current = current.attribute_elements(AX_PARENT).into_iter().next()?;
+            }
+        }
+
+        let mut nodes: Vec<SearchNode> = search_children
+            .into_iter()
+            .map(|element| {
+                let parent = element.attribute_elements(AX_PARENT).into_iter().next();
+                SearchNode {
+                    element,
+                    parent,
+                    children: Vec::new(),
+                }
+            })
+            .collect();
+
+        let parents: Vec<Option<usize>> = nodes
+            .iter()
+            .map(|node| nearest_search_parent_index(web_element, &nodes, node.parent.as_ref()))
+            .collect();
+
+        let mut roots = Vec::new();
+        for (index, parent_index) in parents.into_iter().enumerate() {
+            if let Some(parent_index) = parent_index
+                && parent_index != index
+            {
+                nodes[parent_index].children.push(index);
+                continue;
+            }
+
+            roots.push(index);
+        }
+
+        roots
+            .into_iter()
+            .map(|index| build_seed(&nodes, index))
+            .collect()
+    }
+
+    fn get_child_seeds(element: &AxElement, role: Role) -> Vec<BuildSeed> {
+        if role == Role::WebView {
+            let search_children = Self::search_predicate_children(element);
+            if !search_children.is_empty() {
+                return Self::web_search_child_seeds(element, search_children);
+            }
+        }
+
+        Self::get_children(element)
+            .into_iter()
+            .map(BuildSeed::descend)
+            .collect()
     }
 
     /// Get the windows of an application element.
@@ -1083,19 +1204,19 @@ impl MacOSAccessibility {
         element_count: &mut usize,
     ) -> Option<Element> {
         struct BuildFrame {
-            ax_element: AxElement,
+            seed: BuildSeed,
             depth: usize,
             element: Option<Element>,
             self_matches: bool,
-            children: Vec<AxElement>,
+            children: Vec<BuildSeed>,
             next_child: usize,
             retained_children: Vec<Element>,
         }
 
         impl BuildFrame {
-            fn new(ax_element: AxElement, depth: usize) -> Self {
+            fn new(seed: BuildSeed, depth: usize) -> Self {
                 Self {
-                    ax_element,
+                    seed,
                     depth,
                     element: None,
                     self_matches: false,
@@ -1108,7 +1229,10 @@ impl MacOSAccessibility {
 
         let root_depth = depth;
         let mut root = None;
-        let mut stack = vec![BuildFrame::new(ax_element.clone(), depth)];
+        let mut stack = vec![BuildFrame::new(
+            BuildSeed::descend(ax_element.clone()),
+            depth,
+        )];
 
         while !stack.is_empty() {
             let index = stack.len() - 1;
@@ -1122,14 +1246,14 @@ impl MacOSAccessibility {
                     continue;
                 }
 
-                let current_ax = stack[index].ax_element.clone();
+                let current_ax = stack[index].seed.ax_element.clone();
                 let current_depth = stack[index].depth;
                 let attributes = current_ax.attribute_values(AX_ELEMENT_ATTRIBUTE_BATCH);
-                let ax_role = match attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.string(AX_BATCH_ROLE))
-                    .or_else(|| Self::get_string_attribute(&current_ax, AX_ROLE))
-                {
+                let ax_role = match if let Some(attributes) = attributes.as_ref() {
+                    attributes.string(AX_BATCH_ROLE)
+                } else {
+                    Self::get_string_attribute(&current_ax, AX_ROLE)
+                } {
                     Some(role) => role,
                     None => {
                         stack.pop();
@@ -1142,44 +1266,37 @@ impl MacOSAccessibility {
                 let id = self.cache.next_id();
 
                 let mut element = Element::new(id, role);
-                element.title = attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.string(AX_BATCH_TITLE))
-                    .or_else(|| Self::get_string_attribute(&current_ax, AX_TITLE));
-                element.description = attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.string(AX_BATCH_DESCRIPTION))
-                    .or_else(|| Self::get_string_attribute(&current_ax, AX_DESCRIPTION));
-                element.value = attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.string(AX_BATCH_VALUE))
-                    .or_else(|| Self::get_string_attribute(&current_ax, AX_VALUE));
-                element.bounds = attributes
-                    .as_ref()
-                    .and_then(|attributes| {
-                        let position = attributes.point(AX_BATCH_POSITION)?;
-                        let size = attributes.size(AX_BATCH_SIZE)?;
-                        Some(Rect::new(
-                            sys_point(position),
-                            Size::new(size.width, size.height),
-                        ))
-                    })
-                    .or_else(|| Self::get_bounds(&current_ax));
-                element.enabled = attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.bool(AX_BATCH_ENABLED))
-                    .or_else(|| Self::get_bool_attribute(&current_ax, AX_ENABLED))
-                    .unwrap_or(true);
-                element.focused = attributes
-                    .as_ref()
-                    .and_then(|attributes| attributes.bool(AX_BATCH_FOCUSED))
-                    .or_else(|| Self::get_bool_attribute(&current_ax, AX_FOCUSED))
-                    .unwrap_or(false);
+                if let Some(attributes) = attributes.as_ref() {
+                    element.title = attributes.string(AX_BATCH_TITLE);
+                    element.description = attributes.string(AX_BATCH_DESCRIPTION);
+                    element.value = attributes.string(AX_BATCH_VALUE);
+                    element.bounds = attributes
+                        .point(AX_BATCH_POSITION)
+                        .zip(attributes.size(AX_BATCH_SIZE))
+                        .map(|(position, size)| {
+                            Rect::new(sys_point(position), Size::new(size.width, size.height))
+                        });
+                    element.enabled = attributes.bool(AX_BATCH_ENABLED).unwrap_or(true);
+                    element.focused = attributes.bool(AX_BATCH_FOCUSED).unwrap_or(false);
+                } else {
+                    element.title = Self::get_string_attribute(&current_ax, AX_TITLE);
+                    element.description = Self::get_string_attribute(&current_ax, AX_DESCRIPTION);
+                    element.value = Self::get_string_attribute(&current_ax, AX_VALUE);
+                    element.bounds = Self::get_bounds(&current_ax);
+                    element.enabled =
+                        Self::get_bool_attribute(&current_ax, AX_ENABLED).unwrap_or(true);
+                    element.focused =
+                        Self::get_bool_attribute(&current_ax, AX_FOCUSED).unwrap_or(false);
+                }
                 element.actions = Self::get_actions(&current_ax);
 
                 let self_matches = filter.should_include(&element, current_depth);
                 let mut children = if filter.max_depth.is_none_or(|max| current_depth < max) {
-                    Self::get_children(&current_ax)
+                    stack[index]
+                        .seed
+                        .children
+                        .clone()
+                        .unwrap_or_else(|| Self::get_child_seeds(&current_ax, role))
                 } else {
                     Vec::new()
                 };
@@ -1189,12 +1306,16 @@ impl MacOSAccessibility {
                 // only when AXChildren produced no Window-role child.
                 if role == Role::Application {
                     let has_window_child = children.iter().any(|child| {
-                        Self::get_string_attribute(child, AX_ROLE)
+                        Self::get_string_attribute(&child.ax_element, AX_ROLE)
                             .map(|role| role == ROLE_WINDOW)
                             .unwrap_or(false)
                     });
                     if !has_window_child {
-                        children.extend(Self::get_application_windows(&current_ax));
+                        children.extend(
+                            Self::get_application_windows(&current_ax)
+                                .into_iter()
+                                .map(BuildSeed::descend),
+                        );
                     }
                 }
 
@@ -1225,7 +1346,7 @@ impl MacOSAccessibility {
             }
 
             let id = element.id;
-            self.handles.insert(id, frame.ax_element);
+            self.handles.insert(id, frame.seed.ax_element);
 
             #[allow(deprecated)]
             self.cache.store_with_id(id, element.clone());

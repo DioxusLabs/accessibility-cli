@@ -303,7 +303,7 @@ fn query_has_matches(
 }
 
 fn filter_tree_to_matches(tree: &ElementTree, matches: &[&Element]) -> ElementTree {
-    let match_ids: HashSet<ElementKey> = matches.iter().map(|element| element.id).collect();
+    let match_ids = unique_query_match_ids(matches);
     let root = prune_tree_to_matches(&tree.root, &match_ids).unwrap_or_else(|| tree.root.clone());
     let element_count = count_tree_elements(&root);
 
@@ -314,6 +314,51 @@ fn filter_tree_to_matches(tree: &ElementTree, matches: &[&Element]) -> ElementTr
         root,
         element_count,
     }
+}
+
+fn unique_query_match_ids(matches: &[&Element]) -> HashSet<ElementKey> {
+    let mut seen = HashSet::new();
+    let mut ids = HashSet::new();
+
+    for element in matches {
+        let Some(key) = query_match_dedupe_key(element) else {
+            ids.insert(element.id);
+            continue;
+        };
+
+        if seen.insert(key) {
+            ids.insert(element.id);
+        }
+    }
+
+    ids
+}
+
+fn query_match_dedupe_key(element: &Element) -> Option<String> {
+    let bounds = element.bounds?;
+    let bounds = (
+        bounds.origin.x.round() as i64,
+        bounds.origin.y.round() as i64,
+        bounds.size.width.round() as i64,
+        bounds.size.height.round() as i64,
+    );
+
+    Some(format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+        element.role,
+        element.title,
+        element.description,
+        element.value,
+        element.url,
+        element.help,
+        element.identifier,
+        element.role_description,
+        element.enabled,
+        element.focused,
+        element.actions.join("\x1f"),
+        element.children.is_empty(),
+        bounds
+    ))
 }
 
 fn prune_tree_to_matches(root: &Element, match_ids: &HashSet<ElementKey>) -> Option<Element> {
@@ -367,6 +412,119 @@ fn count_tree_elements(root: &Element) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessibility_core::accessibility::roles::parse_role_name;
+    use accessibility_core::accessibility::{Point, Size};
+
+    macro_rules! role {
+        ($name:expr) => {
+            parse_role_name($name).expect("test role should parse")
+        };
+    }
+
+    fn bounds(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect::new(Point::new(x, y), Size::new(width, height))
+    }
+
+    fn find_element_by_id(element: &Element, id: ElementKey) -> Option<&Element> {
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            if current.id == id {
+                return Some(current);
+            }
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        None
+    }
+
+    fn count_elements_matching(element: &Element, matches: impl Fn(&Element) -> bool) -> usize {
+        let mut count = 0;
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            if matches(current) {
+                count += 1;
+            }
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        count
+    }
+
+    fn duplicate_message_branch(container_id: u64, message_id: u64, reply_id: u64) -> Element {
+        let mut container = Element::new(ElementKey::from_ffi(container_id), role!("Group"));
+        let mut message = Element::new(ElementKey::from_ffi(message_id), role!("Group"));
+        message.title = Some("eveeifyeve replying to Evan Almloff , Same message".to_string());
+        message.bounds = Some(bounds(265.0, 244.0, 966.0, 70.0));
+        message.actions = vec!["AXShowMenu".to_string()];
+
+        let mut reply = Element::new(ElementKey::from_ffi(reply_id), role!("Group"));
+        reply.description = Some("eveeifyeve replying to Evan Almloff".to_string());
+        reply.bounds = Some(bounds(337.0, 246.0, 870.0, 18.0));
+        reply.actions = vec!["AXShowMenu".to_string()];
+
+        message.children.push(reply);
+        container.children.push(message);
+        container
+    }
+
+    #[test]
+    fn query_tree_filter_dedupes_visual_duplicate_matches() {
+        let mut root = Element::new(ElementKey::from_ffi(1), role!("Application"));
+        let mut window = Element::new(ElementKey::from_ffi(2), role!("Window"));
+        let mut web_view = Element::new(ElementKey::from_ffi(3), role!("WebView"));
+
+        web_view.children.push(duplicate_message_branch(4, 5, 6));
+        web_view.children.push(duplicate_message_branch(7, 8, 9));
+        window.children.push(web_view);
+        root.children.push(window);
+
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 9,
+        };
+        let matches = [6, 9]
+            .iter()
+            .map(|id| {
+                find_element_by_id(&tree.root, ElementKey::from_ffi(*id))
+                    .expect("test element should exist")
+            })
+            .collect::<Vec<_>>();
+
+        let filtered = filter_tree_to_matches(&tree, &matches);
+
+        assert_eq!(
+            count_elements_matching(&filtered.root, |element| {
+                element.description.as_deref() == Some("eveeifyeve replying to Evan Almloff")
+            }),
+            1
+        );
+        assert!(find_element_by_id(&filtered.root, ElementKey::from_ffi(6)).is_some());
+        assert!(find_element_by_id(&filtered.root, ElementKey::from_ffi(9)).is_none());
+    }
+
+    #[test]
+    fn query_match_dedupe_keeps_unbounded_matches_distinct() {
+        let mut first = Element::new(ElementKey::from_ffi(1), role!("Group"));
+        first.description = Some("same text".to_string());
+        let mut second = Element::new(ElementKey::from_ffi(2), role!("Group"));
+        second.description = Some("same text".to_string());
+
+        let ids = unique_query_match_ids(&[&first, &second]);
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&ElementKey::from_ffi(1)));
+        assert!(ids.contains(&ElementKey::from_ffi(2)));
+    }
 }
 
 /// Helper for element action operations (click, focus, blur).
