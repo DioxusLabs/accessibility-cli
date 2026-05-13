@@ -23,6 +23,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -42,6 +44,8 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Setup Miri sysroot
         run: cargo miri setup
       - name: Run Miri smoke tests
@@ -62,6 +66,8 @@ jobs:
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Run sanitizer tests
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
@@ -95,6 +101,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install musl-tools
         if: contains(matrix.target, 'linux-musl')
         run: |
@@ -145,6 +153,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Linux E2E dependencies
         if: runner.os == 'Linux'
         run: |
@@ -203,6 +213,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
