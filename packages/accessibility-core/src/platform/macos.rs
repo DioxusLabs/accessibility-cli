@@ -194,8 +194,14 @@ impl ChildDiscovery {
     fn structural_children(self, element: &AxElement) -> Vec<AxElement> {
         let mut children = Vec::new();
         let mut seen = HashSet::new();
+        let attribute_names = element.attribute_names();
 
         for attribute in AX_CHILD_ATTRIBUTES {
+            if !attribute_names.is_empty() && !attribute_names.iter().any(|name| name == attribute)
+            {
+                continue;
+            }
+
             for child in element.attribute_elements(attribute) {
                 MacOSAccessibility::push_unique_element(&mut children, &mut seen, child);
             }
@@ -823,7 +829,10 @@ impl MacOSAccessibility {
             }
 
             accessibility_macos_sys::run_default_loop_slice(0.05, true);
-            if observer.as_ref().is_some_and(|observer| observer.take_notified()) {
+            if observer
+                .as_ref()
+                .is_some_and(|observer| observer.take_notified())
+            {
                 Self::prime_accessibility_roots(app);
             }
         }
@@ -1159,7 +1168,8 @@ impl MacOSAccessibility {
             };
             element.children = frame.retained_children;
 
-            let keep = frame.self_matches || !element.children.is_empty() || frame.depth == root_depth;
+            let keep =
+                frame.self_matches || !element.children.is_empty() || frame.depth == root_depth;
             if !keep {
                 continue;
             }

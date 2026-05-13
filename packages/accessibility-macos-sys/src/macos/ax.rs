@@ -253,12 +253,16 @@ impl AxElement {
     }
 
     pub fn attribute_elements(&self, attribute: &str) -> Vec<AxElement> {
-        let mut elements = self.array_attribute_values(attribute);
+        if let Some(elements) = self.array_attribute_values(attribute) {
+            return elements;
+        }
 
         let value = match self.copy_attribute_value(attribute) {
             Ok(value) => value,
-            Err(_) => return elements,
+            Err(_) => return Vec::new(),
         };
+
+        let mut elements = Vec::new();
 
         match value.downcast::<CFArray>() {
             Ok(array) => {
@@ -494,7 +498,7 @@ impl AxElement {
         }
     }
 
-    fn array_attribute_values(&self, attribute: &str) -> Vec<AxElement> {
+    fn array_attribute_values(&self, attribute: &str) -> Option<Vec<AxElement>> {
         let attribute = CFString::from_str(attribute);
         let mut count: CFIndex = 0;
         let result = unsafe {
@@ -502,7 +506,7 @@ impl AxElement {
                 .attribute_value_count(&attribute, NonNull::new(&mut count).unwrap())
         };
         if result != AXError::Success || count <= 0 {
-            return Vec::new();
+            return (result == AXError::Success).then(Vec::new);
         }
 
         let mut values = Vec::new();
@@ -533,7 +537,7 @@ impl AxElement {
             index += max_values;
         }
 
-        values
+        Some(values)
     }
 }
 
