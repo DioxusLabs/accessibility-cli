@@ -468,11 +468,9 @@ impl MacOSAccessibility {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn post_mouse_event(
         pid: Option<u32>,
-        x: f64,
-        y: f64,
+        point: Point,
         kind: MacMouseEventKind,
         button: crate::input::MouseButton,
         click_state: i64,
@@ -482,8 +480,8 @@ impl MacOSAccessibility {
         accessibility_macos_sys::post_mouse_event(
             pid,
             window_id,
-            x,
-            y,
+            point.x,
+            point.y,
             kind,
             Self::mac_mouse_button(button),
             click_state,
@@ -498,8 +496,7 @@ impl MacOSAccessibility {
 
         Self::post_mouse_event(
             pid,
-            -1.0,
-            -1.0,
+            Point::new(-1.0, -1.0),
             MacMouseEventKind::Down,
             crate::input::MouseButton::Left,
             1,
@@ -508,8 +505,7 @@ impl MacOSAccessibility {
         std::thread::sleep(Duration::from_millis(2));
         Self::post_mouse_event(
             pid,
-            -1.0,
-            -1.0,
+            Point::new(-1.0, -1.0),
             MacMouseEventKind::Up,
             crate::input::MouseButton::Left,
             1,
@@ -530,9 +526,17 @@ impl MacOSAccessibility {
             Self::post_chromium_activation_primer(pid)?;
         }
 
-        Self::post_mouse_event(pid, x, y, MacMouseEventKind::Down, button, click_state, 1.0)?;
+        let point = Point::new(x, y);
+        Self::post_mouse_event(
+            pid,
+            point,
+            MacMouseEventKind::Down,
+            button,
+            click_state,
+            1.0,
+        )?;
         std::thread::sleep(Duration::from_millis(10));
-        Self::post_mouse_event(pid, x, y, MacMouseEventKind::Up, button, click_state, 0.0)
+        Self::post_mouse_event(pid, point, MacMouseEventKind::Up, button, click_state, 0.0)
     }
 
     fn current_mouse_location() -> Result<accessibility_macos_sys::Point> {
@@ -1169,129 +1173,103 @@ impl AccessibilityReader for MacOSAccessibility {
         "macOS"
     }
 
-    fn get_tree(
-        &mut self,
-        pid: Option<u32>,
-        filter: &TreeFilter,
-    ) -> impl std::future::Future<Output = Result<ElementTree>> {
+    async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
         let filter = filter.clone();
-        async move {
-            self.run_with_blocking_state(move |reader| {
-                reader.get_tree_blocking_for_pid(pid, &filter)
-            })
+        self.run_with_blocking_state(move |reader| reader.get_tree_blocking_for_pid(pid, &filter))
             .await
-        }
     }
 
     fn get_element(&self, id: ElementKey) -> Option<&Element> {
         self.cache.get(id)
     }
 
-    fn perform_action(
-        &mut self,
-        id: ElementKey,
-        action: Action,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move {
-            self.run_with_blocking_state(move |reader| {
-                let handle = reader
-                    .handles
-                    .get(&id)
-                    .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+    async fn perform_action(&mut self, id: ElementKey, action: Action) -> Result<()> {
+        self.run_with_blocking_state(move |reader| {
+            let handle = reader
+                .handles
+                .get(&id)
+                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
 
-                // Focus/Blur aren't AX actions on macOS — they're attribute writes.
-                if matches!(action, Action::Focus | Action::Blur) {
-                    let want_focus = matches!(action, Action::Focus);
-                    let result = handle.set_bool_attribute_result(AX_FOCUSED, want_focus);
-                    if !result.is_success() {
-                        // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
-                        // "this element won't accept the focus write" — usually because the
-                        // platform routes blur through a different mechanism (e.g. AppKit
-                        // collapses focus when another window becomes key).
-                        let verb = if want_focus { "focus" } else { "blur" };
-                        bail!(
-                            "this element does not support programmatic {} on macOS ({:?})",
-                            verb,
-                            result
-                        );
-                    }
-                    return Ok(());
-                }
-
-                // AXPress on a menu goes through AppKit's menu-tracking path and
-                // promotes the owning app to key. Deliver a synthetic mouse click
-                // via the SkyLight per-PID path instead, which keeps focus put.
-                if matches!(action, Action::Click)
-                    && let Some(element) = reader.cache.get(id)
-                    && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
-                    && let Some(bounds) = element.bounds
-                    && let Some(pid) = Self::get_pid_for_element(handle)
-                {
-                    let x = bounds.origin.x + bounds.size.width / 2.0;
-                    let y = bounds.origin.y + bounds.size.height / 2.0;
-                    return Self::post_mouse_click_sequence(
-                        Some(pid),
-                        x,
-                        y,
-                        crate::input::MouseButton::Left,
-                        1,
+            // Focus/Blur aren't AX actions on macOS — they're attribute writes.
+            if matches!(action, Action::Focus | Action::Blur) {
+                let want_focus = matches!(action, Action::Focus);
+                let result = handle.set_bool_attribute_result(AX_FOCUSED, want_focus);
+                if !result.is_success() {
+                    // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
+                    // "this element won't accept the focus write" — usually because the
+                    // platform routes blur through a different mechanism (e.g. AppKit
+                    // collapses focus when another window becomes key).
+                    let verb = if want_focus { "focus" } else { "blur" };
+                    bail!(
+                        "this element does not support programmatic {} on macOS ({:?})",
+                        verb,
+                        result
                     );
                 }
+                return Ok(());
+            }
 
-                let action_name = Self::map_action(action)
-                    .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
+            // AXPress on a menu goes through AppKit's menu-tracking path and
+            // promotes the owning app to key. Deliver a synthetic mouse click
+            // via the SkyLight per-PID path instead, which keeps focus put.
+            if matches!(action, Action::Click)
+                && let Some(element) = reader.cache.get(id)
+                && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
+                && let Some(bounds) = element.bounds
+                && let Some(pid) = Self::get_pid_for_element(handle)
+            {
+                let x = bounds.origin.x + bounds.size.width / 2.0;
+                let y = bounds.origin.y + bounds.size.height / 2.0;
+                return Self::post_mouse_click_sequence(
+                    Some(pid),
+                    x,
+                    y,
+                    crate::input::MouseButton::Left,
+                    1,
+                );
+            }
 
-                if let Err(result) = handle.perform_action(action_name) {
-                    bail!("Failed to perform action {}: {:?}", action_name, result);
-                }
+            let action_name = Self::map_action(action)
+                .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
 
-                Ok(())
-            })
-            .await
-        }
+            if let Err(result) = handle.perform_action(action_name) {
+                bail!("Failed to perform action {}: {:?}", action_name, result);
+            }
+
+            Ok(())
+        })
+        .await
     }
 
-    fn set_value(
-        &mut self,
-        id: ElementKey,
-        value: &str,
-    ) -> impl std::future::Future<Output = Result<()>> {
+    async fn set_value(&mut self, id: ElementKey, value: &str) -> Result<()> {
         let value = value.to_string();
-        async move {
-            self.run_with_blocking_state(move |reader| {
-                let handle = reader
-                    .handles
-                    .get(&id)
-                    .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        self.run_with_blocking_state(move |reader| {
+            let handle = reader
+                .handles
+                .get(&id)
+                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
 
-                if let Err(result) = handle.set_string_attribute(AX_VALUE, &value) {
-                    bail!("Failed to set value: {:?}", result);
-                }
+            if let Err(result) = handle.set_string_attribute(AX_VALUE, &value) {
+                bail!("Failed to set value: {:?}", result);
+            }
 
-                Ok(())
-            })
-            .await
-        }
+            Ok(())
+        })
+        .await
     }
 
-    fn hit_test(
-        &mut self,
-        x: f64,
-        y: f64,
-    ) -> impl std::future::Future<Output = Result<Option<ElementKey>>> {
-        async move {
-            self.run_with_blocking_state(move |reader| {
-                if let Some(ax_element) = reader.system_wide.element_at_position(x, y) {
-                    let mut count = reader.cache.len();
-                    let element =
-                        reader.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
-                    Ok(element.map(|e| e.id))
-                } else {
-                    Ok(None)
-                }
-            })
-            .await
-        }
+    async fn hit_test(&mut self, x: f64, y: f64) -> Result<Option<ElementKey>> {
+        self.run_with_blocking_state(move |reader| {
+            if let Some(ax_element) = reader.system_wide.element_at_position(x, y) {
+                let mut count = reader.cache.len();
+                let element =
+                    reader.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
+                Ok(element.map(|e| e.id))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     fn clear_cache(&mut self) {
@@ -1304,122 +1282,86 @@ impl AccessibilityReader for MacOSAccessibility {
         self.cache.version()
     }
 
-    fn keystroke(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-        modifiers: Modifiers,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move { Self::post_keystroke(pid, key, modifiers) }
+    async fn keystroke(&mut self, pid: Option<u32>, key: Code, modifiers: Modifiers) -> Result<()> {
+        Self::post_keystroke(pid, key, modifiers)
     }
 
-    fn type_raw(
-        &mut self,
-        pid: Option<u32>,
-        text: &str,
-    ) -> impl std::future::Future<Output = Result<()>> {
+    async fn type_raw(&mut self, pid: Option<u32>, text: &str) -> Result<()> {
         let text = text.to_string();
-        async move {
-            Self::run_blocking_task(move || {
-                for ch in text.chars() {
-                    let (code, needs_shift) = code_from_char(ch)
-                        .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
-                    let modifiers = if needs_shift {
-                        Modifiers::SHIFT
-                    } else {
-                        Modifiers::empty()
-                    };
-                    Self::post_keystroke(pid, code, modifiers)?;
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(())
-            })
-            .await
-        }
+        Self::run_blocking_task(move || {
+            for ch in text.chars() {
+                let (code, needs_shift) = code_from_char(ch)
+                    .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
+                let modifiers = if needs_shift {
+                    Modifiers::SHIFT
+                } else {
+                    Modifiers::empty()
+                };
+                Self::post_keystroke(pid, code, modifiers)?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })
+        .await
     }
 
-    fn mouse_click_at(
+    async fn mouse_click_at(
         &mut self,
         pid: Option<u32>,
         x: f64,
         y: f64,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move { Self::post_mouse_click_sequence(pid, x, y, button, 1) }
+    ) -> Result<()> {
+        Self::post_mouse_click_sequence(pid, x, y, button, 1)
     }
 
-    fn press_key(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move { Self::post_key_event(pid, key, Modifiers::empty(), true) }
+    async fn press_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
+        Self::post_key_event(pid, key, Modifiers::empty(), true)
     }
 
-    fn release_key(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move { Self::post_key_event(pid, key, Modifiers::empty(), false) }
+    async fn release_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
+        Self::post_key_event(pid, key, Modifiers::empty(), false)
     }
 
-    fn mouse_move(
-        &mut self,
-        pid: Option<u32>,
-        x: f64,
-        y: f64,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move {
-            Self::post_mouse_event(
-                pid,
-                x,
-                y,
-                MacMouseEventKind::Move,
-                crate::input::MouseButton::Left,
-                0,
-                0.0,
-            )
-        }
+    async fn mouse_move(&mut self, pid: Option<u32>, x: f64, y: f64) -> Result<()> {
+        Self::post_mouse_event(
+            pid,
+            Point::new(x, y),
+            MacMouseEventKind::Move,
+            crate::input::MouseButton::Left,
+            0,
+            0.0,
+        )
     }
 
-    fn mouse_click(
+    async fn mouse_click(
         &mut self,
         pid: Option<u32>,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move {
-            Self::run_blocking_task(move || {
-                let point = Self::current_mouse_location()?;
-                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
-            })
-            .await
-        }
+    ) -> Result<()> {
+        Self::run_blocking_task(move || {
+            let point = Self::current_mouse_location()?;
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
+        })
+        .await
     }
 
-    fn mouse_double_click(
+    async fn mouse_double_click(
         &mut self,
         pid: Option<u32>,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move {
-            Self::run_blocking_task(move || {
-                let point = Self::current_mouse_location()?;
-                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
-                std::thread::sleep(Duration::from_millis(40));
-                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
-            })
-            .await
-        }
+    ) -> Result<()> {
+        Self::run_blocking_task(move || {
+            let point = Self::current_mouse_location()?;
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
+            std::thread::sleep(Duration::from_millis(40));
+            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
+        })
+        .await
     }
 
-    fn mouse_scroll(
-        &mut self,
-        pid: Option<u32>,
-        delta_x: f64,
-        delta_y: f64,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        async move { accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y) }
+    async fn mouse_scroll(&mut self, pid: Option<u32>, delta_x: f64, delta_y: f64) -> Result<()> {
+        accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y)
     }
 
     fn supports_keystroke(&self) -> bool {
@@ -1455,18 +1397,13 @@ impl AccessibilityReader for MacOSAccessibility {
         Ok(screenshot)
     }
 
-    fn get_screen_bounds(
-        &self,
-        pid: Option<u32>,
-    ) -> impl std::future::Future<Output = Result<Rect>> {
-        async move {
-            Self::run_blocking_task(move || {
-                Ok(pid
-                    .and_then(Self::get_window_bounds_for_pid)
-                    .unwrap_or_else(Self::main_display_bounds))
-            })
-            .await
-        }
+    async fn get_screen_bounds(&self, pid: Option<u32>) -> Result<Rect> {
+        Self::run_blocking_task(move || {
+            Ok(pid
+                .and_then(Self::get_window_bounds_for_pid)
+                .unwrap_or_else(Self::main_display_bounds))
+        })
+        .await
     }
 
     fn start_listening(

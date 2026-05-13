@@ -81,10 +81,14 @@ cargo test -p accessibility-core --test calculator_windows_e2e -- --nocapture --
 cargo test -p accessibility-core --test gnome_calculator_e2e -- --nocapture --test-threads=1
 
 # Android (with `adb` available)
-cargo test -p accessibility-core --test settings_android_e2e -- --nocapture --test-threads=1
+cargo test -p accessibility-core --test settings_android_e2e -- --ignored --nocapture --test-threads=1
 ```
 
 CI runs the matching e2e on each platform — see `.github/workflows/pr-build.yml`.
+
+## Hardening checks
+
+CI also runs Miri smoke tests and ASan/TSan smoke tests.
 
 ## Style
 

@@ -11,9 +11,12 @@ keywords = ["accessibility", "windows", "uia", "automation"]
 categories = ["accessibility", "api-bindings", "os::windows-apis"]
 
 [dependencies]
+accesskit.workspace = true
 anyhow.workspace = true
+euclid.workspace = true
 image.workspace = true
 keyboard-types.workspace = true
+slotmap.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
@@ -25,4 +28,3 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
 ] }
-

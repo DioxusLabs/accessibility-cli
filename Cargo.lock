@@ -72,12 +72,16 @@ dependencies = [
 name = "accessibility-ios-sys"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
  "block2",
+ "euclid",
+ "image",
  "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+ "slotmap",
 ]
 
 [[package]]
@@ -112,9 +116,12 @@ dependencies = [
 name = "accessibility-windows-sys"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
+ "euclid",
  "image",
  "keyboard-types",
+ "slotmap",
  "windows",
 ]
 

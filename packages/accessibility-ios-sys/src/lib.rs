@@ -1,18 +1,9 @@
 //! Safe low-level wrappers around iOS Simulator private accessibility and HID APIs.
 
-pub use block2;
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "macos")]
-pub use libc;
-#[cfg(target_os = "macos")]
-pub use objc2;
-#[cfg(target_os = "macos")]
-pub use objc2_core_foundation;
-#[cfg(target_os = "macos")]
-pub use objc2_foundation;
-
-#[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod frameworks {
     use std::ffi::{CStr, CString, c_char, c_void};
 
     use anyhow::{Result, anyhow};
@@ -110,6 +101,12 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use frameworks::{
     load_axp_framework, load_coresimulator_framework, load_frameworks, load_simulatorkit_framework,
 };
+
+#[cfg(target_os = "macos")]
+pub use macos::*;

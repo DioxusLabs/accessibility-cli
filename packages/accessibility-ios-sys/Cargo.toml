@@ -11,8 +11,12 @@ keywords = ["accessibility", "ios", "simulator", "automation"]
 categories = ["accessibility", "api-bindings", "os::macos-apis"]
 
 [dependencies]
+accesskit.workspace = true
 anyhow.workspace = true
 block2 = "0.6"
+euclid.workspace = true
+image.workspace = true
+slotmap.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
