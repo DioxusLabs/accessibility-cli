@@ -1638,7 +1638,7 @@ pub fn run() {
 fn build_filter(common: &CommonArgs) -> TreeFilter {
     TreeFilter {
         max_depth: common.depth,
-        max_elements: Some(1000),
+        max_elements: None,
         interactive_only: common.interactive,
         visible_only: common.visible,
         within_bounds: None,
