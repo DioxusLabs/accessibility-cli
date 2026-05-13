@@ -1,8 +1,10 @@
 use super::symbols::ax_ui_element_get_window;
 use super::{AxErrorCode, Point, Rect, Size, WindowId};
-use objc2_application_services::{AXError, AXObserver, AXUIElement, AXValue, AXValueType};
+use objc2_application_services::{
+    AXCopyMultipleAttributeOptions, AXError, AXObserver, AXUIElement, AXValue, AXValueType,
+};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopMode,
+    CFArray, CFBoolean, CFDictionary, CFNull, CFNumber, CFRetained, CFRunLoop, CFRunLoopMode,
     CFRunLoopSource, CFString, CFType, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::CGWindowID;
@@ -34,6 +36,73 @@ pub const AX_SEARCH_KEY_TEXT_FIELD: &str = "AXTextFieldSearchKey";
 #[derive(Clone)]
 pub struct AxElement {
     inner: CFRetained<AXUIElement>,
+}
+
+pub struct AxAttributeValues {
+    values: Vec<Option<CFRetained<CFType>>>,
+}
+
+impl AxAttributeValues {
+    fn value(&self, index: usize) -> Option<&CFType> {
+        let value = self.values.get(index)?.as_deref()?;
+        if value.downcast_ref::<CFNull>().is_some() || is_ax_error_value(value) {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    pub fn string(&self, index: usize) -> Option<String> {
+        self.value(index)
+            .and_then(|value| value.downcast_ref::<CFString>())
+            .map(|value| value.to_string())
+    }
+
+    pub fn bool(&self, index: usize) -> Option<bool> {
+        let value = self.value(index)?;
+        match value.downcast_ref::<CFBoolean>() {
+            Some(value) => Some(value.value()),
+            None => Some(true),
+        }
+    }
+
+    pub fn point(&self, index: usize) -> Option<Point> {
+        let ax_value = self.value(index)?.downcast_ref::<AXValue>()?;
+
+        let mut point = objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 };
+        let success = unsafe {
+            ax_value.value(
+                AXValueType::CGPoint,
+                NonNull::new(&mut point as *mut _ as *mut _).unwrap(),
+            )
+        };
+
+        success.then_some(Point::new(point.x, point.y))
+    }
+
+    pub fn size(&self, index: usize) -> Option<Size> {
+        let ax_value = self.value(index)?.downcast_ref::<AXValue>()?;
+
+        let mut size = objc2_core_foundation::CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        let success = unsafe {
+            ax_value.value(
+                AXValueType::CGSize,
+                NonNull::new(&mut size as *mut _ as *mut _).unwrap(),
+            )
+        };
+
+        success.then_some(Size::new(size.width, size.height))
+    }
+}
+
+fn is_ax_error_value(value: &CFType) -> bool {
+    value.downcast_ref::<AXValue>().is_some_and(|value| {
+        let value_type = unsafe { value.r#type() };
+        value_type == AXValueType::AXError
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +264,42 @@ impl AxElement {
 
     pub fn supports_ui_elements_for_search_predicate(&self) -> bool {
         self.has_parameterized_attribute(AX_UI_ELEMENTS_FOR_SEARCH_PREDICATE)
+    }
+
+    pub fn attribute_values(&self, attributes: &[&str]) -> Option<AxAttributeValues> {
+        if attributes.is_empty() {
+            return Some(AxAttributeValues { values: Vec::new() });
+        }
+
+        let attribute_values: Vec<CFRetained<CFString>> = attributes
+            .iter()
+            .map(|attribute| CFString::from_str(attribute))
+            .collect();
+        let attribute_refs: Vec<&CFString> = attribute_values
+            .iter()
+            .map(|attribute| attribute.as_ref())
+            .collect();
+        let attributes = CFArray::from_objects(&attribute_refs);
+
+        let mut values: *const CFArray = std::ptr::null();
+        let result = unsafe {
+            self.inner.copy_multiple_attribute_values(
+                attributes.as_ref(),
+                AXCopyMultipleAttributeOptions(0),
+                NonNull::new(&mut values).unwrap(),
+            )
+        };
+        if result != AXError::Success || values.is_null() {
+            return None;
+        }
+
+        let values = NonNull::new(values as *mut CFArray as *mut CFArray<CFType>).unwrap();
+        let array: CFRetained<CFArray<CFType>> = unsafe { CFRetained::from_raw(values) };
+        let values = (0..attribute_values.len())
+            .map(|index| array.get(index))
+            .collect();
+
+        Some(AxAttributeValues { values })
     }
 
     pub fn attribute_string(&self, attribute: &str) -> Option<String> {

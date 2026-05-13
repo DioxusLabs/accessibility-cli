@@ -73,6 +73,25 @@ const AX_SELECTED_CHILDREN_CHANGED_NOTIFICATION: &str = "AXSelectedChildrenChang
 const AX_LIVE_REGION_CREATED_NOTIFICATION: &str = "AXLiveRegionCreated";
 const AX_LIVE_REGION_CHANGED_NOTIFICATION: &str = "AXLiveRegionChanged";
 
+const AX_ELEMENT_ATTRIBUTE_BATCH: &[&str] = &[
+    AX_ROLE,
+    AX_TITLE,
+    AX_DESCRIPTION,
+    AX_VALUE,
+    AX_POSITION,
+    AX_SIZE,
+    AX_ENABLED,
+    AX_FOCUSED,
+];
+const AX_BATCH_ROLE: usize = 0;
+const AX_BATCH_TITLE: usize = 1;
+const AX_BATCH_DESCRIPTION: usize = 2;
+const AX_BATCH_VALUE: usize = 3;
+const AX_BATCH_POSITION: usize = 4;
+const AX_BATCH_SIZE: usize = 5;
+const AX_BATCH_ENABLED: usize = 6;
+const AX_BATCH_FOCUSED: usize = 7;
+
 const AX_CHILD_ATTRIBUTES: &[&str] = &[
     AX_CHILDREN,
     AX_VISIBLE_CHILDREN,
@@ -1105,7 +1124,12 @@ impl MacOSAccessibility {
 
                 let current_ax = stack[index].ax_element.clone();
                 let current_depth = stack[index].depth;
-                let ax_role = match Self::get_string_attribute(&current_ax, AX_ROLE) {
+                let attributes = current_ax.attribute_values(AX_ELEMENT_ATTRIBUTE_BATCH);
+                let ax_role = match attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.string(AX_BATCH_ROLE))
+                    .or_else(|| Self::get_string_attribute(&current_ax, AX_ROLE))
+                {
                     Some(role) => role,
                     None => {
                         stack.pop();
@@ -1118,13 +1142,39 @@ impl MacOSAccessibility {
                 let id = self.cache.next_id();
 
                 let mut element = Element::new(id, role);
-                element.title = Self::get_string_attribute(&current_ax, AX_TITLE);
-                element.description = Self::get_string_attribute(&current_ax, AX_DESCRIPTION);
-                element.value = Self::get_string_attribute(&current_ax, AX_VALUE);
-                element.bounds = Self::get_bounds(&current_ax);
-                element.enabled = Self::get_bool_attribute(&current_ax, AX_ENABLED).unwrap_or(true);
-                element.focused =
-                    Self::get_bool_attribute(&current_ax, AX_FOCUSED).unwrap_or(false);
+                element.title = attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.string(AX_BATCH_TITLE))
+                    .or_else(|| Self::get_string_attribute(&current_ax, AX_TITLE));
+                element.description = attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.string(AX_BATCH_DESCRIPTION))
+                    .or_else(|| Self::get_string_attribute(&current_ax, AX_DESCRIPTION));
+                element.value = attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.string(AX_BATCH_VALUE))
+                    .or_else(|| Self::get_string_attribute(&current_ax, AX_VALUE));
+                element.bounds = attributes
+                    .as_ref()
+                    .and_then(|attributes| {
+                        let position = attributes.point(AX_BATCH_POSITION)?;
+                        let size = attributes.size(AX_BATCH_SIZE)?;
+                        Some(Rect::new(
+                            sys_point(position),
+                            Size::new(size.width, size.height),
+                        ))
+                    })
+                    .or_else(|| Self::get_bounds(&current_ax));
+                element.enabled = attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.bool(AX_BATCH_ENABLED))
+                    .or_else(|| Self::get_bool_attribute(&current_ax, AX_ENABLED))
+                    .unwrap_or(true);
+                element.focused = attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.bool(AX_BATCH_FOCUSED))
+                    .or_else(|| Self::get_bool_attribute(&current_ax, AX_FOCUSED))
+                    .unwrap_or(false);
                 element.actions = Self::get_actions(&current_ax);
 
                 let self_matches = filter.should_include(&element, current_depth);

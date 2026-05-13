@@ -379,9 +379,11 @@ pub fn format_element_selector(elem: &Element) -> String {
 
 struct MinimalQueryFormatter<'a> {
     tree: &'a ElementTree,
+    element_ids: Vec<ElementKey>,
     elements_by_id: HashMap<ElementKey, &'a Element>,
     parent_by_id: HashMap<ElementKey, Option<ElementKey>>,
     child_index_by_id: HashMap<ElementKey, usize>,
+    match_index: SelectorMatchIndex<'a>,
     match_cache: HashMap<String, Option<ElementKey>>,
 }
 
@@ -389,9 +391,11 @@ impl<'a> MinimalQueryFormatter<'a> {
     fn new(tree: &'a ElementTree) -> Self {
         let mut formatter = Self {
             tree,
+            element_ids: Vec::new(),
             elements_by_id: HashMap::new(),
             parent_by_id: HashMap::new(),
             child_index_by_id: HashMap::new(),
+            match_index: SelectorMatchIndex::default(),
             match_cache: HashMap::new(),
         };
         formatter.index_tree();
@@ -421,6 +425,29 @@ impl<'a> MinimalQueryFormatter<'a> {
         }
     }
 
+    fn nested_selector_for(&mut self, scope_id: Option<ElementKey>, elem: &Element) -> String {
+        let Some(mut candidate) = self.unique_relative_candidate_for(scope_id, elem.id) else {
+            return self.id_fallback_selector(elem);
+        };
+
+        for removal in candidate.removal_candidates() {
+            let mut trial = candidate.clone();
+            if !trial.remove(removal.part) {
+                continue;
+            }
+            if self.matches_relative_target(scope_id, &trial, elem.id) {
+                candidate = trial;
+            }
+        }
+
+        let selector = candidate.to_selector();
+        if self.unique_relative_candidate_match_id(scope_id, &candidate) == Some(elem.id) {
+            selector
+        } else {
+            self.id_fallback_selector(elem)
+        }
+    }
+
     fn unique_candidate_for(&mut self, target_id: ElementKey) -> Option<SelectorCandidate> {
         if let Some(candidate) = self.maximal_candidate(target_id)
             && self.matches_target(&candidate, target_id)
@@ -437,12 +464,34 @@ impl<'a> MinimalQueryFormatter<'a> {
         None
     }
 
+    fn unique_relative_candidate_for(
+        &mut self,
+        scope_id: Option<ElementKey>,
+        target_id: ElementKey,
+    ) -> Option<SelectorCandidate> {
+        if let Some(candidate) = self.relative_semantic_candidate(scope_id, target_id)
+            && self.matches_relative_target(scope_id, &candidate, target_id)
+        {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = self.relative_positional_candidate(scope_id, target_id)
+            && self.matches_relative_target(scope_id, &candidate, target_id)
+        {
+            return Some(candidate);
+        }
+
+        None
+    }
+
     fn index_tree(&mut self) {
         let mut stack = vec![(&self.tree.root, None, 0usize)];
         while let Some((current, parent_id, child_index)) = stack.pop() {
+            self.element_ids.push(current.id);
             self.elements_by_id.insert(current.id, current);
             self.parent_by_id.insert(current.id, parent_id);
             self.child_index_by_id.insert(current.id, child_index);
+            self.match_index.add(current);
 
             for (index, child) in current.children.iter().enumerate().rev() {
                 stack.push((child, Some(current.id), index));
@@ -499,6 +548,62 @@ impl<'a> MinimalQueryFormatter<'a> {
         Some(SelectorCandidate { steps })
     }
 
+    fn relative_semantic_candidate(
+        &self,
+        scope_id: Option<ElementKey>,
+        target_id: ElementKey,
+    ) -> Option<SelectorCandidate> {
+        let path = self.relative_path(scope_id, target_id)?;
+        let target_path_index = path.len().checked_sub(1)?;
+        let target_has_semantics = element_has_selector_semantics(path[target_path_index]);
+        let steps = path
+            .into_iter()
+            .enumerate()
+            .filter(|(path_index, elem)| {
+                *path_index == target_path_index
+                    || is_top_level_selector_context(elem)
+                    || element_has_selector_semantics(elem)
+                    || (!target_has_semantics && *path_index + 1 == target_path_index)
+            })
+            .map(|(path_index, elem)| {
+                let nth_child = self
+                    .parent_by_id
+                    .get(&elem.id)
+                    .copied()
+                    .flatten()
+                    .and_then(|_| self.child_index_by_id.get(&elem.id).copied())
+                    .map(|child_index| child_index + 1);
+                SelectorStep::new(elem, nth_child, path_index)
+            })
+            .collect();
+
+        Some(SelectorCandidate { steps })
+    }
+
+    fn relative_positional_candidate(
+        &self,
+        scope_id: Option<ElementKey>,
+        target_id: ElementKey,
+    ) -> Option<SelectorCandidate> {
+        let steps = self
+            .relative_path(scope_id, target_id)?
+            .into_iter()
+            .enumerate()
+            .map(|(path_index, elem)| {
+                let nth_child = self
+                    .parent_by_id
+                    .get(&elem.id)
+                    .copied()
+                    .flatten()
+                    .and_then(|_| self.child_index_by_id.get(&elem.id).copied())
+                    .map(|child_index| child_index + 1);
+                SelectorStep::new(elem, nth_child, path_index)
+            })
+            .collect();
+
+        Some(SelectorCandidate { steps })
+    }
+
     fn path_to(&self, target_id: ElementKey) -> Option<Vec<&'a Element>> {
         let mut ids = Vec::new();
         let mut current_id = target_id;
@@ -517,8 +622,35 @@ impl<'a> MinimalQueryFormatter<'a> {
             .collect()
     }
 
+    fn relative_path(
+        &self,
+        scope_id: Option<ElementKey>,
+        target_id: ElementKey,
+    ) -> Option<Vec<&'a Element>> {
+        let path = self.path_to(target_id)?;
+        let Some(scope_id) = scope_id else {
+            return Some(path);
+        };
+
+        let scope_index = path.iter().position(|elem| elem.id == scope_id)?;
+        if scope_index + 1 >= path.len() {
+            return None;
+        }
+
+        Some(path.into_iter().skip(scope_index + 1).collect())
+    }
+
     fn matches_target(&mut self, candidate: &SelectorCandidate, target_id: ElementKey) -> bool {
         self.unique_candidate_match_id(candidate) == Some(target_id)
+    }
+
+    fn matches_relative_target(
+        &mut self,
+        scope_id: Option<ElementKey>,
+        candidate: &SelectorCandidate,
+        target_id: ElementKey,
+    ) -> bool {
+        self.unique_relative_candidate_match_id(scope_id, candidate) == Some(target_id)
     }
 
     fn unique_candidate_match_id(&mut self, candidate: &SelectorCandidate) -> Option<ElementKey> {
@@ -537,7 +669,55 @@ impl<'a> MinimalQueryFormatter<'a> {
         unique_id
     }
 
+    fn unique_relative_candidate_match_id(
+        &mut self,
+        scope_id: Option<ElementKey>,
+        candidate: &SelectorCandidate,
+    ) -> Option<ElementKey> {
+        let selector = format!("{:?}|{}", scope_id, candidate.to_selector());
+        if selector.is_empty() {
+            return None;
+        }
+
+        if let Some(cached) = self.match_cache.get(&selector) {
+            return *cached;
+        }
+
+        let unique_id = self.direct_unique_relative_match_id(scope_id, candidate);
+
+        self.match_cache.insert(selector, unique_id);
+        unique_id
+    }
+
     fn direct_unique_match_id(&self, candidate: &SelectorCandidate) -> Option<ElementKey> {
+        let active_steps = candidate.active_steps();
+        if active_steps.is_empty() {
+            return None;
+        }
+
+        let (_, terminal_step) = active_steps[active_steps.len() - 1];
+        let candidate_ids = self.terminal_candidate_ids(terminal_step)?;
+        let mut matched = None;
+        for element_id in candidate_ids {
+            if self
+                .matches_active_steps(*element_id, &active_steps, active_steps.len() - 1)
+                .is_some()
+            {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(*element_id);
+            }
+        }
+
+        matched
+    }
+
+    fn direct_unique_relative_match_id(
+        &self,
+        scope_id: Option<ElementKey>,
+        candidate: &SelectorCandidate,
+    ) -> Option<ElementKey> {
         let active_steps = candidate.active_steps();
         if active_steps.is_empty() {
             return None;
@@ -545,15 +725,40 @@ impl<'a> MinimalQueryFormatter<'a> {
 
         let mut matched = None;
         for element in self.elements_by_id.values() {
-            if self.matches_active_steps(element.id, &active_steps, active_steps.len() - 1) {
-                if matched.is_some() {
-                    return None;
-                }
-                matched = Some(element.id);
+            let Some(first_step_id) =
+                self.matches_active_steps(element.id, &active_steps, active_steps.len() - 1)
+            else {
+                continue;
+            };
+
+            if !self.matches_scope(scope_id, first_step_id, active_steps[0].0) {
+                continue;
             }
+
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(element.id);
         }
 
         matched
+    }
+
+    fn terminal_candidate_ids(&self, step: &SelectorStep) -> Option<&[ElementKey]> {
+        let mut best = if step.role == "*" {
+            self.element_ids.as_slice()
+        } else {
+            self.match_index.role.get(step.role)?.as_slice()
+        };
+
+        for attr in step.attrs.iter().filter(|attr| attr.active) {
+            let attr_ids = self.match_index.attr_ids(attr)?;
+            if attr_ids.len() < best.len() {
+                best = attr_ids;
+            }
+        }
+
+        Some(best)
     }
 
     fn matches_active_steps(
@@ -561,33 +766,64 @@ impl<'a> MinimalQueryFormatter<'a> {
         element_id: ElementKey,
         active_steps: &[(usize, &SelectorStep)],
         active_index: usize,
-    ) -> bool {
+    ) -> Option<ElementKey> {
         let Some(element) = self.elements_by_id.get(&element_id).copied() else {
-            return false;
+            return None;
         };
         let (step_index, step) = active_steps[active_index];
         if !step.matches(element, self.child_index_by_id.get(&element_id).copied()) {
-            return false;
+            return None;
         }
 
         if active_index == 0 {
-            return true;
+            return Some(element_id);
         }
 
         let (previous_step_index, _) = active_steps[active_index - 1];
         let parent_id = self.parent_by_id.get(&element_id).copied().flatten();
         if previous_step_index + 1 == step_index {
-            return parent_id.is_some_and(|parent_id| {
+            return parent_id.and_then(|parent_id| {
                 self.matches_active_steps(parent_id, active_steps, active_index - 1)
             });
         }
 
         let mut ancestor_id = parent_id;
         while let Some(id) = ancestor_id {
-            if self.matches_active_steps(id, active_steps, active_index - 1) {
-                return true;
+            if let Some(first_step_id) =
+                self.matches_active_steps(id, active_steps, active_index - 1)
+            {
+                return Some(first_step_id);
             }
             ancestor_id = self.parent_by_id.get(&id).copied().flatten();
+        }
+
+        None
+    }
+
+    fn matches_scope(
+        &self,
+        scope_id: Option<ElementKey>,
+        first_step_id: ElementKey,
+        first_step_index: usize,
+    ) -> bool {
+        let Some(scope_id) = scope_id else {
+            return true;
+        };
+
+        if first_step_index == 0 {
+            self.parent_by_id.get(&first_step_id).copied().flatten() == Some(scope_id)
+        } else {
+            self.is_descendant_of(first_step_id, scope_id)
+        }
+    }
+
+    fn is_descendant_of(&self, element_id: ElementKey, ancestor_id: ElementKey) -> bool {
+        let mut current_id = self.parent_by_id.get(&element_id).copied().flatten();
+        while let Some(id) = current_id {
+            if id == ancestor_id {
+                return true;
+            }
+            current_id = self.parent_by_id.get(&id).copied().flatten();
         }
 
         false
@@ -605,6 +841,92 @@ impl<'a> MinimalQueryFormatter<'a> {
         } else {
             format_element_selector(elem)
         }
+    }
+}
+
+#[derive(Default)]
+struct SelectorMatchIndex<'a> {
+    role: HashMap<&'static str, Vec<ElementKey>>,
+    title: HashMap<&'a str, Vec<ElementKey>>,
+    description: HashMap<&'a str, Vec<ElementKey>>,
+    value: HashMap<&'a str, Vec<ElementKey>>,
+    url: HashMap<&'a str, Vec<ElementKey>>,
+    help: HashMap<&'a str, Vec<ElementKey>>,
+    identifier: HashMap<&'a str, Vec<ElementKey>>,
+    role_description: HashMap<&'a str, Vec<ElementKey>>,
+    actions: HashMap<String, Vec<ElementKey>>,
+}
+
+impl<'a> SelectorMatchIndex<'a> {
+    fn add(&mut self, elem: &'a Element) {
+        push_indexed_value(&mut self.role, format_role_query_name(elem.role), elem.id);
+
+        if let Some(title) = elem.title.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.title, title, elem.id);
+        }
+        if let Some(description) = elem.description.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.description, description, elem.id);
+        }
+        if let Some(value) = elem.value.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.value, value, elem.id);
+        }
+        if let Some(url) = elem.url.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.url, url, elem.id);
+        }
+        if let Some(help) = elem.help.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.help, help, elem.id);
+        }
+        if let Some(identifier) = elem.identifier.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.identifier, identifier, elem.id);
+        }
+        if let Some(role_description) = elem.role_description.as_deref().filter(|s| !s.is_empty()) {
+            push_indexed_value(&mut self.role_description, role_description, elem.id);
+        }
+
+        let actions = format_actions_query_value(&elem.actions);
+        if actions.is_empty() {
+            return;
+        }
+
+        push_owned_indexed_value(&mut self.actions, actions.clone(), elem.id);
+        for action in actions.split_whitespace() {
+            if action != actions {
+                push_owned_indexed_value(&mut self.actions, action.to_string(), elem.id);
+            }
+        }
+    }
+
+    fn attr_ids(&self, attr: &SelectorAttr) -> Option<&[ElementKey]> {
+        let ids = match attr.kind {
+            SelectorAttrKind::Title => self.title.get(attr.value.as_str()),
+            SelectorAttrKind::Description => self.description.get(attr.value.as_str()),
+            SelectorAttrKind::Value => self.value.get(attr.value.as_str()),
+            SelectorAttrKind::Url => self.url.get(attr.value.as_str()),
+            SelectorAttrKind::Help => self.help.get(attr.value.as_str()),
+            SelectorAttrKind::Identifier => self.identifier.get(attr.value.as_str()),
+            SelectorAttrKind::RoleDescription => self.role_description.get(attr.value.as_str()),
+            SelectorAttrKind::Actions => self.actions.get(attr.value.as_str()),
+        }?;
+
+        Some(ids.as_slice())
+    }
+}
+
+fn push_indexed_value<K>(map: &mut HashMap<K, Vec<ElementKey>>, value: K, id: ElementKey)
+where
+    K: Eq + std::hash::Hash,
+{
+    map.entry(value).or_default().push(id);
+}
+
+fn push_owned_indexed_value(
+    map: &mut HashMap<String, Vec<ElementKey>>,
+    value: String,
+    id: ElementKey,
+) {
+    let ids = map.entry(value).or_default();
+    if !ids.contains(&id) {
+        ids.push(id);
     }
 }
 
@@ -689,6 +1011,9 @@ impl SelectorCandidate {
             }
 
             for (attr_index, attr) in step.attrs.iter().enumerate() {
+                if attr.always_keep() {
+                    continue;
+                }
                 removals.push(RemovalCandidate {
                     part: SelectorPart::Attr(step_index, attr_index),
                     cost: attr.removal_cost(step_index == target_index),
@@ -905,15 +1230,32 @@ impl SelectorAttr {
 
     fn removal_cost(&self, is_target: bool) -> u16 {
         match self.kind {
-            SelectorAttrKind::Value => 900,
-            SelectorAttrKind::Actions
+            SelectorAttrKind::Actions | SelectorAttrKind::Url => 800,
+            SelectorAttrKind::Title
+            | SelectorAttrKind::Description
+            | SelectorAttrKind::Value
             | SelectorAttrKind::Help
-            | SelectorAttrKind::Url
-            | SelectorAttrKind::RoleDescription => 800,
-            SelectorAttrKind::Description => 700,
-            SelectorAttrKind::Title | SelectorAttrKind::Identifier if !is_target => 650,
-            SelectorAttrKind::Title | SelectorAttrKind::Identifier => 100,
+            | SelectorAttrKind::Identifier
+            | SelectorAttrKind::RoleDescription => {
+                if is_target {
+                    100
+                } else {
+                    650
+                }
+            }
         }
+    }
+
+    fn always_keep(&self) -> bool {
+        matches!(
+            self.kind,
+            SelectorAttrKind::Title
+                | SelectorAttrKind::Description
+                | SelectorAttrKind::Value
+                | SelectorAttrKind::Help
+                | SelectorAttrKind::Identifier
+                | SelectorAttrKind::RoleDescription
+        )
     }
 
     fn matches(&self, elem: &Element) -> bool {
@@ -1148,13 +1490,26 @@ fn print_llm_query_format(tree: &ElementTree, structure_only: bool) {
 
 fn format_llm_query_lines(tree: &ElementTree, structure_only: bool) -> Vec<String> {
     let root = &tree.root;
+    let tree_lines = collect_llm_query_tree_lines(root, structure_only);
     let mut formatter = MinimalQueryFormatter::new(tree);
-    let mut lines = vec![formatter.selector_for(root), String::new()];
+    render_css_tree_lines(&tree_lines, &mut formatter)
+}
+
+#[derive(Clone, Copy)]
+struct CssTreeLine<'a> {
+    element: &'a Element,
+    depth: usize,
+}
+
+fn collect_llm_query_tree_lines(root: &Element, structure_only: bool) -> Vec<CssTreeLine<'_>> {
+    let mut lines = vec![CssTreeLine {
+        element: root,
+        depth: 0,
+    }];
+
     if structure_only {
         for child in &root.children {
-            collect_structure_node_lines_with(child, 0, &mut lines, &mut |elem| {
-                formatter.selector_for(elem)
-            });
+            collect_structure_node_css_lines(child, 1, &mut lines);
         }
         return lines;
     }
@@ -1174,19 +1529,63 @@ fn format_llm_query_lines(tree: &ElementTree, structure_only: bool) -> Vec<Strin
     }
 
     for window in &windows {
-        collect_window_llm_lines(window, &mut lines, &mut formatter);
-        lines.push(String::new());
+        collect_window_css_lines(window, 1, &mut lines);
     }
 
     if let Some(mb) = menubar {
-        collect_menubar_llm_lines(mb, &mut lines, &mut formatter);
-        lines.push(String::new());
+        collect_menubar_css_lines(mb, 1, &mut lines);
     }
 
     if !other_interactive.is_empty() {
         for elem in other_interactive {
-            lines.push(format_element_llm_line(elem, 0, &mut formatter));
+            lines.push(CssTreeLine {
+                element: elem,
+                depth: 1,
+            });
         }
+    }
+
+    lines
+}
+
+fn render_css_tree_lines(
+    tree_lines: &[CssTreeLine<'_>],
+    formatter: &mut MinimalQueryFormatter<'_>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut open_elements: Vec<ElementKey> = Vec::new();
+
+    for (index, tree_line) in tree_lines.iter().enumerate() {
+        while open_elements.len() > tree_line.depth {
+            let close_indent = "  ".repeat(open_elements.len() - 1);
+            lines.push(format!("{}}}", close_indent));
+            open_elements.pop();
+        }
+
+        let has_children = tree_lines
+            .get(index + 1)
+            .is_some_and(|next| next.depth > tree_line.depth);
+        let indent = "  ".repeat(tree_line.depth);
+        let selector = if tree_line.depth == 0 {
+            formatter.selector_for(tree_line.element)
+        } else {
+            let scope_id = open_elements
+                .get(tree_line.depth.saturating_sub(1))
+                .copied();
+            formatter.nested_selector_for(scope_id, tree_line.element)
+        };
+
+        if has_children {
+            lines.push(format!("{}{} {{", indent, selector));
+            open_elements.push(tree_line.element.id);
+        } else {
+            lines.push(format!("{}{} {{}}", indent, selector));
+        }
+    }
+
+    while let Some(_) = open_elements.pop() {
+        let close_indent = "  ".repeat(open_elements.len());
+        lines.push(format!("{}}}", close_indent));
     }
 
     lines
@@ -1228,6 +1627,35 @@ fn collect_structure_node_lines_with(
         } else if has_structural_descendants(current) {
             for child in current.children.iter().rev() {
                 stack.push((child, current_indent));
+            }
+        }
+    }
+}
+
+fn collect_structure_node_css_lines<'a>(
+    element: &'a Element,
+    depth: usize,
+    lines: &mut Vec<CssTreeLine<'a>>,
+) {
+    let mut stack = vec![(element, depth)];
+
+    while let Some((current, current_depth)) = stack.pop() {
+        let is_structural = is_structural_node(current);
+
+        if is_structural || current_depth == depth {
+            lines.push(CssTreeLine {
+                element: current,
+                depth: current_depth,
+            });
+
+            for child in current.children.iter().rev() {
+                if is_structural_node(child) || has_structural_descendants(child) {
+                    stack.push((child, current_depth + 1));
+                }
+            }
+        } else if has_structural_descendants(current) {
+            for child in current.children.iter().rev() {
+                stack.push((child, current_depth));
             }
         }
     }
@@ -1290,74 +1718,59 @@ fn count_interactive_descendants(element: &Element) -> usize {
     count
 }
 
-fn collect_window_llm_lines(
-    window: &Element,
-    lines: &mut Vec<String>,
-    formatter: &mut MinimalQueryFormatter<'_>,
+fn collect_window_css_lines<'a>(
+    window: &'a Element,
+    depth: usize,
+    lines: &mut Vec<CssTreeLine<'a>>,
 ) {
     let mut all_interactive: Vec<&Element> = Vec::new();
     for child in &window.children {
         collect_interactive(child, &mut all_interactive);
     }
 
-    lines.push(formatter.selector_for(window));
+    lines.push(CssTreeLine {
+        element: window,
+        depth,
+    });
 
     if !all_interactive.is_empty() {
         for child in &window.children {
-            collect_element_hierarchical_lines(child, 1, lines, formatter);
+            collect_element_hierarchical_css_lines(child, depth + 1, lines);
         }
     }
 }
 
-fn collect_element_hierarchical_lines(
-    element: &Element,
-    indent: usize,
-    lines: &mut Vec<String>,
-    formatter: &mut MinimalQueryFormatter<'_>,
+fn collect_element_hierarchical_css_lines<'a>(
+    element: &'a Element,
+    depth: usize,
+    lines: &mut Vec<CssTreeLine<'a>>,
 ) {
-    let mut stack = vec![(element, indent)];
+    let mut stack = vec![(element, depth)];
 
-    while let Some((current, current_indent)) = stack.pop() {
-        let capped_indent = current_indent.min(8);
+    while let Some((current, current_depth)) = stack.pop() {
         let is_container = is_meaningful_container(current);
         let interactive_children = count_interactive_descendants(current);
 
         if is_container && interactive_children > 0 {
-            push_container_header_line(current, capped_indent, lines, formatter);
-
-            let child_indent = if has_printable_label(current) {
-                capped_indent + 1
-            } else {
-                capped_indent
-            };
+            lines.push(CssTreeLine {
+                element: current,
+                depth: current_depth,
+            });
 
             for child in current.children.iter().rev() {
-                stack.push((child, child_indent));
+                stack.push((child, current_depth + 1));
             }
         } else if is_llm_relevant(current) {
-            lines.push(format_element_llm_line(current, capped_indent, formatter));
+            lines.push(CssTreeLine {
+                element: current,
+                depth: current_depth,
+            });
         } else {
             for child in current.children.iter().rev() {
-                stack.push((child, capped_indent));
+                stack.push((child, current_depth));
             }
         }
     }
-}
-
-fn has_printable_label(elem: &Element) -> bool {
-    elem.title.as_ref().is_some_and(|t| !t.is_empty())
-        || elem.description.as_ref().is_some_and(|d| !d.is_empty())
-}
-
-fn push_container_header_line(
-    elem: &Element,
-    indent: usize,
-    lines: &mut Vec<String>,
-    formatter: &mut MinimalQueryFormatter<'_>,
-) {
-    let prefix = "  ".repeat(indent);
-
-    lines.push(format!("{}{}", prefix, formatter.selector_for(elem)));
 }
 
 fn is_meaningful_container(elem: &Element) -> bool {
@@ -1394,27 +1807,23 @@ fn is_meaningful_container(elem: &Element) -> bool {
     has_label || interactive_count >= 2
 }
 
-fn collect_menubar_llm_lines(
-    menubar: &Element,
-    lines: &mut Vec<String>,
-    formatter: &mut MinimalQueryFormatter<'_>,
+fn collect_menubar_css_lines<'a>(
+    menubar: &'a Element,
+    depth: usize,
+    lines: &mut Vec<CssTreeLine<'a>>,
 ) {
-    lines.push(formatter.selector_for(menubar));
+    lines.push(CssTreeLine {
+        element: menubar,
+        depth,
+    });
     for item in &menubar.children {
         if item.role == Role::MenuItem {
-            lines.push(format_element_llm_line(item, 1, formatter));
+            lines.push(CssTreeLine {
+                element: item,
+                depth: depth + 1,
+            });
         }
     }
-}
-
-fn format_element_llm_line(
-    elem: &Element,
-    indent: usize,
-    formatter: &mut MinimalQueryFormatter<'_>,
-) -> String {
-    let prefix = "  ".repeat(indent);
-    let selector = formatter.selector_for(elem);
-    format!("{}{}", prefix, selector)
 }
 
 fn collect_interactive<'a>(element: &'a Element, result: &mut Vec<&'a Element>) {
@@ -1585,16 +1994,20 @@ mod tests {
         }
     }
 
-    fn assert_llm_query_output_round_trips(tree: &ElementTree, structure_only: bool) {
-        for raw_line in format_llm_query_lines(tree, structure_only) {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
+    fn css_line_selector(line: &str) -> Option<&str> {
+        let line = line.trim();
+        if line.is_empty() || line == "}" {
+            return None;
+        }
 
-            let parsed = parse_query(line).unwrap_or_else(|err| panic!("{line}: {err}"));
-            let matches = find_matches(&parsed, tree);
-            assert_eq!(matches.len(), 1, "{line}");
+        line.strip_suffix(" {}").or_else(|| line.strip_suffix(" {"))
+    }
+
+    fn assert_llm_query_output_selectors_parse(tree: &ElementTree, structure_only: bool) {
+        for raw_line in format_llm_query_lines(tree, structure_only) {
+            if let Some(selector) = css_line_selector(&raw_line) {
+                parse_query(selector).unwrap_or_else(|err| panic!("{selector}: {err}"));
+            }
         }
     }
 
@@ -1638,15 +2051,18 @@ mod tests {
             element_count: 3,
         };
 
-        assert_eq!(minimal_selector_for(&tree, 4_294_967_299), "MenuItem");
+        assert_eq!(
+            minimal_selector_for(&tree, 4_294_967_299),
+            "MenuItem[title=\"Apple\"]"
+        );
     }
 
     #[test]
-    fn minimal_selector_reduces_globally_unique_role_without_id() {
+    fn minimal_selector_keeps_text_attrs_even_when_role_is_unique() {
         let tree = make_output_round_trip_tree();
         let selector = minimal_selector_for(&tree, 5);
 
-        assert_eq!(selector, "Button");
+        assert_eq!(selector, "Button[title=\"Run\"]");
         assert!(!selector.contains("data-id"));
     }
 
@@ -1680,7 +2096,7 @@ mod tests {
 
         assert_eq!(
             minimal_selector_for(&tree, 4),
-            "Toolbar[title=\"Editor\"] > Button"
+            "Toolbar[title=\"Editor\"] > Button[title=\"Save\"]"
         );
     }
 
@@ -1703,7 +2119,7 @@ mod tests {
         };
 
         let selector = minimal_selector_for(&tree, 3);
-        assert_eq!(selector, "Button:nth-child(1)");
+        assert_eq!(selector, "Button[title=\"Save\"]:nth-child(1)");
         assert!(!selector.contains("data-id"));
     }
 
@@ -1887,10 +2303,48 @@ mod tests {
     }
 
     #[test]
-    fn every_llm_query_output_line_round_trips() {
+    fn llm_query_output_is_parseable_nested_css() {
         let tree = make_output_round_trip_tree();
-        assert_llm_query_output_round_trips(&tree, false);
-        assert_llm_query_output_round_trips(&tree, true);
+        assert_llm_query_output_selectors_parse(&tree, false);
+        assert_llm_query_output_selectors_parse(&tree, true);
+    }
+
+    #[test]
+    fn llm_query_output_uses_nested_css_blocks() {
+        let tree = make_output_round_trip_tree();
+        let lines = format_llm_query_lines(&tree, false);
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Application[title=\"Test App\"] {")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  Window[title=\"Main Window\"] {")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "    Group[title=\"Primary Controls\"] {")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "      List[title=\"Actions\"] {")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "        Button[title=\"Run\"] {}")
+        );
+        assert!(lines.iter().any(|line| line == "  MenuBar {"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "    MenuItem[title=\"Apple\"] {}")
+        );
+        assert_eq!(lines.last().map(String::as_str), Some("}"));
     }
 
     #[test]
@@ -1898,7 +2352,9 @@ mod tests {
         let tree = make_deep_output_tree(2048);
         let lines = format_llm_query_lines(&tree, false);
         assert!(
-            lines.iter().any(|line| line.trim() == "Button"),
+            lines
+                .iter()
+                .any(|line| line.trim() == "Button[title=\"Needle\"] {}"),
             "{lines:?}"
         );
     }

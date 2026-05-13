@@ -27,15 +27,15 @@
 //! ```
 
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, Element, ListenerConfig, Rect,
-    TargetedAccessibility, TreeFilter,
+    AccessibilityEvent, AccessibilityEventType, Element, ElementKey, ElementTree, ListenerConfig,
+    Rect, TargetedAccessibility, TreeFilter,
 };
 use accessibility_core::api::{
     OutputFormat, OutputPrinter, annotate_elements, decode_screenshot, draw_grid_overlay,
-    format_role_short, print_elements_formatted_with_tree, print_formatted, print_statistics,
-    truncate,
+    format_role_short, print_formatted, print_statistics, truncate,
 };
 use clap::{Args, Parser, ValueEnum};
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -302,6 +302,73 @@ fn query_has_matches(
     }
 }
 
+fn filter_tree_to_matches(tree: &ElementTree, matches: &[&Element]) -> ElementTree {
+    let match_ids: HashSet<ElementKey> = matches.iter().map(|element| element.id).collect();
+    let root = prune_tree_to_matches(&tree.root, &match_ids).unwrap_or_else(|| tree.root.clone());
+    let element_count = count_tree_elements(&root);
+
+    ElementTree {
+        version: tree.version,
+        pid: tree.pid,
+        app_name: tree.app_name.clone(),
+        root,
+        element_count,
+    }
+}
+
+fn prune_tree_to_matches(root: &Element, match_ids: &HashSet<ElementKey>) -> Option<Element> {
+    enum Frame<'a> {
+        Enter(&'a Element),
+        Exit(&'a Element, usize),
+    }
+
+    let mut frames = vec![Frame::Enter(root)];
+    let mut kept: Vec<Option<Element>> = Vec::new();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::Enter(element) => {
+                frames.push(Frame::Exit(element, element.children.len()));
+                for child in element.children.iter().rev() {
+                    frames.push(Frame::Enter(child));
+                }
+            }
+            Frame::Exit(element, child_count) => {
+                let mut children = Vec::new();
+                for _ in 0..child_count {
+                    if let Some(child) = kept.pop().flatten() {
+                        children.push(child);
+                    }
+                }
+                children.reverse();
+
+                if element.id == root.id || match_ids.contains(&element.id) || !children.is_empty()
+                {
+                    let mut element = element.clone();
+                    element.children = children;
+                    kept.push(Some(element));
+                } else {
+                    kept.push(None);
+                }
+            }
+        }
+    }
+
+    kept.pop().flatten()
+}
+
+fn count_tree_elements(root: &Element) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root];
+    while let Some(element) = stack.pop() {
+        count += 1;
+        for child in element.children.iter().rev() {
+            stack.push(child);
+        }
+    }
+    count
+}
+
 /// Helper for element action operations (click, focus, blur).
 /// Returns OperationResult based on whether the action succeeded.
 /// Perform a click action on an element.
@@ -533,7 +600,9 @@ async fn handle_common_operations(
                         query
                     ));
                 }
-                print_elements_formatted_with_tree(&elements, args.output_format(), tree);
+                let filtered_tree = filter_tree_to_matches(tree, &elements);
+                let printer = OutputPrinter::new(args.output_format(), args.structure);
+                print_formatted(&filtered_tree, &printer);
                 return OperationResult::Success;
             }
             Err(e) => {
