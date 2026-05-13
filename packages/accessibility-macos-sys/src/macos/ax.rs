@@ -2,7 +2,7 @@ use super::symbols::ax_ui_element_get_window;
 use super::{AxErrorCode, Point, Rect, Size, WindowId};
 use objc2_application_services::{AXError, AXObserver, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFIndex, CFNumber, CFRetained, CFRunLoop, CFRunLoopMode,
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFRunLoop, CFRunLoopMode,
     CFRunLoopSource, CFString, CFType, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::CGWindowID;
@@ -253,10 +253,6 @@ impl AxElement {
     }
 
     pub fn attribute_elements(&self, attribute: &str) -> Vec<AxElement> {
-        if let Some(elements) = self.array_attribute_values(attribute) {
-            return elements;
-        }
-
         let value = match self.copy_attribute_value(attribute) {
             Ok(value) => value,
             Err(_) => return Vec::new(),
@@ -496,48 +492,6 @@ impl AxElement {
         } else {
             Err(AxErrorCode::from_ax_error(result))
         }
-    }
-
-    fn array_attribute_values(&self, attribute: &str) -> Option<Vec<AxElement>> {
-        let attribute = CFString::from_str(attribute);
-        let mut count: CFIndex = 0;
-        let result = unsafe {
-            self.inner
-                .attribute_value_count(&attribute, NonNull::new(&mut count).unwrap())
-        };
-        if result != AXError::Success || count <= 0 {
-            return (result == AXError::Success).then(Vec::new);
-        }
-
-        let mut values = Vec::new();
-        let mut index: CFIndex = 0;
-        while index < count {
-            let max_values = (count - index).min(256);
-            let mut array: *const CFArray = std::ptr::null();
-            let result = unsafe {
-                self.inner.copy_attribute_values(
-                    &attribute,
-                    index,
-                    max_values,
-                    NonNull::new(&mut array).unwrap(),
-                )
-            };
-            if result != AXError::Success || array.is_null() {
-                break;
-            }
-
-            let array = NonNull::new(array as *mut CFArray as *mut CFArray<AXUIElement>).unwrap();
-            let array: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::from_raw(array) };
-            for i in 0..array.len() {
-                if let Some(element) = array.get(i) {
-                    values.push(Self::new(element));
-                }
-            }
-
-            index += max_values;
-        }
-
-        Some(values)
     }
 }
 

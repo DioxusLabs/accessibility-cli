@@ -32,7 +32,8 @@ use accessibility_core::accessibility::{
 };
 use accessibility_core::api::{
     OutputFormat, OutputPrinter, annotate_elements, decode_screenshot, draw_grid_overlay,
-    format_role_short, print_elements_formatted, print_formatted, print_statistics, truncate,
+    format_role_short, print_elements_formatted_with_tree, print_formatted, print_statistics,
+    truncate,
 };
 use clap::{Args, Parser, ValueEnum};
 use std::sync::{
@@ -532,7 +533,7 @@ async fn handle_common_operations(
                         query
                     ));
                 }
-                print_elements_formatted(&elements, args.output_format());
+                print_elements_formatted_with_tree(&elements, args.output_format(), tree);
                 return OperationResult::Success;
             }
             Err(e) => {

@@ -1,6 +1,6 @@
 //! Output formatting utilities.
 
-use crate::accessibility::{Element, ElementTree};
+use crate::accessibility::{Element, ElementKey, ElementTree, find_matches, parse_query};
 use accesskit::Role;
 use std::collections::HashMap;
 
@@ -118,12 +118,7 @@ impl LlmQueryPrinter {
 
 impl Printer for LlmQueryPrinter {
     fn print(&self, tree: &ElementTree) {
-        print_llm_query_format(
-            &tree.root,
-            tree.app_name.as_deref(),
-            tree.pid,
-            self.structure_only,
-        );
+        print_llm_query_format(tree, self.structure_only);
     }
 }
 
@@ -317,6 +312,15 @@ pub fn print_elements_formatted(elements: &[&Element], format: OutputFormat) {
     }
 }
 
+/// Print an element list using tree context when a format can benefit from it.
+pub fn print_elements_formatted_with_tree(
+    elements: &[&Element],
+    format: OutputFormat,
+    _tree: &ElementTree,
+) {
+    print_elements_formatted(elements, format);
+}
+
 /// Format an element as a CSS selector string.
 pub fn format_element_selector(elem: &Element) -> String {
     let role_str = format_role_query_name(elem.role);
@@ -363,6 +367,466 @@ pub fn format_element_selector(elem: &Element) -> String {
     }
 
     format!("{}{}", role_str, attrs.join(""))
+}
+
+struct MinimalQueryFormatter<'a> {
+    tree: &'a ElementTree,
+    elements_by_id: HashMap<ElementKey, &'a Element>,
+    parent_by_id: HashMap<ElementKey, Option<ElementKey>>,
+    child_index_by_id: HashMap<ElementKey, usize>,
+    match_cache: HashMap<String, Option<ElementKey>>,
+}
+
+impl<'a> MinimalQueryFormatter<'a> {
+    fn new(tree: &'a ElementTree) -> Self {
+        let mut formatter = Self {
+            tree,
+            elements_by_id: HashMap::new(),
+            parent_by_id: HashMap::new(),
+            child_index_by_id: HashMap::new(),
+            match_cache: HashMap::new(),
+        };
+        formatter.index_tree();
+        formatter
+    }
+
+    fn selector_for(&mut self, elem: &Element) -> String {
+        let Some(mut candidate) = self.maximal_candidate(elem.id) else {
+            return self.id_fallback_selector(elem);
+        };
+
+        if !self.matches_target(&candidate, elem.id) {
+            return self.id_fallback_selector(elem);
+        }
+
+        for removal in candidate.removal_candidates() {
+            let mut trial = candidate.clone();
+            if !trial.remove(removal.part) {
+                continue;
+            }
+            if self.matches_target(&trial, elem.id) {
+                candidate = trial;
+            }
+        }
+
+        let selector = candidate.to_selector();
+        if self.unique_match_id(&selector) == Some(elem.id) {
+            selector
+        } else {
+            self.id_fallback_selector(elem)
+        }
+    }
+
+    fn index_tree(&mut self) {
+        let mut stack = vec![(&self.tree.root, None, 0usize)];
+        while let Some((current, parent_id, child_index)) = stack.pop() {
+            self.elements_by_id.insert(current.id, current);
+            self.parent_by_id.insert(current.id, parent_id);
+            self.child_index_by_id.insert(current.id, child_index);
+
+            for (index, child) in current.children.iter().enumerate().rev() {
+                stack.push((child, Some(current.id), index));
+            }
+        }
+    }
+
+    fn maximal_candidate(&self, target_id: ElementKey) -> Option<SelectorCandidate> {
+        let path = self.path_to(target_id)?;
+        let steps = path
+            .into_iter()
+            .map(|elem| {
+                let nth_child = self
+                    .parent_by_id
+                    .get(&elem.id)
+                    .copied()
+                    .flatten()
+                    .and_then(|_| self.child_index_by_id.get(&elem.id).copied())
+                    .map(|child_index| child_index + 1);
+                SelectorStep::new(elem, nth_child)
+            })
+            .collect();
+
+        Some(SelectorCandidate { steps })
+    }
+
+    fn path_to(&self, target_id: ElementKey) -> Option<Vec<&'a Element>> {
+        let mut ids = Vec::new();
+        let mut current_id = target_id;
+
+        loop {
+            ids.push(current_id);
+            match self.parent_by_id.get(&current_id).copied().flatten() {
+                Some(parent_id) => current_id = parent_id,
+                None => break,
+            }
+        }
+
+        ids.reverse();
+        ids.into_iter()
+            .map(|id| self.elements_by_id.get(&id).copied())
+            .collect()
+    }
+
+    fn matches_target(&mut self, candidate: &SelectorCandidate, target_id: ElementKey) -> bool {
+        let selector = candidate.to_selector();
+        self.unique_match_id(&selector) == Some(target_id)
+    }
+
+    fn unique_match_id(&mut self, selector: &str) -> Option<ElementKey> {
+        if selector.is_empty() {
+            return None;
+        }
+
+        if let Some(cached) = self.match_cache.get(selector) {
+            return *cached;
+        }
+
+        let unique_id = parse_query(selector).ok().and_then(|parsed| {
+            let matches = find_matches(&parsed, self.tree);
+            if matches.len() == 1 {
+                Some(matches[0].id)
+            } else {
+                None
+            }
+        });
+
+        self.match_cache.insert(selector.to_string(), unique_id);
+        unique_id
+    }
+
+    fn id_fallback_selector(&mut self, elem: &Element) -> String {
+        let selector = format!(
+            "{}{}",
+            format_role_query_name(elem.role),
+            format_attr_selector("data-id", &elem.id.to_string())
+        );
+
+        if self.unique_match_id(&selector) == Some(elem.id) {
+            selector
+        } else {
+            format_element_selector(elem)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SelectorCandidate {
+    steps: Vec<SelectorStep>,
+}
+
+impl SelectorCandidate {
+    fn to_selector(&self) -> String {
+        let mut selector = String::new();
+        let mut previous_step_index: Option<usize> = None;
+
+        for (index, step) in self.steps.iter().enumerate() {
+            if !step.active {
+                continue;
+            }
+
+            let step_selector = step.to_selector();
+            if step_selector.is_empty() {
+                continue;
+            }
+
+            if let Some(previous_index) = previous_step_index {
+                if index == previous_index + 1 {
+                    selector.push_str(" > ");
+                } else {
+                    selector.push(' ');
+                }
+            }
+
+            selector.push_str(&step_selector);
+            previous_step_index = Some(index);
+        }
+
+        selector
+    }
+
+    fn removal_candidates(&self) -> Vec<RemovalCandidate> {
+        let target_index = self.steps.len().saturating_sub(1);
+        let mut removals = Vec::new();
+        let mut order = 0usize;
+
+        for (step_index, step) in self.steps.iter().enumerate() {
+            for (pseudo_index, pseudo) in step.pseudos.iter().enumerate() {
+                removals.push(RemovalCandidate {
+                    part: SelectorPart::Pseudo(step_index, pseudo_index),
+                    cost: pseudo.removal_cost(),
+                    order,
+                });
+                order += 1;
+            }
+
+            for (attr_index, attr) in step.attrs.iter().enumerate() {
+                removals.push(RemovalCandidate {
+                    part: SelectorPart::Attr(step_index, attr_index),
+                    cost: attr.removal_cost(step_index == target_index),
+                    order,
+                });
+                order += 1;
+            }
+
+            if step_index != target_index {
+                removals.push(RemovalCandidate {
+                    part: SelectorPart::Step(step_index),
+                    cost: 600,
+                    order,
+                });
+                order += 1;
+            }
+        }
+
+        removals.sort_by(|left, right| {
+            right
+                .cost
+                .cmp(&left.cost)
+                .then_with(|| left.order.cmp(&right.order))
+        });
+        removals
+    }
+
+    fn remove(&mut self, part: SelectorPart) -> bool {
+        match part {
+            SelectorPart::Step(index) => {
+                let Some(step) = self.steps.get_mut(index) else {
+                    return false;
+                };
+                if !step.active {
+                    return false;
+                }
+                step.active = false;
+                true
+            }
+            SelectorPart::Attr(step_index, attr_index) => {
+                let Some(step) = self.steps.get_mut(step_index) else {
+                    return false;
+                };
+                if !step.active {
+                    return false;
+                }
+                let Some(attr) = step.attrs.get_mut(attr_index) else {
+                    return false;
+                };
+                if !attr.active {
+                    return false;
+                }
+                attr.active = false;
+                true
+            }
+            SelectorPart::Pseudo(step_index, pseudo_index) => {
+                let Some(step) = self.steps.get_mut(step_index) else {
+                    return false;
+                };
+                if !step.active {
+                    return false;
+                }
+                let Some(pseudo) = step.pseudos.get_mut(pseudo_index) else {
+                    return false;
+                };
+                if !pseudo.active {
+                    return false;
+                }
+                pseudo.active = false;
+                true
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SelectorStep {
+    active: bool,
+    role: &'static str,
+    attrs: Vec<SelectorAttr>,
+    pseudos: Vec<SelectorPseudo>,
+}
+
+impl SelectorStep {
+    fn new(elem: &Element, nth_child: Option<usize>) -> Self {
+        let mut attrs = Vec::new();
+
+        if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
+            attrs.push(SelectorAttr::new(SelectorAttrKind::Title, "title", title));
+        }
+
+        if let Some(desc) = elem.description.as_ref().filter(|s| !s.is_empty())
+            && elem.title.as_deref() != Some(desc.as_str())
+        {
+            attrs.push(SelectorAttr::new(
+                SelectorAttrKind::Description,
+                "description",
+                desc,
+            ));
+        }
+
+        if let Some(value) = elem.value.as_ref().filter(|s| !s.is_empty())
+            && elem.title.as_deref() != Some(value.as_str())
+        {
+            attrs.push(SelectorAttr::new(SelectorAttrKind::Value, "value", value));
+        }
+
+        if let Some(url) = elem.url.as_ref().filter(|s| !s.is_empty()) {
+            attrs.push(SelectorAttr::new(SelectorAttrKind::Url, "url", url));
+        }
+
+        if let Some(help) = elem.help.as_ref().filter(|s| !s.is_empty()) {
+            attrs.push(SelectorAttr::new(SelectorAttrKind::Help, "help", help));
+        }
+
+        if let Some(identifier) = elem.identifier.as_ref().filter(|s| !s.is_empty()) {
+            attrs.push(SelectorAttr::new(
+                SelectorAttrKind::Identifier,
+                "identifier",
+                identifier,
+            ));
+        }
+
+        if let Some(role_description) = elem.role_description.as_ref().filter(|s| !s.is_empty()) {
+            attrs.push(SelectorAttr::new(
+                SelectorAttrKind::RoleDescription,
+                "role-description",
+                role_description,
+            ));
+        }
+
+        let actions = format_actions_query_value(&elem.actions);
+        if !actions.is_empty() {
+            attrs.push(SelectorAttr::new(
+                SelectorAttrKind::Actions,
+                "actions",
+                &actions,
+            ));
+        }
+
+        let mut pseudos = Vec::new();
+        if elem.focused {
+            pseudos.push(SelectorPseudo::new(SelectorPseudoKind::Focused));
+        }
+        if !elem.enabled {
+            pseudos.push(SelectorPseudo::new(SelectorPseudoKind::Disabled));
+        }
+        if let Some(nth_child) = nth_child {
+            pseudos.push(SelectorPseudo::new(SelectorPseudoKind::NthChild(nth_child)));
+        }
+
+        Self {
+            active: true,
+            role: format_role_query_name(elem.role),
+            attrs,
+            pseudos,
+        }
+    }
+
+    fn to_selector(&self) -> String {
+        let mut selector = self.role.to_string();
+
+        for attr in &self.attrs {
+            if attr.active {
+                selector.push_str(&format_attr_selector(attr.name, &attr.value));
+            }
+        }
+
+        for pseudo in &self.pseudos {
+            if pseudo.active {
+                selector.push_str(&pseudo.to_selector());
+            }
+        }
+
+        selector
+    }
+}
+
+#[derive(Clone)]
+struct SelectorAttr {
+    active: bool,
+    kind: SelectorAttrKind,
+    name: &'static str,
+    value: String,
+}
+
+impl SelectorAttr {
+    fn new(kind: SelectorAttrKind, name: &'static str, value: &str) -> Self {
+        Self {
+            active: true,
+            kind,
+            name,
+            value: value.to_string(),
+        }
+    }
+
+    fn removal_cost(&self, is_target: bool) -> u16 {
+        match self.kind {
+            SelectorAttrKind::Value => 900,
+            SelectorAttrKind::Actions
+            | SelectorAttrKind::Help
+            | SelectorAttrKind::Url
+            | SelectorAttrKind::RoleDescription => 800,
+            SelectorAttrKind::Description => 700,
+            SelectorAttrKind::Title | SelectorAttrKind::Identifier if !is_target => 650,
+            SelectorAttrKind::Title | SelectorAttrKind::Identifier => 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SelectorAttrKind {
+    Title,
+    Description,
+    Value,
+    Url,
+    Help,
+    Identifier,
+    RoleDescription,
+    Actions,
+}
+
+#[derive(Clone)]
+struct SelectorPseudo {
+    active: bool,
+    kind: SelectorPseudoKind,
+}
+
+impl SelectorPseudo {
+    fn new(kind: SelectorPseudoKind) -> Self {
+        Self { active: true, kind }
+    }
+
+    fn to_selector(&self) -> String {
+        match self.kind {
+            SelectorPseudoKind::Focused => ":focused".to_string(),
+            SelectorPseudoKind::Disabled => ":disabled".to_string(),
+            SelectorPseudoKind::NthChild(index) => format!(":nth-child({})", index),
+        }
+    }
+
+    fn removal_cost(&self) -> u16 {
+        match self.kind {
+            SelectorPseudoKind::NthChild(_) => 1_000,
+            SelectorPseudoKind::Focused | SelectorPseudoKind::Disabled => 900,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SelectorPseudoKind {
+    Focused,
+    Disabled,
+    NthChild(usize),
+}
+
+#[derive(Clone, Copy)]
+enum SelectorPart {
+    Step(usize),
+    Attr(usize, usize),
+    Pseudo(usize, usize),
+}
+
+struct RemovalCandidate {
+    part: SelectorPart,
+    cost: u16,
+    order: usize,
 }
 
 /// Print human-readable tree using CSS selector format.
@@ -497,22 +961,21 @@ fn format_element_concise_line(elem: &Element) -> String {
 }
 
 /// Print verbose LLM format with CSS-like selectors.
-fn print_llm_query_format(
-    root: &Element,
-    _app_name: Option<&str>,
-    _pid: Option<u32>,
-    structure_only: bool,
-) {
-    for line in format_llm_query_lines(root, structure_only) {
+fn print_llm_query_format(tree: &ElementTree, structure_only: bool) {
+    for line in format_llm_query_lines(tree, structure_only) {
         println!("{}", line);
     }
 }
 
-fn format_llm_query_lines(root: &Element, structure_only: bool) -> Vec<String> {
-    let mut lines = vec![format_element_selector(root), String::new()];
+fn format_llm_query_lines(tree: &ElementTree, structure_only: bool) -> Vec<String> {
+    let root = &tree.root;
+    let mut formatter = MinimalQueryFormatter::new(tree);
+    let mut lines = vec![formatter.selector_for(root), String::new()];
     if structure_only {
         for child in &root.children {
-            collect_structure_node_lines(child, 0, &mut lines);
+            collect_structure_node_lines_with(child, 0, &mut lines, &mut |elem| {
+                formatter.selector_for(elem)
+            });
         }
         return lines;
     }
@@ -532,18 +995,18 @@ fn format_llm_query_lines(root: &Element, structure_only: bool) -> Vec<String> {
     }
 
     for window in &windows {
-        collect_window_llm_lines(window, &mut lines);
+        collect_window_llm_lines(window, &mut lines, &mut formatter);
         lines.push(String::new());
     }
 
     if let Some(mb) = menubar {
-        collect_menubar_llm_lines(mb, &mut lines);
+        collect_menubar_llm_lines(mb, &mut lines, &mut formatter);
         lines.push(String::new());
     }
 
     if !other_interactive.is_empty() {
         for elem in other_interactive {
-            lines.push(format_element_llm_line(elem, 0));
+            lines.push(format_element_llm_line(elem, 0, &mut formatter));
         }
     }
 
@@ -559,6 +1022,16 @@ fn print_structure_node(element: &Element, indent: usize) {
 }
 
 fn collect_structure_node_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
+    let mut format_selector = format_element_selector;
+    collect_structure_node_lines_with(element, indent, lines, &mut format_selector);
+}
+
+fn collect_structure_node_lines_with(
+    element: &Element,
+    indent: usize,
+    lines: &mut Vec<String>,
+    format_selector: &mut impl FnMut(&Element) -> String,
+) {
     let mut stack = vec![(element, indent)];
 
     while let Some((current, current_indent)) = stack.pop() {
@@ -566,7 +1039,7 @@ fn collect_structure_node_lines(element: &Element, indent: usize, lines: &mut Ve
 
         if is_structural || current_indent == 0 {
             let prefix = "  ".repeat(current_indent);
-            lines.push(format!("{}{}", prefix, format_element_selector(current)));
+            lines.push(format!("{}{}", prefix, format_selector(current)));
 
             for child in current.children.iter().rev() {
                 if is_structural_node(child) || has_structural_descendants(child) {
@@ -638,22 +1111,31 @@ fn count_interactive_descendants(element: &Element) -> usize {
     count
 }
 
-fn collect_window_llm_lines(window: &Element, lines: &mut Vec<String>) {
+fn collect_window_llm_lines(
+    window: &Element,
+    lines: &mut Vec<String>,
+    formatter: &mut MinimalQueryFormatter<'_>,
+) {
     let mut all_interactive: Vec<&Element> = Vec::new();
     for child in &window.children {
         collect_interactive(child, &mut all_interactive);
     }
 
-    lines.push(format_element_selector(window));
+    lines.push(formatter.selector_for(window));
 
     if !all_interactive.is_empty() {
         for child in &window.children {
-            collect_element_hierarchical_lines(child, 1, lines);
+            collect_element_hierarchical_lines(child, 1, lines, formatter);
         }
     }
 }
 
-fn collect_element_hierarchical_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
+fn collect_element_hierarchical_lines(
+    element: &Element,
+    indent: usize,
+    lines: &mut Vec<String>,
+    formatter: &mut MinimalQueryFormatter<'_>,
+) {
     let mut stack = vec![(element, indent)];
 
     while let Some((current, current_indent)) = stack.pop() {
@@ -662,7 +1144,7 @@ fn collect_element_hierarchical_lines(element: &Element, indent: usize, lines: &
         let interactive_children = count_interactive_descendants(current);
 
         if is_container && interactive_children > 0 {
-            push_container_header_line(current, capped_indent, lines);
+            push_container_header_line(current, capped_indent, lines, formatter);
 
             let child_indent = if has_printable_label(current) {
                 capped_indent + 1
@@ -674,7 +1156,7 @@ fn collect_element_hierarchical_lines(element: &Element, indent: usize, lines: &
                 stack.push((child, child_indent));
             }
         } else if is_llm_relevant(current) {
-            lines.push(format_element_llm_line(current, capped_indent));
+            lines.push(format_element_llm_line(current, capped_indent, formatter));
         } else {
             for child in current.children.iter().rev() {
                 stack.push((child, capped_indent));
@@ -688,10 +1170,15 @@ fn has_printable_label(elem: &Element) -> bool {
         || elem.description.as_ref().is_some_and(|d| !d.is_empty())
 }
 
-fn push_container_header_line(elem: &Element, indent: usize, lines: &mut Vec<String>) {
+fn push_container_header_line(
+    elem: &Element,
+    indent: usize,
+    lines: &mut Vec<String>,
+    formatter: &mut MinimalQueryFormatter<'_>,
+) {
     let prefix = "  ".repeat(indent);
 
-    lines.push(format!("{}{}", prefix, format_element_selector(elem)));
+    lines.push(format!("{}{}", prefix, formatter.selector_for(elem)));
 }
 
 fn is_meaningful_container(elem: &Element) -> bool {
@@ -728,18 +1215,26 @@ fn is_meaningful_container(elem: &Element) -> bool {
     has_label || interactive_count >= 2
 }
 
-fn collect_menubar_llm_lines(menubar: &Element, lines: &mut Vec<String>) {
-    lines.push(format_element_selector(menubar));
+fn collect_menubar_llm_lines(
+    menubar: &Element,
+    lines: &mut Vec<String>,
+    formatter: &mut MinimalQueryFormatter<'_>,
+) {
+    lines.push(formatter.selector_for(menubar));
     for item in &menubar.children {
         if item.role == Role::MenuItem {
-            lines.push(format_element_llm_line(item, 1));
+            lines.push(format_element_llm_line(item, 1, formatter));
         }
     }
 }
 
-fn format_element_llm_line(elem: &Element, indent: usize) -> String {
+fn format_element_llm_line(
+    elem: &Element,
+    indent: usize,
+    formatter: &mut MinimalQueryFormatter<'_>,
+) -> String {
     let prefix = "  ".repeat(indent);
-    let selector = format_element_selector(elem);
+    let selector = formatter.selector_for(elem);
     format!("{}{}", prefix, selector)
 }
 
