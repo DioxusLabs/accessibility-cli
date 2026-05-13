@@ -662,8 +662,7 @@ pub fn parse(query: &str) -> Result<SelectorList<AccessibilitySelectors>, String
 
 /// Create a MatchingContext for selector matching.
 ///
-/// This is used by both `find_matches_recursive` and `matches_simple` to avoid
-/// duplicating the context initialization logic.
+/// This keeps selector matching context initialization in one place.
 fn create_matching_context<'a>(
     nth_index_cache: &'a mut NthIndexCache,
 ) -> MatchingContext<'a, AccessibilitySelectors> {
@@ -683,52 +682,45 @@ pub fn find_matches<'a>(
     tree: &'a ElementTree,
 ) -> Vec<&'a Element> {
     let mut results = Vec::new();
-    let mut ancestors = Vec::new();
-    find_matches_recursive(selector_list, &tree.root, &mut ancestors, &mut results);
+    let mut stack: Vec<(&'a Element, Vec<&'a Element>)> = vec![(&tree.root, Vec::new())];
+
+    while let Some((element, ancestors)) = stack.pop() {
+        let parent = ancestors.last().copied();
+        let index_in_parent = parent
+            .map(|p| {
+                p.children
+                    .iter()
+                    .position(|c| c.id == element.id)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
+        let siblings: &[Element] = parent
+            .map(|p| p.children.as_slice())
+            .unwrap_or(std::slice::from_ref(element));
+
+        let elem_ref = ElementRef {
+            element,
+            ancestors: ancestors.clone(),
+            index_in_parent,
+            siblings,
+        };
+
+        let mut nth_index_cache = NthIndexCache::default();
+        let mut context = create_matching_context(&mut nth_index_cache);
+
+        if matches_selector_list(selector_list, &elem_ref, &mut context) {
+            results.push(element);
+        }
+
+        for child in element.children.iter().rev() {
+            let mut child_ancestors = ancestors.clone();
+            child_ancestors.push(element);
+            stack.push((child, child_ancestors));
+        }
+    }
+
     results
-}
-
-fn find_matches_recursive<'a>(
-    selector_list: &SelectorList<AccessibilitySelectors>,
-    element: &'a Element,
-    ancestors: &mut Vec<&'a Element>,
-    results: &mut Vec<&'a Element>,
-) {
-    let parent = ancestors.last().copied();
-    let index_in_parent = parent
-        .map(|p| {
-            p.children
-                .iter()
-                .position(|c| c.id == element.id)
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
-
-    let siblings: &[Element] = parent
-        .map(|p| p.children.as_slice())
-        .unwrap_or(std::slice::from_ref(element));
-
-    let elem_ref = ElementRef {
-        element,
-        ancestors: ancestors.clone(),
-        index_in_parent,
-        siblings,
-    };
-
-    // Check if this element matches any selector in the list
-    let mut nth_index_cache = NthIndexCache::default();
-    let mut context = create_matching_context(&mut nth_index_cache);
-
-    if matches_selector_list(selector_list, &elem_ref, &mut context) {
-        results.push(element);
-    }
-
-    // Recurse into children
-    ancestors.push(element);
-    for child in &element.children {
-        find_matches_recursive(selector_list, child, ancestors, results);
-    }
-    ancestors.pop();
 }
 
 #[cfg(test)]
@@ -868,6 +860,25 @@ mod tests {
         }
     }
 
+    fn make_deep_chain_tree(depth: u64) -> ElementTree {
+        let mut leaf = Element::new(ElementKey::from_ffi(depth + 100), Role::Button);
+        leaf.title = Some("Needle".to_string());
+
+        for id in (0..depth).rev() {
+            let mut parent = Element::new(ElementKey::from_ffi(id + 100), Role::Group);
+            parent.children.push(leaf);
+            leaf = parent;
+        }
+
+        ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            element_count: depth as usize + 1,
+            root: leaf,
+        }
+    }
+
     #[test]
     fn test_preprocess_numeric_id() {
         assert_eq!(preprocess_query("#42"), "[data-id=\"42\"]");
@@ -1000,6 +1011,15 @@ mod tests {
         let matches = find_matches(&sel, &tree);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, ElementKey::from_ffi(13));
+    }
+
+    #[test]
+    fn test_find_matches_handles_deep_tree_iteratively() {
+        let tree = make_deep_chain_tree(2048);
+        let sel = parse("[title=\"Needle\"]").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title.as_deref(), Some("Needle"));
     }
 
     #[test]

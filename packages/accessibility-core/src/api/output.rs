@@ -367,26 +367,30 @@ pub fn format_element_selector(elem: &Element) -> String {
 
 /// Print human-readable tree using CSS selector format.
 pub fn print_tree(element: &Element, indent: usize) {
-    let prefix = "  ".repeat(indent);
-    let selector = format_element_selector(element);
+    let mut stack = vec![(element, indent)];
 
-    let mut status = Vec::new();
-    if element.focused {
-        status.push("FOCUSED");
-    }
-    if !element.enabled {
-        status.push("disabled");
-    }
-    let status_str = if status.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", status.join(", "))
-    };
+    while let Some((current, current_indent)) = stack.pop() {
+        let prefix = "  ".repeat(current_indent);
+        let selector = format_element_selector(current);
 
-    println!("{}[{}] {}{}", prefix, element.id, selector, status_str);
+        let mut status = Vec::new();
+        if current.focused {
+            status.push("FOCUSED");
+        }
+        if !current.enabled {
+            status.push("disabled");
+        }
+        let status_str = if status.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", status.join(", "))
+        };
 
-    for child in &element.children {
-        print_tree(child, indent + 1);
+        println!("{}[{}] {}{}", prefix, current.id, selector, status_str);
+
+        for child in current.children.iter().rev() {
+            stack.push((child, current_indent + 1));
+        }
     }
 }
 
@@ -408,9 +412,12 @@ pub fn print_statistics(element: &Element) {
 }
 
 fn count_roles(element: &Element, counts: &mut HashMap<Role, usize>) {
-    *counts.entry(element.role).or_insert(0) += 1;
-    for child in &element.children {
-        count_roles(child, counts);
+    let mut stack = vec![element];
+    while let Some(current) = stack.pop() {
+        *counts.entry(current.role).or_insert(0) += 1;
+        for child in current.children.iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
@@ -552,22 +559,24 @@ fn print_structure_node(element: &Element, indent: usize) {
 }
 
 fn collect_structure_node_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
-    let prefix = "  ".repeat(indent);
-    let is_structural = is_structural_node(element);
+    let mut stack = vec![(element, indent)];
 
-    if is_structural || indent == 0 {
-        lines.push(format!("{}{}", prefix, format_element_selector(element)));
+    while let Some((current, current_indent)) = stack.pop() {
+        let is_structural = is_structural_node(current);
 
-        if !element.children.is_empty() {
-            for child in &element.children {
+        if is_structural || current_indent == 0 {
+            let prefix = "  ".repeat(current_indent);
+            lines.push(format!("{}{}", prefix, format_element_selector(current)));
+
+            for child in current.children.iter().rev() {
                 if is_structural_node(child) || has_structural_descendants(child) {
-                    collect_structure_node_lines(child, indent + 1, lines);
+                    stack.push((child, current_indent + 1));
                 }
             }
-        }
-    } else if has_structural_descendants(element) {
-        for child in &element.children {
-            collect_structure_node_lines(child, indent, lines);
+        } else if has_structural_descendants(current) {
+            for child in current.children.iter().rev() {
+                stack.push((child, current_indent));
+            }
         }
     }
 }
@@ -603,9 +612,13 @@ fn is_structural_node(elem: &Element) -> bool {
 }
 
 fn has_structural_descendants(element: &Element) -> bool {
-    for child in &element.children {
-        if is_structural_node(child) || has_structural_descendants(child) {
+    let mut stack: Vec<&Element> = element.children.iter().collect();
+    while let Some(current) = stack.pop() {
+        if is_structural_node(current) {
             return true;
+        }
+        for child in &current.children {
+            stack.push(child);
         }
     }
     false
@@ -613,11 +626,14 @@ fn has_structural_descendants(element: &Element) -> bool {
 
 fn count_interactive_descendants(element: &Element) -> usize {
     let mut count = 0;
-    if is_llm_relevant(element) {
-        count += 1;
-    }
-    for child in &element.children {
-        count += count_interactive_descendants(child);
+    let mut stack = vec![element];
+    while let Some(current) = stack.pop() {
+        if is_llm_relevant(current) {
+            count += 1;
+        }
+        for child in current.children.iter().rev() {
+            stack.push(child);
+        }
     }
     count
 }
@@ -638,27 +654,31 @@ fn collect_window_llm_lines(window: &Element, lines: &mut Vec<String>) {
 }
 
 fn collect_element_hierarchical_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
-    let capped_indent = indent.min(8);
-    let is_container = is_meaningful_container(element);
-    let interactive_children = count_interactive_descendants(element);
+    let mut stack = vec![(element, indent)];
 
-    if is_container && interactive_children > 0 {
-        push_container_header_line(element, capped_indent, lines);
+    while let Some((current, current_indent)) = stack.pop() {
+        let capped_indent = current_indent.min(8);
+        let is_container = is_meaningful_container(current);
+        let interactive_children = count_interactive_descendants(current);
 
-        let child_indent = if has_printable_label(element) {
-            capped_indent + 1
+        if is_container && interactive_children > 0 {
+            push_container_header_line(current, capped_indent, lines);
+
+            let child_indent = if has_printable_label(current) {
+                capped_indent + 1
+            } else {
+                capped_indent
+            };
+
+            for child in current.children.iter().rev() {
+                stack.push((child, child_indent));
+            }
+        } else if is_llm_relevant(current) {
+            lines.push(format_element_llm_line(current, capped_indent));
         } else {
-            capped_indent
-        };
-
-        for child in &element.children {
-            collect_element_hierarchical_lines(child, child_indent, lines);
-        }
-    } else if is_llm_relevant(element) {
-        lines.push(format_element_llm_line(element, capped_indent));
-    } else {
-        for child in &element.children {
-            collect_element_hierarchical_lines(child, capped_indent, lines);
+            for child in current.children.iter().rev() {
+                stack.push((child, capped_indent));
+            }
         }
     }
 }
@@ -724,11 +744,14 @@ fn format_element_llm_line(elem: &Element, indent: usize) -> String {
 }
 
 fn collect_interactive<'a>(element: &'a Element, result: &mut Vec<&'a Element>) {
-    if is_llm_relevant(element) {
-        result.push(element);
-    }
-    for child in &element.children {
-        collect_interactive(child, result);
+    let mut stack = vec![element];
+    while let Some(current) = stack.pop() {
+        if is_llm_relevant(current) {
+            result.push(current);
+        }
+        for child in current.children.iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
@@ -856,6 +879,35 @@ mod tests {
             app_name: Some("Test App".to_string()),
             root,
             element_count: 10,
+        }
+    }
+
+    fn make_deep_output_tree(depth: u64) -> ElementTree {
+        let mut button = Element::new(ElementKey::from_ffi(depth + 100), Role::Button);
+        button.title = Some("Needle".to_string());
+        button.actions = vec!["AXPress".to_string()];
+
+        let mut current = button;
+        for id in (0..depth).rev() {
+            let mut group = Element::new(ElementKey::from_ffi(id + 100), Role::Group);
+            group.children.push(current);
+            current = group;
+        }
+
+        let mut window = Element::new(ElementKey::from_ffi(42), Role::Window);
+        window.title = Some("Deep Window".to_string());
+        window.children.push(current);
+
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        root.title = Some("Deep App".to_string());
+        root.children.push(window);
+
+        ElementTree {
+            version: 1,
+            pid: None,
+            app_name: Some("Deep App".to_string()),
+            element_count: depth as usize + 3,
+            root,
         }
     }
 
@@ -989,5 +1041,12 @@ mod tests {
         let tree = make_output_round_trip_tree();
         assert_llm_query_output_round_trips(&tree, false);
         assert_llm_query_output_round_trips(&tree, true);
+    }
+
+    #[test]
+    fn llm_query_output_handles_deep_tree_iteratively() {
+        let tree = make_deep_output_tree(2048);
+        let lines = format_llm_query_lines(&tree.root, false);
+        assert!(lines.iter().any(|line| line.contains("[title=\"Needle\"]")));
     }
 }

@@ -226,13 +226,16 @@ impl ChildDiscovery {
         seen: &mut HashSet<String>,
         depth: usize,
     ) {
-        if depth > 24 {
-            return;
-        }
+        let mut stack = vec![(element.clone(), depth)];
+        while let Some((current, current_depth)) = stack.pop() {
+            if current_depth > 24 {
+                continue;
+            }
 
-        for child in self.structural_children(element) {
-            if seen.insert(MacOSAccessibility::element_signature(&child)) {
-                self.collect_structural_signatures(&child, seen, depth + 1);
+            for child in self.structural_children(&current).into_iter().rev() {
+                if seen.insert(MacOSAccessibility::element_signature(&child)) {
+                    stack.push((child, current_depth + 1));
+                }
             }
         }
     }
@@ -667,9 +670,12 @@ impl MacOSAccessibility {
     }
 
     fn flatten_elements(element: &Element, elements: &mut Vec<Element>) {
-        elements.push(element.clone());
-        for child in &element.children {
-            Self::flatten_elements(child, elements);
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            elements.push(current.clone());
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -859,40 +865,24 @@ impl MacOSAccessibility {
             .any(|value| !value.trim().is_empty())
         }
 
-        fn has_meaningful_descendant(element: &Element, depth: usize) -> bool {
+        let mut stack = vec![(&tree.root, 0usize, false)];
+        while let Some((element, depth, inside_webview)) = stack.pop() {
             if depth > 24 {
-                return false;
+                continue;
             }
 
-            if has_accessible_text(element) {
+            if inside_webview && has_accessible_text(element) {
                 return true;
             }
 
-            element
-                .children
-                .iter()
-                .any(|child| has_meaningful_descendant(child, depth + 1))
+            let child_inside_webview =
+                inside_webview || (element.role == Role::WebView && !element.children.is_empty());
+            for child in element.children.iter().rev() {
+                stack.push((child, depth + 1, child_inside_webview));
+            }
         }
 
-        fn walk_for_webview_content(element: &Element, depth: usize) -> bool {
-            if depth > 24 {
-                return false;
-            }
-
-            if element.role == Role::WebView && !element.children.is_empty() {
-                return element
-                    .children
-                    .iter()
-                    .any(|child| has_meaningful_descendant(child, depth + 1));
-            }
-
-            element
-                .children
-                .iter()
-                .any(|child| walk_for_webview_content(child, depth + 1))
-        }
-
-        walk_for_webview_content(&tree.root, 0)
+        false
     }
 
     fn element_signature(element: &AxElement) -> String {
@@ -1064,84 +1054,131 @@ impl MacOSAccessibility {
         depth: usize,
         element_count: &mut usize,
     ) -> Option<Element> {
-        // Check element count limit
-        if let Some(max) = filter.max_elements
-            && *element_count >= max
-        {
-            return None;
+        struct BuildFrame {
+            ax_element: AxElement,
+            depth: usize,
+            element: Option<Element>,
+            self_matches: bool,
+            children: Vec<AxElement>,
+            next_child: usize,
+            retained_children: Vec<Element>,
         }
 
-        // Get role
-        let ax_role = Self::get_string_attribute(ax_element, AX_ROLE)?;
-        let role = Self::map_role(&ax_role);
+        impl BuildFrame {
+            fn new(ax_element: AxElement, depth: usize) -> Self {
+                Self {
+                    ax_element,
+                    depth,
+                    element: None,
+                    self_matches: false,
+                    children: Vec::new(),
+                    next_child: 0,
+                    retained_children: Vec::new(),
+                }
+            }
+        }
 
-        // Allocate ID before storing the platform handle; this preserves the existing
-        // handle/cache ordering for macOS while the cache API transition settles.
-        #[allow(deprecated)]
-        let id = self.cache.next_id();
+        let root_depth = depth;
+        let mut root = None;
+        let mut stack = vec![BuildFrame::new(ax_element.clone(), depth)];
 
-        // Build element
-        let mut element = Element::new(id, role);
-        element.title = Self::get_string_attribute(ax_element, AX_TITLE);
-        element.description = Self::get_string_attribute(ax_element, AX_DESCRIPTION);
-        element.value = Self::get_string_attribute(ax_element, AX_VALUE);
-        element.bounds = Self::get_bounds(ax_element);
-        element.enabled = Self::get_bool_attribute(ax_element, AX_ENABLED).unwrap_or(true);
-        element.focused = Self::get_bool_attribute(ax_element, AX_FOCUSED).unwrap_or(false);
-        element.actions = Self::get_actions(ax_element);
+        while !stack.is_empty() {
+            let index = stack.len() - 1;
 
-        let self_matches = filter.should_include(&element, depth);
+            if stack[index].element.is_none() {
+                if let Some(max) = filter.max_elements
+                    && *element_count >= max
+                    && stack[index].depth != root_depth
+                {
+                    stack.pop();
+                    continue;
+                }
 
-        // Process children (subject to max_depth). We always recurse so that filters
-        // like --interactive / --visible don't prune containers whose descendants do
-        // match; the container is included below if any child survived.
-        let should_recurse = filter.max_depth.is_none_or(|max| depth < max);
-        if should_recurse {
-            let mut children = Self::get_children(ax_element);
+                let current_ax = stack[index].ax_element.clone();
+                let current_depth = stack[index].depth;
+                let ax_role = match Self::get_string_attribute(&current_ax, AX_ROLE) {
+                    Some(role) => role,
+                    None => {
+                        stack.pop();
+                        continue;
+                    }
+                };
+                let role = Self::map_role(&ax_role);
 
-            // For backgrounded apps, AXChildren of the Application typically omits
-            // visible windows; AXWindows still returns them. Fall back to AXWindows
-            // only when AXChildren produced no Window-role child, since macOS hands
-            // out fresh AXUIElement wrappers per call (no cheap pointer dedup) and
-            // we want to avoid double-walking the same window.
-            if role == Role::Application {
-                let has_window_child = children.iter().any(|c| {
-                    Self::get_string_attribute(c, AX_ROLE)
-                        .map(|r| r == ROLE_WINDOW)
-                        .unwrap_or(false)
-                });
-                if !has_window_child {
-                    for window in Self::get_application_windows(ax_element) {
-                        children.push(window);
+                #[allow(deprecated)]
+                let id = self.cache.next_id();
+
+                let mut element = Element::new(id, role);
+                element.title = Self::get_string_attribute(&current_ax, AX_TITLE);
+                element.description = Self::get_string_attribute(&current_ax, AX_DESCRIPTION);
+                element.value = Self::get_string_attribute(&current_ax, AX_VALUE);
+                element.bounds = Self::get_bounds(&current_ax);
+                element.enabled = Self::get_bool_attribute(&current_ax, AX_ENABLED).unwrap_or(true);
+                element.focused =
+                    Self::get_bool_attribute(&current_ax, AX_FOCUSED).unwrap_or(false);
+                element.actions = Self::get_actions(&current_ax);
+
+                let self_matches = filter.should_include(&element, current_depth);
+                let mut children = if filter.max_depth.is_none_or(|max| current_depth < max) {
+                    Self::get_children(&current_ax)
+                } else {
+                    Vec::new()
+                };
+
+                // For backgrounded apps, AXChildren of the Application typically omits
+                // visible windows; AXWindows still returns them. Fall back to AXWindows
+                // only when AXChildren produced no Window-role child.
+                if role == Role::Application {
+                    let has_window_child = children.iter().any(|child| {
+                        Self::get_string_attribute(child, AX_ROLE)
+                            .map(|role| role == ROLE_WINDOW)
+                            .unwrap_or(false)
+                    });
+                    if !has_window_child {
+                        children.extend(Self::get_application_windows(&current_ax));
                     }
                 }
+
+                stack[index].element = Some(element);
+                stack[index].self_matches = self_matches;
+                stack[index].children = children;
+                continue;
             }
 
-            for child in children {
-                if let Some(child_element) =
-                    self.build_element(&child, filter, depth + 1, element_count)
-                {
-                    element.children.push(child_element);
-                }
+            if stack[index].next_child < stack[index].children.len() {
+                let child = stack[index].children[stack[index].next_child].clone();
+                let child_depth = stack[index].depth + 1;
+                stack[index].next_child += 1;
+                stack.push(BuildFrame::new(child, child_depth));
+                continue;
+            }
+
+            let mut frame = stack.pop().expect("stack is not empty");
+            let Some(mut element) = frame.element.take() else {
+                continue;
+            };
+            element.children = frame.retained_children;
+
+            let keep = frame.self_matches || !element.children.is_empty() || frame.depth == root_depth;
+            if !keep {
+                continue;
+            }
+
+            let id = element.id;
+            self.handles.insert(id, frame.ax_element);
+
+            #[allow(deprecated)]
+            self.cache.store_with_id(id, element.clone());
+            *element_count += 1;
+
+            if let Some(parent) = stack.last_mut() {
+                parent.retained_children.push(element);
+            } else {
+                root = Some(element);
             }
         }
 
-        // Include this element if it matches the filter itself, has any kept
-        // descendants (so we don't drop containers), or is the root (so get_tree
-        // always has something to return).
-        if !self_matches && element.children.is_empty() && depth != 0 {
-            return None;
-        }
-
-        // Store handle for actions.
-        self.handles.insert(id, ax_element.clone());
-
-        // Store in cache
-        #[allow(deprecated)]
-        self.cache.store_with_id(id, element.clone());
-        *element_count += 1;
-
-        Some(element)
+        root
     }
 
     /// Get the focused application's PID using NSWorkspace (most reliable method).

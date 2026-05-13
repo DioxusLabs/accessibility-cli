@@ -248,12 +248,18 @@ impl Element {
         F: Fn(&Element) -> bool,
     {
         let mut results = Vec::new();
-        if predicate(self) {
-            results.push(self);
+        let mut stack = vec![self];
+
+        while let Some(element) = stack.pop() {
+            if predicate(element) {
+                results.push(element);
+            }
+
+            for child in element.children.iter().rev() {
+                stack.push(child);
+            }
         }
-        for child in &self.children {
-            results.extend(child.find_all(predicate));
-        }
+
         results
     }
 }
