@@ -199,9 +199,102 @@ impl MacOSAccessibility {
         })
     }
 
+    fn empty_replacement() -> Self {
+        Self {
+            cache: ElementCache::new(),
+            handles: HashMap::new(),
+            last_tree_pid: None,
+            system_wide: AxElement::system_wide(),
+        }
+    }
+
+    async fn run_with_blocking_state<T, F>(&mut self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Self) -> Result<T> + Send + 'static,
+    {
+        let mut reader = std::mem::replace(self, Self::empty_replacement());
+
+        let (reader, result) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle
+                .spawn_blocking(move || {
+                    let result = f(&mut reader);
+                    (reader, result)
+                })
+                .await
+                .map_err(|error| anyhow!("macOS accessibility blocking task failed: {error}"))?
+        } else {
+            let result = f(&mut reader);
+            (reader, result)
+        };
+
+        *self = reader;
+        result
+    }
+
+    async fn run_blocking_task<T, F>(f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle
+                .spawn_blocking(f)
+                .await
+                .map_err(|error| anyhow!("macOS accessibility blocking task failed: {error}"))?
+        } else {
+            f()
+        }
+    }
+
     /// Check if the process has accessibility permissions.
     pub fn is_process_trusted() -> bool {
         accessibility_macos_sys::is_process_trusted()
+    }
+
+    /// Snapshot the accessibility tree synchronously for a target application.
+    ///
+    /// The async trait method delegates here; the sys wrapper bounds individual
+    /// remote AX messages with AXUIElementSetMessagingTimeout so a bad target
+    /// cannot wedge the caller indefinitely.
+    fn get_tree_blocking_for_pid(
+        &mut self,
+        pid: Option<u32>,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        self.clear_cache();
+
+        let version = self.cache.version();
+
+        let (app_element, actual_pid) = if let Some(pid) = pid {
+            (AxElement::application(pid), pid)
+        } else {
+            let focused_pid = Self::get_frontmost_app_pid()
+                .or_else(|| self.get_focused_app_pid_ax())
+                .ok_or_else(|| anyhow!("No focused application found"))?;
+            (AxElement::application(focused_pid), focused_pid)
+        };
+        self.last_tree_pid = Some(actual_pid);
+        let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
+        if !Self::wait_for_accessibility_materialization(actual_pid, &app_element)
+            && Self::enable_full_accessibility_for_app(&app_element)
+        {
+            std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
+        }
+        Self::prime_accessibility_roots(&app_element);
+
+        let mut element_count = 0;
+        let root = self
+            .build_element(&app_element, filter, 0, &mut element_count)
+            .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?;
+
+        Ok(ElementTree {
+            version,
+            pid: Some(actual_pid),
+            app_name,
+            root,
+            element_count,
+        })
     }
 
     /// Return the main display's bounds in global screen coordinates.
@@ -1081,45 +1174,13 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         filter: &TreeFilter,
     ) -> impl std::future::Future<Output = Result<ElementTree>> {
-        // Clear previous cache
-        self.clear_cache();
-
-        let version = self.cache.version();
-
-        let result: Result<ElementTree> = (|| {
-            let (app_element, actual_pid) = if let Some(pid) = pid {
-                (AxElement::application(pid), pid)
-            } else {
-                let focused_pid = Self::get_frontmost_app_pid()
-                    .or_else(|| self.get_focused_app_pid_ax())
-                    .ok_or_else(|| anyhow!("No focused application found"))?;
-                (AxElement::application(focused_pid), focused_pid)
-            };
-            self.last_tree_pid = Some(actual_pid);
-            let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
-            if !Self::wait_for_accessibility_materialization(actual_pid, &app_element)
-                && Self::enable_full_accessibility_for_app(&app_element)
-            {
-                std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
-            }
-            Self::prime_accessibility_roots(&app_element);
-
-            // Build the tree
-            let mut element_count = 0;
-            let root = self
-                .build_element(&app_element, filter, 0, &mut element_count)
-                .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?;
-
-            Ok(ElementTree {
-                version,
-                pid: Some(actual_pid),
-                app_name,
-                root,
-                element_count,
+        let filter = filter.clone();
+        async move {
+            self.run_with_blocking_state(move |reader| {
+                reader.get_tree_blocking_for_pid(pid, &filter)
             })
-        })();
-
-        std::future::ready(result)
+            .await
+        }
     }
 
     fn get_element(&self, id: ElementKey) -> Option<&Element> {
@@ -1131,62 +1192,63 @@ impl AccessibilityReader for MacOSAccessibility {
         id: ElementKey,
         action: Action,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result: Result<()> = (|| {
-            let handle = self
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        async move {
+            self.run_with_blocking_state(move |reader| {
+                let handle = reader
+                    .handles
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
 
-            // Focus/Blur aren't AX actions on macOS — they're attribute writes.
-            if matches!(action, Action::Focus | Action::Blur) {
-                let want_focus = matches!(action, Action::Focus);
-                let result = handle.set_bool_attribute_result(AX_FOCUSED, want_focus);
-                if !result.is_success() {
-                    // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
-                    // "this element won't accept the focus write" — usually because the
-                    // platform routes blur through a different mechanism (e.g. AppKit
-                    // collapses focus when another window becomes key).
-                    let verb = if want_focus { "focus" } else { "blur" };
-                    bail!(
-                        "this element does not support programmatic {} on macOS ({:?})",
-                        verb,
-                        result
+                // Focus/Blur aren't AX actions on macOS — they're attribute writes.
+                if matches!(action, Action::Focus | Action::Blur) {
+                    let want_focus = matches!(action, Action::Focus);
+                    let result = handle.set_bool_attribute_result(AX_FOCUSED, want_focus);
+                    if !result.is_success() {
+                        // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
+                        // "this element won't accept the focus write" — usually because the
+                        // platform routes blur through a different mechanism (e.g. AppKit
+                        // collapses focus when another window becomes key).
+                        let verb = if want_focus { "focus" } else { "blur" };
+                        bail!(
+                            "this element does not support programmatic {} on macOS ({:?})",
+                            verb,
+                            result
+                        );
+                    }
+                    return Ok(());
+                }
+
+                // AXPress on a menu goes through AppKit's menu-tracking path and
+                // promotes the owning app to key. Deliver a synthetic mouse click
+                // via the SkyLight per-PID path instead, which keeps focus put.
+                if matches!(action, Action::Click)
+                    && let Some(element) = reader.cache.get(id)
+                    && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
+                    && let Some(bounds) = element.bounds
+                    && let Some(pid) = Self::get_pid_for_element(handle)
+                {
+                    let x = bounds.origin.x + bounds.size.width / 2.0;
+                    let y = bounds.origin.y + bounds.size.height / 2.0;
+                    return Self::post_mouse_click_sequence(
+                        Some(pid),
+                        x,
+                        y,
+                        crate::input::MouseButton::Left,
+                        1,
                     );
                 }
-                return Ok(());
-            }
 
-            // AXPress on a menu goes through AppKit's menu-tracking path and
-            // promotes the owning app to key. Deliver a synthetic mouse click
-            // via the SkyLight per-PID path instead, which keeps focus put.
-            if matches!(action, Action::Click)
-                && let Some(element) = self.cache.get(id)
-                && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
-                && let Some(bounds) = element.bounds
-                && let Some(pid) = Self::get_pid_for_element(handle)
-            {
-                let x = bounds.origin.x + bounds.size.width / 2.0;
-                let y = bounds.origin.y + bounds.size.height / 2.0;
-                return Self::post_mouse_click_sequence(
-                    Some(pid),
-                    x,
-                    y,
-                    crate::input::MouseButton::Left,
-                    1,
-                );
-            }
+                let action_name = Self::map_action(action)
+                    .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
 
-            let action_name = Self::map_action(action)
-                .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
+                if let Err(result) = handle.perform_action(action_name) {
+                    bail!("Failed to perform action {}: {:?}", action_name, result);
+                }
 
-            if let Err(result) = handle.perform_action(action_name) {
-                bail!("Failed to perform action {}: {:?}", action_name, result);
-            }
-
-            Ok(())
-        })();
-
-        std::future::ready(result)
+                Ok(())
+            })
+            .await
+        }
     }
 
     fn set_value(
@@ -1194,20 +1256,22 @@ impl AccessibilityReader for MacOSAccessibility {
         id: ElementKey,
         value: &str,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result: Result<()> = (|| {
-            let handle = self
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let value = value.to_string();
+        async move {
+            self.run_with_blocking_state(move |reader| {
+                let handle = reader
+                    .handles
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
 
-            if let Err(result) = handle.set_string_attribute(AX_VALUE, value) {
-                bail!("Failed to set value: {:?}", result);
-            }
+                if let Err(result) = handle.set_string_attribute(AX_VALUE, &value) {
+                    bail!("Failed to set value: {:?}", result);
+                }
 
-            Ok(())
-        })();
-
-        std::future::ready(result)
+                Ok(())
+            })
+            .await
+        }
     }
 
     fn hit_test(
@@ -1215,15 +1279,19 @@ impl AccessibilityReader for MacOSAccessibility {
         x: f64,
         y: f64,
     ) -> impl std::future::Future<Output = Result<Option<ElementKey>>> {
-        let result = if let Some(ax_element) = self.system_wide.element_at_position(x, y) {
-            let mut count = self.cache.len();
-            let element = self.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
-            Ok(element.map(|e| e.id))
-        } else {
-            Ok(None)
-        };
-
-        std::future::ready(result)
+        async move {
+            self.run_with_blocking_state(move |reader| {
+                if let Some(ax_element) = reader.system_wide.element_at_position(x, y) {
+                    let mut count = reader.cache.len();
+                    let element =
+                        reader.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
+                    Ok(element.map(|e| e.id))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await
+        }
     }
 
     fn clear_cache(&mut self) {
@@ -1242,8 +1310,7 @@ impl AccessibilityReader for MacOSAccessibility {
         key: Code,
         modifiers: Modifiers,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_keystroke(pid, key, modifiers);
-        std::future::ready(result)
+        async move { Self::post_keystroke(pid, key, modifiers) }
     }
 
     fn type_raw(
@@ -1251,22 +1318,24 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         text: &str,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
-            for ch in text.chars() {
-                let (code, needs_shift) = code_from_char(ch)
-                    .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
-                let modifiers = if needs_shift {
-                    Modifiers::SHIFT
-                } else {
-                    Modifiers::empty()
-                };
-                Self::post_keystroke(pid, code, modifiers)?;
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(())
-        })();
-
-        std::future::ready(result)
+        let text = text.to_string();
+        async move {
+            Self::run_blocking_task(move || {
+                for ch in text.chars() {
+                    let (code, needs_shift) = code_from_char(ch)
+                        .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
+                    let modifiers = if needs_shift {
+                        Modifiers::SHIFT
+                    } else {
+                        Modifiers::empty()
+                    };
+                    Self::post_keystroke(pid, code, modifiers)?;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            })
+            .await
+        }
     }
 
     fn mouse_click_at(
@@ -1276,9 +1345,7 @@ impl AccessibilityReader for MacOSAccessibility {
         y: f64,
         button: crate::input::MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_mouse_click_sequence(pid, x, y, button, 1);
-
-        std::future::ready(result)
+        async move { Self::post_mouse_click_sequence(pid, x, y, button, 1) }
     }
 
     fn press_key(
@@ -1286,9 +1353,7 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         key: Code,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_key_event(pid, key, Modifiers::empty(), true);
-
-        std::future::ready(result)
+        async move { Self::post_key_event(pid, key, Modifiers::empty(), true) }
     }
 
     fn release_key(
@@ -1296,9 +1361,7 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         key: Code,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_key_event(pid, key, Modifiers::empty(), false);
-
-        std::future::ready(result)
+        async move { Self::post_key_event(pid, key, Modifiers::empty(), false) }
     }
 
     fn mouse_move(
@@ -1307,17 +1370,17 @@ impl AccessibilityReader for MacOSAccessibility {
         x: f64,
         y: f64,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_mouse_event(
-            pid,
-            x,
-            y,
-            MacMouseEventKind::Move,
-            crate::input::MouseButton::Left,
-            0,
-            0.0,
-        );
-
-        std::future::ready(result)
+        async move {
+            Self::post_mouse_event(
+                pid,
+                x,
+                y,
+                MacMouseEventKind::Move,
+                crate::input::MouseButton::Left,
+                0,
+                0.0,
+            )
+        }
     }
 
     fn mouse_click(
@@ -1325,12 +1388,13 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         button: crate::input::MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
-            let point = Self::current_mouse_location()?;
-            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
-        })();
-
-        std::future::ready(result)
+        async move {
+            Self::run_blocking_task(move || {
+                let point = Self::current_mouse_location()?;
+                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
+            })
+            .await
+        }
     }
 
     fn mouse_double_click(
@@ -1338,14 +1402,15 @@ impl AccessibilityReader for MacOSAccessibility {
         pid: Option<u32>,
         button: crate::input::MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
-            let point = Self::current_mouse_location()?;
-            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
-            std::thread::sleep(Duration::from_millis(40));
-            Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
-        })();
-
-        std::future::ready(result)
+        async move {
+            Self::run_blocking_task(move || {
+                let point = Self::current_mouse_location()?;
+                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
+                std::thread::sleep(Duration::from_millis(40));
+                Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
+            })
+            .await
+        }
     }
 
     fn mouse_scroll(
@@ -1354,9 +1419,7 @@ impl AccessibilityReader for MacOSAccessibility {
         delta_x: f64,
         delta_y: f64,
     ) -> impl std::future::Future<Output = Result<()>> {
-        let result = accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y);
-
-        std::future::ready(result)
+        async move { accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y) }
     }
 
     fn supports_keystroke(&self) -> bool {
@@ -1396,11 +1459,14 @@ impl AccessibilityReader for MacOSAccessibility {
         &self,
         pid: Option<u32>,
     ) -> impl std::future::Future<Output = Result<Rect>> {
-        let bounds = pid
-            .and_then(Self::get_window_bounds_for_pid)
-            .unwrap_or_else(Self::main_display_bounds);
-
-        std::future::ready(Ok(bounds))
+        async move {
+            Self::run_blocking_task(move || {
+                Ok(pid
+                    .and_then(Self::get_window_bounds_for_pid)
+                    .unwrap_or_else(Self::main_display_bounds))
+            })
+            .await
+        }
     }
 
     fn start_listening(
@@ -1412,7 +1478,6 @@ impl AccessibilityReader for MacOSAccessibility {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let task_stop_flag = stop_flag.clone();
 
-        let runtime_handle = tokio::runtime::Handle::current();
         let task_handle = tokio::task::spawn_blocking(move || {
             let mut callback = callback;
             let mut reader = match MacOSAccessibility::new() {
@@ -1473,7 +1538,7 @@ impl AccessibilityReader for MacOSAccessibility {
                     Self::prime_accessibility_roots(&app);
                 }
 
-                match runtime_handle.block_on(reader.get_tree(pid, &TreeFilter::default())) {
+                match reader.get_tree_blocking_for_pid(pid, &TreeFilter::default()) {
                     Ok(tree) => {
                         let (values, focused) = MacOSAccessibility::listener_snapshots(&tree);
                         if let Some(ax_observer) = observer.as_ref() {

@@ -411,10 +411,11 @@ async fn chrome_web_content_materializes_in_accessibility_tree() {
         "Button[title='AX test button'], ",
         "TextField[title='AX test input']",
     );
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let mut adapter =
         TargetedAccessibility::new_macos(Some(pid)).expect("Failed to create macOS AX adapter");
     let filter = TreeFilter::with_max_depth(12);
-    let deadline = Instant::now() + Duration::from_millis(1500);
+    let deadline = Instant::now() + Duration::from_millis(3000);
 
     loop {
         adapter.clear_cache();

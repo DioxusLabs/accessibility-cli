@@ -11,10 +11,19 @@ use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const DEFAULT_MESSAGING_TIMEOUT_SECONDS: f32 = 1.0;
+
 #[derive(Clone)]
 pub struct AxElement {
     inner: CFRetained<AXUIElement>,
 }
+
+// AXUIElementRef is an opaque Core Foundation handle to a remote accessibility
+// object. The underlying objc2 binding is conservatively !Send, but the AX
+// calls we expose are synchronous process-bound IPC and do not rely on AppKit
+// thread affinity. We move handles between the async caller and a blocking AX
+// worker thread, never share mutable wrapper state concurrently.
+unsafe impl Send for AxElement {}
 
 #[derive(Clone)]
 pub struct AxObserver {
@@ -55,16 +64,22 @@ fn default_run_loop_mode() -> Option<&'static CFRunLoopMode> {
 }
 
 impl AxElement {
+    fn new(inner: CFRetained<AXUIElement>) -> Self {
+        let element = Self { inner };
+        let _ = element.set_messaging_timeout(DEFAULT_MESSAGING_TIMEOUT_SECONDS);
+        element
+    }
+
     pub fn system_wide() -> Self {
-        Self {
-            inner: unsafe { AXUIElement::new_system_wide() },
-        }
+        Self::new(unsafe { AXUIElement::new_system_wide() })
     }
 
     pub fn application(pid: u32) -> Self {
-        Self {
-            inner: unsafe { AXUIElement::new_application(pid as libc::pid_t) },
-        }
+        Self::new(unsafe { AXUIElement::new_application(pid as libc::pid_t) })
+    }
+
+    pub fn set_messaging_timeout(&self, seconds: f32) -> std::result::Result<(), AxErrorCode> {
+        ax_result(unsafe { self.inner.set_messaging_timeout(seconds.max(0.0)) })
     }
 
     pub fn identity(&self) -> usize {
@@ -173,13 +188,13 @@ impl AxElement {
                     unsafe { CFRetained::cast_unchecked(array) };
                 for i in 0..array.len() {
                     if let Some(element) = array.get(i) {
-                        elements.push(Self { inner: element });
+                        elements.push(Self::new(element));
                     }
                 }
             }
             Err(value) => {
                 if let Ok(element) = value.downcast::<AXUIElement>() {
-                    elements.push(Self { inner: element });
+                    elements.push(Self::new(element));
                 }
             }
         }
@@ -301,9 +316,7 @@ impl AxElement {
             None
         } else {
             let ptr = NonNull::new(element as *mut AXUIElement).unwrap();
-            Some(Self {
-                inner: unsafe { CFRetained::from_raw(ptr) },
-            })
+            Some(Self::new(unsafe { CFRetained::from_raw(ptr) }))
         }
     }
 
@@ -361,7 +374,7 @@ impl AxElement {
             let array: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::from_raw(array) };
             for i in 0..array.len() {
                 if let Some(element) = array.get(i) {
-                    values.push(Self { inner: element });
+                    values.push(Self::new(element));
                 }
             }
 

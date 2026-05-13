@@ -251,6 +251,12 @@ fn system_wide_attribute_reads_are_repeatable() {
 }
 
 #[test]
+fn messaging_timeout_can_be_set() {
+    let element = AxElement::system_wide();
+    assert_ax_result(element.set_messaging_timeout(0.25));
+}
+
+#[test]
 fn unsupported_attributes_fail_closed() {
     let element = AxElement::system_wide();
     assert!(
