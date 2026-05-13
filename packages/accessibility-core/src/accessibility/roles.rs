@@ -17,6 +17,8 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "tab" => Some(Role::Tab),
         "tablist" => Some(Role::TabList),
         "menuitem" => Some(Role::MenuItem),
+        "menuitemcheckbox" | "menucheck" => Some(Role::MenuItemCheckBox),
+        "menuitemradio" | "menuradio" => Some(Role::MenuItemRadio),
         "menubar" => Some(Role::MenuBar),
         "menu" => Some(Role::Menu),
         "window" => Some(Role::Window),
@@ -24,12 +26,12 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "image" | "img" => Some(Role::Image),
         "group" => Some(Role::Group),
         "list" => Some(Role::List),
-        "listitem" => Some(Role::ListItem),
+        "listitem" | "item" => Some(Role::ListItem),
         "toolbar" => Some(Role::Toolbar),
         "table" => Some(Role::Table),
         "row" => Some(Role::Row),
         "cell" => Some(Role::Cell),
-        "heading" => Some(Role::Heading),
+        "heading" | "header" => Some(Role::Heading),
         "application" | "app" => Some(Role::Application),
         "scrollbar" => Some(Role::ScrollBar),
         "label" => Some(Role::Label),
@@ -37,8 +39,20 @@ pub fn parse_role_name(name: &str) -> Option<Role> {
         "text" | "statictext" => Some(Role::TextRun),
         "scrollview" => Some(Role::ScrollView),
         "genericcontainer" | "container" | "div" => Some(Role::GenericContainer),
-        "progressbar" | "progress" => Some(Role::ProgressIndicator),
+        "progressbar" | "progress" | "progressindicator" => Some(Role::ProgressIndicator),
         "spinbutton" | "spinner" => Some(Role::SpinButton),
+        "navigation" | "nav" => Some(Role::Navigation),
+        "region" => Some(Role::Region),
+        "banner" => Some(Role::Banner),
+        "complementary" | "aside" => Some(Role::Complementary),
+        "contentinfo" | "footer" => Some(Role::ContentInfo),
+        "main" => Some(Role::Main),
+        "search" => Some(Role::Search),
+        "form" => Some(Role::Form),
+        "section" => Some(Role::Section),
+        "document" => Some(Role::Document),
+        "webview" => Some(Role::WebView),
+        "article" => Some(Role::Article),
         "*" => None, // Universal selector
         _ => None,
     }
@@ -128,6 +142,15 @@ mod tests {
         assert_eq!(parse_role_name("TextInput"), Some(Role::TextInput));
         assert_eq!(parse_role_name("input"), Some(Role::TextInput));
         assert_eq!(parse_role_name("TextRun"), Some(Role::TextRun));
+        assert_eq!(parse_role_name("MenuCheck"), Some(Role::MenuItemCheckBox));
+        assert_eq!(parse_role_name("MenuRadio"), Some(Role::MenuItemRadio));
+        assert_eq!(parse_role_name("Item"), Some(Role::ListItem));
+        assert_eq!(parse_role_name("Nav"), Some(Role::Navigation));
+        assert_eq!(parse_role_name("Header"), Some(Role::Heading));
+        assert_eq!(parse_role_name("Document"), Some(Role::Document));
+        assert_eq!(parse_role_name("WebView"), Some(Role::WebView));
+        assert_eq!(parse_role_name("Aside"), Some(Role::Complementary));
+        assert_eq!(parse_role_name("Footer"), Some(Role::ContentInfo));
         assert_eq!(parse_role_name("*"), None);
         assert_eq!(parse_role_name("unknown"), None);
     }

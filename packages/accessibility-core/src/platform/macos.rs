@@ -16,7 +16,8 @@ use accessibility_macos_sys::{
     AX_SEARCH_KEY_HEADING, AX_SEARCH_KEY_LINK, AX_SEARCH_KEY_LIST, AX_SEARCH_KEY_RADIO_GROUP,
     AX_SEARCH_KEY_STATIC_TEXT, AX_SEARCH_KEY_TABLE, AX_SEARCH_KEY_TEXT_FIELD, AxElement,
     AxObserver, AxSearchPredicate, ModifierFlags as MacModifierFlags,
-    MouseButton as MacMouseButton, MouseEventKind as MacMouseEventKind, RunLoop, WindowId,
+    MouseButton as MacMouseButton, MouseEventKind as MacMouseEventKind, RunLoop, RunLoopSource,
+    WindowId,
 };
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
@@ -44,7 +45,6 @@ const AX_MAIN_WINDOW: &str = "AXMainWindow";
 const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
 const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
 const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(500);
-const AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY: Duration = Duration::from_millis(25);
 const AX_FULL_ACCESSIBILITY_PRIME_DEPTH: usize = 8;
 const AX_VISIBLE_CHILDREN: &str = "AXVisibleChildren";
 const AX_CHILDREN_IN_NAVIGATION_ORDER: &str = "AXChildrenInNavigationOrder";
@@ -163,22 +163,18 @@ const ROLE_ROW: &str = "AXRow";
 const ROLE_COLUMN: &str = "AXColumn";
 const ROLE_CELL: &str = "AXCell";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TraversalPurpose {
-    BuildTree,
-    MaterializationCheck,
-    PrimeAccessibility,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ChildDiscovery {
-    purpose: TraversalPurpose,
+    include_search_descendants: bool,
 }
 
 impl ChildDiscovery {
-    fn new(purpose: TraversalPurpose) -> Self {
-        Self { purpose }
-    }
+    const STRUCTURAL_ONLY: Self = Self {
+        include_search_descendants: false,
+    };
+    const ENRICHED: Self = Self {
+        include_search_descendants: true,
+    };
 
     fn discover(self, element: &AxElement) -> Vec<AxElement> {
         let mut children = self.structural_children(element);
@@ -209,7 +205,7 @@ impl ChildDiscovery {
     }
 
     fn should_include_search_descendants(self, element: &AxElement) -> bool {
-        if self.purpose == TraversalPurpose::PrimeAccessibility {
+        if !self.include_search_descendants {
             return false;
         }
 
@@ -239,6 +235,46 @@ impl ChildDiscovery {
                 self.collect_structural_signatures(&child, seen, depth + 1);
             }
         }
+    }
+}
+
+struct MaterializationObserver {
+    _observer: AxObserver,
+    run_loop: RunLoop,
+    source: RunLoopSource,
+    notified: Box<AtomicBool>,
+}
+
+impl MaterializationObserver {
+    fn start(pid: u32, app: &AxElement) -> Option<Self> {
+        let observer = AxObserver::new(pid).ok()?;
+        let run_loop = RunLoop::current()?;
+        let notified = Box::new(AtomicBool::new(false));
+
+        observer.add_notifications(app, AX_MATERIALIZATION_NOTIFICATIONS, &notified);
+        for window in MacOSAccessibility::get_application_windows(app) {
+            observer.add_notifications(&window, AX_MATERIALIZATION_NOTIFICATIONS, &notified);
+        }
+
+        let source = observer.run_loop_source();
+        run_loop.add_default_source(&source);
+
+        Some(Self {
+            _observer: observer,
+            run_loop,
+            source,
+            notified,
+        })
+    }
+
+    fn take_notified(&self) -> bool {
+        self.notified.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl Drop for MaterializationObserver {
+    fn drop(&mut self) {
+        self.run_loop.remove_default_source(&self.source);
     }
 }
 
@@ -360,10 +396,6 @@ impl MacOSAccessibility {
         pid: Option<u32>,
         filter: &TreeFilter,
     ) -> Result<ElementTree> {
-        self.clear_cache();
-
-        let version = self.cache.version();
-
         let (app_element, actual_pid) = if let Some(pid) = pid {
             (AxElement::application(pid), pid)
         } else {
@@ -372,27 +404,9 @@ impl MacOSAccessibility {
                 .ok_or_else(|| anyhow!("No focused application found"))?;
             (AxElement::application(focused_pid), focused_pid)
         };
-        self.last_tree_pid = Some(actual_pid);
         let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
-        if !Self::wait_for_accessibility_materialization(actual_pid, &app_element)
-            && Self::enable_full_accessibility_for_app(&app_element)
-        {
-            std::thread::sleep(AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY);
-        }
-        Self::prime_accessibility_roots(&app_element);
 
-        let mut element_count = 0;
-        let root = self
-            .build_element(&app_element, filter, 0, &mut element_count)
-            .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?;
-
-        Ok(ElementTree {
-            version,
-            pid: Some(actual_pid),
-            app_name,
-            root,
-            element_count,
-        })
+        self.prepare_and_build_tree(actual_pid, &app_element, app_name, filter)
     }
 
     /// Return the main display's bounds in global screen coordinates.
@@ -625,6 +639,13 @@ impl MacOSAccessibility {
         }
 
         let point = Point::new(x, y);
+        // Hover the target before clicking. Chromium's pointer-event pipeline
+        // tracks hit-test state across moves; React's synthetic onClick won't
+        // fire on a button if the renderer never observed a MouseMoved landing
+        // on it. The chromium primer wakes the renderer but lands at (-1, -1),
+        // so without this move the pointer state stays off-screen.
+        Self::post_mouse_event(pid, point, MacMouseEventKind::Move, button, 0, 0.0)?;
+        std::thread::sleep(Duration::from_millis(10));
         Self::post_mouse_event(
             pid,
             point,
@@ -739,7 +760,7 @@ impl MacOSAccessibility {
             return requested;
         }
 
-        for child in Self::discover_children(element, TraversalPurpose::PrimeAccessibility) {
+        for child in Self::discover_children(element, ChildDiscovery::STRUCTURAL_ONLY) {
             requested |=
                 Self::enable_full_accessibility_for_subtree(&child, remaining_depth - 1, seen);
         }
@@ -749,10 +770,10 @@ impl MacOSAccessibility {
 
     fn prime_accessibility_roots(app: &AxElement) {
         let _ = app.attribute_string(AX_FOCUSED_UI_ELEMENT);
-        let _ = Self::discover_children(app, TraversalPurpose::PrimeAccessibility);
+        let _ = Self::discover_children(app, ChildDiscovery::STRUCTURAL_ONLY);
 
         for window in Self::get_application_windows(app) {
-            let _ = Self::discover_children(&window, TraversalPurpose::PrimeAccessibility);
+            let _ = Self::discover_children(&window, ChildDiscovery::STRUCTURAL_ONLY);
             let _ = window.attribute_string(AX_FOCUSED_UI_ELEMENT);
         }
     }
@@ -765,165 +786,113 @@ impl MacOSAccessibility {
         observer.add_notifications(element, AX_MATERIALIZATION_NOTIFICATIONS, notified);
     }
 
-    fn wait_for_accessibility_materialization(pid: u32, app: &AxElement) -> bool {
-        let Ok(observer) = AxObserver::new(pid) else {
-            return false;
-        };
-        let notified = AtomicBool::new(false);
-        Self::observe_materialization_notifications(&observer, app, &notified);
-        for window in Self::get_application_windows(app) {
-            Self::observe_materialization_notifications(&observer, &window, &notified);
-        }
-
-        let Some(run_loop) = RunLoop::current() else {
-            return false;
-        };
-        let source = observer.run_loop_source();
-        run_loop.add_default_source(&source);
-
-        let requested = Self::enable_full_accessibility_for_app(app);
-        Self::prime_accessibility_roots(app);
-        let has_enhanced_attribute = Self::has_attribute_name(app, AX_ENHANCED_USER_INTERFACE)
+    fn has_full_accessibility_request(app: &AxElement) -> bool {
+        Self::has_attribute_name(app, AX_ENHANCED_USER_INTERFACE)
             || Self::get_application_windows(app)
                 .iter()
-                .any(|window| Self::has_attribute_name(window, AX_ENHANCED_USER_INTERFACE));
-        if !requested && !has_enhanced_attribute {
-            run_loop.remove_default_source(&source);
-            return false;
+                .any(|window| Self::has_attribute_name(window, AX_ENHANCED_USER_INTERFACE))
+    }
+
+    fn prepare_and_build_tree(
+        &mut self,
+        pid: u32,
+        app: &AxElement,
+        app_name: Option<String>,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        let observer = MaterializationObserver::start(pid, app);
+        let requested = Self::enable_full_accessibility_for_app(app);
+        Self::prime_accessibility_roots(app);
+
+        if !requested && !Self::has_full_accessibility_request(app) {
+            return self.build_tree_snapshot(pid, app, app_name, filter);
         }
 
         let deadline = std::time::Instant::now() + AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT;
-        while std::time::Instant::now() < deadline {
-            if Self::has_materialized_web_content(app) {
-                run_loop.remove_default_source(&source);
-                return true;
+
+        loop {
+            let tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+            if Self::tree_has_webview_content(&tree) || std::time::Instant::now() >= deadline {
+                return Ok(tree);
             }
+
             accessibility_macos_sys::run_default_loop_slice(0.05, true);
-            if notified.swap(false, Ordering::SeqCst) {
+            if observer.as_ref().is_some_and(|observer| observer.take_notified()) {
                 Self::prime_accessibility_roots(app);
             }
         }
-
-        run_loop.remove_default_source(&source);
-        Self::has_materialized_web_content(app)
     }
 
-    fn has_materialized_web_content(element: &AxElement) -> bool {
-        fn has_accessible_text(element: &AxElement) -> bool {
-            [AX_TITLE, AX_DESCRIPTION, AX_VALUE]
-                .iter()
-                .any(|attribute| {
-                    MacOSAccessibility::get_string_attribute(element, attribute)
-                        .is_some_and(|value| !value.trim().is_empty())
-                })
+    fn build_tree_snapshot(
+        &mut self,
+        pid: u32,
+        app: &AxElement,
+        app_name: Option<String>,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        self.clear_cache();
+        self.last_tree_pid = Some(pid);
+        let version = self.cache.version();
+        let mut element_count = 0;
+        let root = self
+            .build_element(app, filter, 0, &mut element_count)
+            .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?;
+
+        Ok(ElementTree {
+            version,
+            pid: Some(pid),
+            app_name,
+            root,
+            element_count,
+        })
+    }
+
+    fn tree_has_webview_content(tree: &ElementTree) -> bool {
+        fn has_accessible_text(element: &Element) -> bool {
+            [
+                element.title.as_ref(),
+                element.description.as_ref(),
+                element.value.as_ref(),
+            ]
+            .iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
         }
 
-        fn is_web_content_role(role: Option<&str>) -> bool {
-            matches!(
-                role,
-                Some(ROLE_STATIC_TEXT)
-                    | Some(ROLE_LINK)
-                    | Some(ROLE_BUTTON)
-                    | Some(ROLE_TEXT_FIELD)
-                    | Some(ROLE_TEXT_AREA)
-                    | Some(ROLE_CHECKBOX)
-                    | Some(ROLE_RADIO_BUTTON)
-                    | Some(ROLE_COMBO_BOX)
-                    | Some(ROLE_IMAGE)
-                    | Some(ROLE_GROUP)
-                    | Some(ROLE_ROW)
-                    | Some(ROLE_CELL)
-            )
-        }
-
-        fn walk_for_materialized_web_area(
-            element: &AxElement,
-            depth: usize,
-            seen: &mut std::collections::HashSet<usize>,
-        ) -> bool {
+        fn has_meaningful_descendant(element: &Element, depth: usize) -> bool {
             if depth > 24 {
                 return false;
             }
-            let identity = element.identity();
-            if !seen.insert(identity) {
+
+            if has_accessible_text(element) {
+                return true;
+            }
+
+            element
+                .children
+                .iter()
+                .any(|child| has_meaningful_descendant(child, depth + 1))
+        }
+
+        fn walk_for_webview_content(element: &Element, depth: usize) -> bool {
+            if depth > 24 {
                 return false;
             }
 
-            let role = MacOSAccessibility::get_string_attribute(element, AX_ROLE);
-            let children = MacOSAccessibility::discover_children(
-                element,
-                TraversalPurpose::MaterializationCheck,
-            );
-            if role.as_deref() == Some(ROLE_WEB_AREA) && !children.is_empty() {
-                return children
+            if element.role == Role::WebView && !element.children.is_empty() {
+                return element
+                    .children
                     .iter()
-                    .any(|child| walk_for_page_content(child, depth + 1, f64::NEG_INFINITY, seen));
+                    .any(|child| has_meaningful_descendant(child, depth + 1));
             }
 
-            children
+            element
+                .children
                 .iter()
-                .any(|child| walk_for_materialized_web_area(child, depth + 1, seen))
+                .any(|child| walk_for_webview_content(child, depth + 1))
         }
 
-        fn walk_for_page_content(
-            element: &AxElement,
-            depth: usize,
-            content_top: f64,
-            seen: &mut std::collections::HashSet<usize>,
-        ) -> bool {
-            if depth > 24 {
-                return false;
-            }
-            let identity = element.identity();
-            if !seen.insert(identity) {
-                return false;
-            }
-
-            let role = MacOSAccessibility::get_string_attribute(element, AX_ROLE);
-            if is_web_content_role(role.as_deref())
-                && has_accessible_text(element)
-                && MacOSAccessibility::get_bounds(element)
-                    .is_none_or(|bounds| bounds.origin.y >= content_top)
-            {
-                return true;
-            }
-
-            MacOSAccessibility::discover_children(element, TraversalPurpose::MaterializationCheck)
-                .iter()
-                .any(|child| walk_for_page_content(child, depth + 1, content_top, seen))
-        }
-
-        // Keep the explicit WebArea path for WebKit/Chromium builds that expose
-        // it, but require real descendants. Chromium/Electron can expose a
-        // placeholder WebArea with empty groups before page AX has materialized.
-        let mut seen = std::collections::HashSet::new();
-        if walk_for_materialized_web_area(element, 0, &mut seen) {
-            return true;
-        }
-
-        let mut windows = Self::get_application_windows(element);
-        for child in Self::discover_children(element, TraversalPurpose::MaterializationCheck) {
-            if Self::get_string_attribute(&child, AX_ROLE).as_deref() == Some(ROLE_WINDOW) {
-                windows.push(child);
-            }
-        }
-
-        for window in windows {
-            let content_top = Self::get_bounds(&window)
-                .map(|bounds| bounds.origin.y + 100.0)
-                .unwrap_or(120.0);
-            let mut seen = std::collections::HashSet::new();
-            if walk_for_page_content(&window, 0, content_top, &mut seen) {
-                return true;
-            }
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        if walk_for_page_content(element, 0, 100.0, &mut seen) {
-            return true;
-        }
-
-        false
+        walk_for_webview_content(&tree.root, 0)
     }
 
     fn element_signature(element: &AxElement) -> String {
@@ -990,13 +959,13 @@ impl MacOSAccessibility {
     }
 
     /// Discover children for the requested traversal purpose.
-    fn discover_children(element: &AxElement, purpose: TraversalPurpose) -> Vec<AxElement> {
-        ChildDiscovery::new(purpose).discover(element)
+    fn discover_children(element: &AxElement, discovery: ChildDiscovery) -> Vec<AxElement> {
+        discovery.discover(element)
     }
 
     /// Get tree-building children for an element.
     fn get_children(element: &AxElement) -> Vec<AxElement> {
-        Self::discover_children(element, TraversalPurpose::BuildTree)
+        Self::discover_children(element, ChildDiscovery::ENRICHED)
     }
 
     /// Get the windows of an application element.
@@ -1348,14 +1317,28 @@ impl AccessibilityReader for MacOSAccessibility {
                 return Ok(());
             }
 
-            // AXPress on a menu goes through AppKit's menu-tracking path and
-            // promotes the owning app to key. Deliver a synthetic mouse click
-            // via the SkyLight per-PID path instead, which keeps focus put.
+            // Route certain clicks through a synthetic mouse event via SkyLight
+            // instead of AXPress, when the element has bounds and a target pid:
+            //
+            // 1. Menu/MenuItem/MenuBar — AXPress on these goes through AppKit's
+            //    menu-tracking path which promotes the owning app to key.
+            //    Synthetic clicks keep focus put.
+            // 2. Chromium-based apps (Electron: Discord/Slack/VS Code; Chrome
+            //    itself; Edge/Brave/etc.) — Chromium's AX-to-DOM bridge
+            //    silently drops AXPress for many web elements. The AX call
+            //    returns success but the renderer never dispatches a DOM
+            //    click. Synthetic mouse events hit Chromium's input pipeline
+            //    directly and the web element's onClick fires.
+            //
+            // AXPress remains the path for native AppKit controls (Calculator,
+            // Finder, etc.) where it's bulletproof and unaffected by window
+            // occlusion — and for elements without bounds.
             if matches!(action, Action::Click)
                 && let Some(element) = reader.cache.get(id)
-                && matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
                 && let Some(bounds) = element.bounds
                 && let Some(pid) = Self::get_pid_for_element(handle)
+                && (matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
+                    || accessibility_macos_sys::is_chromium_based_app(pid))
             {
                 let x = bounds.origin.x + bounds.size.width / 2.0;
                 let y = bounds.origin.y + bounds.size.height / 2.0;

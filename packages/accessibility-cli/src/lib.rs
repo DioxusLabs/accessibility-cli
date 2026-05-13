@@ -31,9 +31,8 @@ use accessibility_core::accessibility::{
     TargetedAccessibility, TreeFilter,
 };
 use accessibility_core::api::{
-    JsonPrinter, LlmPrinter, LlmQueryPrinter, Printer, TreePrinter, annotate_elements,
-    decode_screenshot, draw_grid_overlay, format_role_short, print_element_summary,
-    print_formatted, print_statistics, truncate,
+    OutputFormat, OutputPrinter, annotate_elements, decode_screenshot, draw_grid_overlay,
+    format_role_short, print_elements_formatted, print_formatted, print_statistics, truncate,
 };
 use clap::{Args, Parser, ValueEnum};
 use std::sync::{
@@ -533,14 +532,7 @@ async fn handle_common_operations(
                         query
                     ));
                 }
-                println!(
-                    "Found {} match{}:",
-                    elements.len(),
-                    if elements.len() == 1 { "" } else { "es" }
-                );
-                for elem in elements {
-                    print_element_summary(elem);
-                }
+                print_elements_formatted(&elements, args.output_format());
                 return OperationResult::Success;
             }
             Err(e) => {
@@ -549,18 +541,9 @@ async fn handle_common_operations(
         }
     }
 
-    // Create the appropriate printer based on args
-    let printer: Box<dyn Printer> = if args.json {
-        Box::new(JsonPrinter)
-    } else if args.llm_query {
-        Box::new(LlmQueryPrinter::new(args.structure))
-    } else if args.llm {
-        Box::new(LlmPrinter::new(args.structure))
-    } else {
-        Box::new(TreePrinter)
-    };
-
-    let is_tree_mode = !args.json && !args.llm && !args.llm_query;
+    let output_format = args.output_format();
+    let printer = OutputPrinter::new(output_format, args.structure);
+    let is_tree_mode = output_format == OutputFormat::Tree;
 
     // For Tree mode, print additional context
     if is_tree_mode {
@@ -573,7 +556,7 @@ async fn handle_common_operations(
     }
 
     // Print the tree using the selected printer
-    print_formatted(tree, printer.as_ref());
+    print_formatted(tree, &printer);
 
     // For Tree mode, print additional statistics and interactive elements
     if is_tree_mode {
@@ -979,7 +962,7 @@ async fn handle_event_listening(
 async fn handle_list_windows(adapter: &TargetedAccessibility, args: &CommonArgs) {
     let windows = adapter.list_windows().await;
 
-    if args.json {
+    if args.output_format() == OutputFormat::Json {
         let rows = windows
             .iter()
             .map(|(pid, app_name, window_title, focused)| {
@@ -1253,6 +1236,29 @@ pub enum PlatformType {
     Android,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormatArg {
+    /// Human-readable tree output.
+    Tree,
+    /// JSON output.
+    Json,
+    /// Compact LLM-friendly output.
+    Llm,
+    /// Queryable LLM-friendly selector output.
+    LlmQuery,
+}
+
+impl From<OutputFormatArg> for OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Tree => OutputFormat::Tree,
+            OutputFormatArg::Json => OutputFormat::Json,
+            OutputFormatArg::Llm => OutputFormat::Llm,
+            OutputFormatArg::LlmQuery => OutputFormat::LlmQuery,
+        }
+    }
+}
+
 impl Default for PlatformType {
     fn default() -> Self {
         #[cfg(target_os = "macos")]
@@ -1376,16 +1382,20 @@ pub struct CommonArgs {
     #[arg(long)]
     list_windows: bool,
 
+    /// Output format for tree and query output
+    #[arg(long, value_enum, conflicts_with_all = ["json", "llm", "llm_query"])]
+    format: Option<OutputFormatArg>,
+
     /// Output as JSON
-    #[arg(long)]
+    #[arg(long, conflicts_with = "format")]
     json: bool,
 
-    /// Compact LLM-friendly output (concise format)
-    #[arg(long)]
+    /// Compact LLM-friendly output (concise format, alias for --format llm)
+    #[arg(long, conflicts_with = "format")]
     llm: bool,
 
-    /// Verbose LLM output with CSS-like selectors (detailed format)
-    #[arg(long)]
+    /// Verbose LLM output with CSS-like selectors (alias for --format llm-query)
+    #[arg(long, conflicts_with = "format")]
     llm_query: bool,
 
     /// Structure-only output (with --llm or --llm-query)
@@ -1479,6 +1489,24 @@ pub struct CommonArgs {
     /// Poll interval in milliseconds when using --timeout (default: 100)
     #[arg(long, default_value = "100", value_name = "MS")]
     poll_interval: u64,
+}
+
+impl CommonArgs {
+    fn output_format(&self) -> OutputFormat {
+        if let Some(format) = self.format {
+            return format.into();
+        }
+
+        if self.json {
+            OutputFormat::Json
+        } else if self.llm_query {
+            OutputFormat::LlmQuery
+        } else if self.llm {
+            OutputFormat::Llm
+        } else {
+            OutputFormat::Tree
+        }
+    }
 }
 
 /// Parameters for a swipe gesture.

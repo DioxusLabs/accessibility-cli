@@ -10,6 +10,50 @@ pub trait Printer {
     fn print(&self, tree: &ElementTree);
 }
 
+/// Output format for accessibility trees and element lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// Human-readable tree output.
+    #[default]
+    Tree,
+    /// JSON output.
+    Json,
+    /// Compact LLM-friendly output.
+    Llm,
+    /// Queryable LLM-friendly selector output.
+    LlmQuery,
+}
+
+/// Printer that renders a tree using a selected output format.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutputPrinter {
+    /// Output format to render.
+    pub format: OutputFormat,
+    /// Only print structure for LLM formats.
+    pub structure_only: bool,
+}
+
+impl OutputPrinter {
+    /// Create a new output printer.
+    pub fn new(format: OutputFormat, structure_only: bool) -> Self {
+        Self {
+            format,
+            structure_only,
+        }
+    }
+}
+
+impl Printer for OutputPrinter {
+    fn print(&self, tree: &ElementTree) {
+        match self.format {
+            OutputFormat::Tree => TreePrinter.print(tree),
+            OutputFormat::Json => JsonPrinter.print(tree),
+            OutputFormat::Llm => LlmPrinter::new(self.structure_only).print(tree),
+            OutputFormat::LlmQuery => LlmQueryPrinter::new(self.structure_only).print(tree),
+        }
+    }
+}
+
 /// Human-readable tree printer with CSS selectors.
 #[derive(Default)]
 pub struct TreePrinter;
@@ -137,6 +181,57 @@ pub fn format_role_short(role: Role) -> &'static str {
     }
 }
 
+fn format_role_query_name(role: Role) -> &'static str {
+    match role {
+        Role::Application => "Application",
+        Role::Window => "Window",
+        Role::Dialog => "Dialog",
+        Role::Button => "Button",
+        Role::Link => "Link",
+        Role::TextInput => "TextInput",
+        Role::MultilineTextInput => "MultilineTextInput",
+        Role::CheckBox => "CheckBox",
+        Role::RadioButton => "RadioButton",
+        Role::ComboBox => "ComboBox",
+        Role::Slider => "Slider",
+        Role::Tab => "Tab",
+        Role::TabList => "TabList",
+        Role::MenuItem => "MenuItem",
+        Role::MenuBar => "MenuBar",
+        Role::Menu => "Menu",
+        Role::MenuItemCheckBox => "MenuItemCheckBox",
+        Role::MenuItemRadio => "MenuItemRadio",
+        Role::Switch => "Switch",
+        Role::SpinButton => "SpinButton",
+        Role::ProgressIndicator => "ProgressIndicator",
+        Role::Image => "Image",
+        Role::TextRun => "TextRun",
+        Role::Label => "Label",
+        Role::Group => "Group",
+        Role::List => "List",
+        Role::ListItem => "ListItem",
+        Role::Cell => "Cell",
+        Role::Row => "Row",
+        Role::Table => "Table",
+        Role::ScrollView => "ScrollView",
+        Role::Toolbar => "Toolbar",
+        Role::Article => "Article",
+        Role::Navigation => "Navigation",
+        Role::Region => "Region",
+        Role::Banner => "Banner",
+        Role::Complementary => "Complementary",
+        Role::ContentInfo => "ContentInfo",
+        Role::Main => "Main",
+        Role::Search => "Search",
+        Role::Form => "Form",
+        Role::Section => "Section",
+        Role::Document => "Document",
+        Role::WebView => "WebView",
+        Role::Heading => "Heading",
+        _ => "*",
+    }
+}
+
 /// Truncate a string with ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -149,18 +244,9 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Escape special characters.
-pub fn escape_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn format_attr_selector(name: &str, value: &str, max: usize) -> String {
-    let truncated = truncate(value, max);
+fn format_attr_selector(name: &str, value: &str) -> String {
     let mut serialized = String::new();
-    cssparser::serialize_string(&truncated, &mut serialized)
+    cssparser::serialize_string(value, &mut serialized)
         .expect("serializing a CSS string into String should not fail");
     format!("[{}={}]", name, serialized)
 }
@@ -201,29 +287,79 @@ pub fn print_element_summary(elem: &Element) {
     );
 }
 
+/// Print an element list using the selected output format.
+pub fn print_elements_formatted(elements: &[&Element], format: OutputFormat) {
+    match format {
+        OutputFormat::Tree => {
+            println!(
+                "Found {} match{}:",
+                elements.len(),
+                if elements.len() == 1 { "" } else { "es" }
+            );
+            for elem in elements {
+                print_element_summary(elem);
+            }
+        }
+        OutputFormat::Json => match serde_json::to_string_pretty(elements) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Failed to serialize elements: {}", e),
+        },
+        OutputFormat::Llm => {
+            for elem in elements {
+                println!("{}", format_element_concise_line(elem));
+            }
+        }
+        OutputFormat::LlmQuery => {
+            for elem in elements {
+                println!("{}", format_element_selector(elem));
+            }
+        }
+    }
+}
+
 /// Format an element as a CSS selector string.
 pub fn format_element_selector(elem: &Element) -> String {
-    let role_str = format_role_short(elem.role);
+    let role_str = format_role_query_name(elem.role);
     let mut attrs: Vec<String> = Vec::new();
 
+    attrs.push(format_attr_selector("data-id", &elem.id.to_string()));
+    attrs.push(format_attr_selector("role", &format!("{:?}", elem.role)));
+
     if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format_attr_selector("title", title, 50));
+        attrs.push(format_attr_selector("title", title));
     }
 
     if let Some(desc) = elem.description.as_ref().filter(|s| !s.is_empty())
         && elem.title.as_deref() != Some(desc.as_str())
     {
-        attrs.push(format_attr_selector("description", desc, 50));
+        attrs.push(format_attr_selector("description", desc));
     }
 
     if let Some(value) = elem.value.as_ref().filter(|s| !s.is_empty())
         && elem.title.as_deref() != Some(value.as_str())
     {
-        attrs.push(format_attr_selector("value", value, 40));
+        attrs.push(format_attr_selector("value", value));
     }
 
     if let Some(url) = elem.url.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format_attr_selector("url", url, 50));
+        attrs.push(format_attr_selector("url", url));
+    }
+
+    if let Some(help) = elem.help.as_ref().filter(|s| !s.is_empty()) {
+        attrs.push(format_attr_selector("help", help));
+    }
+
+    if let Some(identifier) = elem.identifier.as_ref().filter(|s| !s.is_empty()) {
+        attrs.push(format_attr_selector("identifier", identifier));
+    }
+
+    if let Some(role_description) = elem.role_description.as_ref().filter(|s| !s.is_empty()) {
+        attrs.push(format_attr_selector("role-description", role_description));
+    }
+
+    let actions = format_actions_query_value(&elem.actions);
+    if !actions.is_empty() {
+        attrs.push(format_attr_selector("actions", &actions));
     }
 
     format!("{}{}", role_str, attrs.join(""))
@@ -312,6 +448,10 @@ fn print_llm_concise(
 }
 
 fn print_element_concise(elem: &Element) {
+    println!("{}", format_element_concise_line(elem));
+}
+
+fn format_element_concise_line(elem: &Element) -> String {
     let role_str = format_role_short(elem.role);
 
     // Get the primary label (prefer title, then description, then value)
@@ -337,38 +477,37 @@ fn print_element_concise(elem: &Element) {
 
     // Single line: [id] Role "label" (x,y)
     if label.is_empty() {
-        println!("[{}] {} {}", elem.id, role_str, pos);
+        format!("[{}] {} {}", elem.id, role_str, pos)
     } else {
-        println!(
+        format!(
             "[{}] {} \"{}\" {}",
             elem.id,
             role_str,
             truncate(label, 40),
             pos
-        );
+        )
     }
 }
 
 /// Print verbose LLM format with CSS-like selectors.
 fn print_llm_query_format(
     root: &Element,
-    app_name: Option<&str>,
-    pid: Option<u32>,
+    _app_name: Option<&str>,
+    _pid: Option<u32>,
     structure_only: bool,
 ) {
-    println!(
-        "# App: {} (pid: {})",
-        app_name.unwrap_or("Unknown"),
-        pid.map(|p| p.to_string())
-            .unwrap_or_else(|| "?".to_string())
-    );
-    println!();
+    for line in format_llm_query_lines(root, structure_only) {
+        println!("{}", line);
+    }
+}
 
+fn format_llm_query_lines(root: &Element, structure_only: bool) -> Vec<String> {
+    let mut lines = vec![format_element_selector(root), String::new()];
     if structure_only {
         for child in &root.children {
-            print_structure_node(child, 0);
+            collect_structure_node_lines(child, 0, &mut lines);
         }
-        return;
+        return lines;
     }
 
     let mut windows: Vec<&Element> = Vec::new();
@@ -386,55 +525,49 @@ fn print_llm_query_format(
     }
 
     for window in &windows {
-        print_window_llm(window);
-        println!();
+        collect_window_llm_lines(window, &mut lines);
+        lines.push(String::new());
     }
 
     if let Some(mb) = menubar {
-        print_menubar_llm(mb);
-        println!();
+        collect_menubar_llm_lines(mb, &mut lines);
+        lines.push(String::new());
     }
 
     if !other_interactive.is_empty() {
-        println!("## Other Elements");
         for elem in other_interactive {
-            print_element_llm(elem, 0);
+            lines.push(format_element_llm_line(elem, 0));
         }
     }
+
+    lines
 }
 
 fn print_structure_node(element: &Element, indent: usize) {
+    let mut lines = Vec::new();
+    collect_structure_node_lines(element, indent, &mut lines);
+    for line in lines {
+        println!("{}", line);
+    }
+}
+
+fn collect_structure_node_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
     let prefix = "  ".repeat(indent);
-    let total = count_all_descendants(element);
-    let interactive = count_interactive_descendants(element);
-
-    let label = element
-        .title
-        .as_ref()
-        .filter(|s| !s.is_empty())
-        .or(element.description.as_ref().filter(|s| !s.is_empty()))
-        .map(|s| format!(" \"{}\"", truncate(s, 30)))
-        .unwrap_or_default();
-
-    let role_str = format_role_short(element.role);
     let is_structural = is_structural_node(element);
 
     if is_structural || indent == 0 {
-        println!(
-            "{}[{}] {}{} ({} elements, {} interactive)",
-            prefix, element.id, role_str, label, total, interactive
-        );
+        lines.push(format!("{}{}", prefix, format_element_selector(element)));
 
         if !element.children.is_empty() {
             for child in &element.children {
                 if is_structural_node(child) || has_structural_descendants(child) {
-                    print_structure_node(child, indent + 1);
+                    collect_structure_node_lines(child, indent + 1, lines);
                 }
             }
         }
     } else if has_structural_descendants(element) {
         for child in &element.children {
-            print_structure_node(child, indent);
+            collect_structure_node_lines(child, indent, lines);
         }
     }
 }
@@ -478,14 +611,6 @@ fn has_structural_descendants(element: &Element) -> bool {
     false
 }
 
-fn count_all_descendants(element: &Element) -> usize {
-    let mut count = 1;
-    for child in &element.children {
-        count += count_all_descendants(child);
-    }
-    count
-}
-
 fn count_interactive_descendants(element: &Element) -> usize {
     let mut count = 0;
     if is_llm_relevant(element) {
@@ -497,41 +622,28 @@ fn count_interactive_descendants(element: &Element) -> usize {
     count
 }
 
-fn print_window_llm(window: &Element) {
-    let title = window.title.as_deref().unwrap_or("Untitled");
-    let bounds_str = window
-        .bounds
-        .map(|b| format!(" {}x{}", b.size.width as i32, b.size.height as i32))
-        .unwrap_or_default();
-
+fn collect_window_llm_lines(window: &Element, lines: &mut Vec<String>) {
     let mut all_interactive: Vec<&Element> = Vec::new();
     for child in &window.children {
         collect_interactive(child, &mut all_interactive);
     }
 
-    println!(
-        "## [Window] \"{}\"{}  ({} elements)",
-        truncate(title, 50),
-        bounds_str,
-        all_interactive.len()
-    );
+    lines.push(format_element_selector(window));
 
-    if all_interactive.is_empty() {
-        println!("  (no interactive elements)");
-    } else {
+    if !all_interactive.is_empty() {
         for child in &window.children {
-            print_element_hierarchical(child, 1);
+            collect_element_hierarchical_lines(child, 1, lines);
         }
     }
 }
 
-fn print_element_hierarchical(element: &Element, indent: usize) {
+fn collect_element_hierarchical_lines(element: &Element, indent: usize, lines: &mut Vec<String>) {
     let capped_indent = indent.min(8);
     let is_container = is_meaningful_container(element);
     let interactive_children = count_interactive_descendants(element);
 
     if is_container && interactive_children > 0 {
-        print_container_header(element, capped_indent);
+        push_container_header_line(element, capped_indent, lines);
 
         let child_indent = if has_printable_label(element) {
             capped_indent + 1
@@ -540,13 +652,13 @@ fn print_element_hierarchical(element: &Element, indent: usize) {
         };
 
         for child in &element.children {
-            print_element_hierarchical(child, child_indent);
+            collect_element_hierarchical_lines(child, child_indent, lines);
         }
     } else if is_llm_relevant(element) {
-        print_element_llm(element, capped_indent);
+        lines.push(format_element_llm_line(element, capped_indent));
     } else {
         for child in &element.children {
-            print_element_hierarchical(child, capped_indent);
+            collect_element_hierarchical_lines(child, capped_indent, lines);
         }
     }
 }
@@ -556,46 +668,10 @@ fn has_printable_label(elem: &Element) -> bool {
         || elem.description.as_ref().is_some_and(|d| !d.is_empty())
 }
 
-fn print_container_header(elem: &Element, indent: usize) {
+fn push_container_header_line(elem: &Element, indent: usize, lines: &mut Vec<String>) {
     let prefix = "  ".repeat(indent);
 
-    let role_str = match elem.role {
-        Role::Group => "Group",
-        Role::List => "List",
-        Role::ListItem => "Item",
-        Role::Toolbar => "Toolbar",
-        Role::TabList => "Tabs",
-        Role::Menu => "Menu",
-        Role::Dialog => "Dialog",
-        Role::Form => "Form",
-        Role::Article => "Article",
-        Role::Region => "Region",
-        Role::Navigation => "Nav",
-        Role::Banner => "Banner",
-        Role::Complementary => "Aside",
-        Role::ContentInfo => "Footer",
-        Role::Main => "Main",
-        Role::Search => "Search",
-        _ => "Section",
-    };
-
-    // Collect non-empty attributes as CSS selector syntax
-    let mut attrs: Vec<String> = Vec::new();
-
-    if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format!("[title=\"{}\"]", truncate(title, 40)));
-    }
-
-    if let Some(desc) = elem.description.as_ref().filter(|s| !s.is_empty())
-        && elem.title.as_deref() != Some(desc.as_str())
-    {
-        attrs.push(format!("[description=\"{}\"]", truncate(desc, 40)));
-    }
-
-    if !attrs.is_empty() {
-        let selector = format!("{}{}", role_str, attrs.join(""));
-        println!("{}[{}]", prefix, selector);
-    }
+    lines.push(format!("{}{}", prefix, format_element_selector(elem)));
 }
 
 fn is_meaningful_container(elem: &Element) -> bool {
@@ -632,36 +708,19 @@ fn is_meaningful_container(elem: &Element) -> bool {
     has_label || interactive_count >= 2
 }
 
-fn print_menubar_llm(menubar: &Element) {
-    println!("## [MenuBar]");
+fn collect_menubar_llm_lines(menubar: &Element, lines: &mut Vec<String>) {
+    lines.push(format_element_selector(menubar));
     for item in &menubar.children {
         if item.role == Role::MenuItem {
-            print_element_llm(item, 1);
+            lines.push(format_element_llm_line(item, 1));
         }
     }
-}
-
-fn print_element_llm(elem: &Element, indent: usize) {
-    println!("{}", format_element_llm_line(elem, indent));
 }
 
 fn format_element_llm_line(elem: &Element, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
     let selector = format_element_selector(elem);
-
-    // Position
-    let pos_str = elem
-        .bounds
-        .map(|b| format!(" ({},{})", b.origin.x as i32, b.origin.y as i32))
-        .unwrap_or_default();
-
-    // Actions
-    let actions = format_actions_short(&elem.actions);
-
-    format!(
-        "{}[{}] {}{} {}",
-        prefix, elem.id, selector, pos_str, actions
-    )
+    format!("{}{}", prefix, selector)
 }
 
 fn collect_interactive<'a>(element: &'a Element, result: &mut Vec<&'a Element>) {
@@ -725,12 +784,8 @@ fn is_llm_relevant(elem: &Element) -> bool {
     false
 }
 
-fn format_actions_short(actions: &[String]) -> String {
-    if actions.is_empty() {
-        return String::new();
-    }
-
-    let short: Vec<&str> = actions
+fn format_actions_query_value(actions: &[String]) -> String {
+    actions
         .iter()
         .filter_map(|a| match a.as_str() {
             "AXPress" => Some("click"),
@@ -743,11 +798,196 @@ fn format_actions_short(actions: &[String]) -> String {
             "AXRaise" => Some("raise"),
             _ => None,
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    if short.is_empty() {
-        String::new()
-    } else {
-        format!("-> {}", short.join(", "))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accessibility::{ElementKey, find_matches, parse_query};
+
+    fn make_output_round_trip_tree() -> ElementTree {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        root.title = Some("Test App".to_string());
+
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+        window.title = Some("Main Window".to_string());
+
+        let mut group = Element::new(ElementKey::from_ffi(3), Role::Group);
+        group.title = Some("Primary Controls".to_string());
+
+        let mut list = Element::new(ElementKey::from_ffi(4), Role::List);
+        list.title = Some("Actions".to_string());
+
+        let mut button = Element::new(ElementKey::from_ffi(5), Role::Button);
+        button.title = Some("Run".to_string());
+        button.actions = vec!["AXPress".to_string()];
+
+        let mut text = Element::new(ElementKey::from_ffi(6), Role::TextRun);
+        text.value = Some("Status: ready".to_string());
+
+        list.children.push(button);
+        group.children.push(list);
+        group.children.push(text);
+        window.children.push(group);
+
+        let mut menubar = Element::new(ElementKey::from_ffi(7), Role::MenuBar);
+        let mut apple = Element::new(ElementKey::from_ffi(8), Role::MenuItem);
+        apple.title = Some("Apple".to_string());
+        apple.actions = vec!["AXPress".to_string(), "AXPick".to_string()];
+        let mut edit = Element::new(ElementKey::from_ffi(9), Role::MenuItem);
+        edit.title = Some("Edit".to_string());
+        edit.actions = vec!["AXPress".to_string()];
+        menubar.children.push(apple);
+        menubar.children.push(edit);
+
+        let mut link = Element::new(ElementKey::from_ffi(10), Role::Link);
+        link.title = Some("Docs".to_string());
+        link.url = Some("https://example.test/docs?q=\"roundtrip\"".to_string());
+
+        root.children.push(window);
+        root.children.push(menubar);
+        root.children.push(link);
+
+        ElementTree {
+            version: 1,
+            pid: Some(123),
+            app_name: Some("Test App".to_string()),
+            root,
+            element_count: 10,
+        }
+    }
+
+    fn assert_llm_query_output_round_trips(tree: &ElementTree, structure_only: bool) {
+        for raw_line in format_llm_query_lines(&tree.root, structure_only) {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let parsed = parse_query(line).unwrap_or_else(|err| panic!("{line}: {err}"));
+            let matches = find_matches(&parsed, tree);
+            assert_eq!(matches.len(), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn llm_menu_item_line_uses_query_selector_syntax() {
+        let mut item = Element::new(ElementKey::from_ffi(4_294_967_299), Role::MenuItem);
+        item.title = Some("Apple".to_string());
+        item.actions = vec![
+            "AXCancel".to_string(),
+            "AXPress".to_string(),
+            "AXPick".to_string(),
+        ];
+
+        assert_eq!(
+            format_element_llm_line(&item, 1),
+            "  MenuItem[data-id=\"4294967299\"][role=\"MenuItem\"][title=\"Apple\"][actions=\"cancel click pick\"]"
+        );
+    }
+
+    #[test]
+    fn formatted_selector_round_trips_full_escaped_attributes() {
+        let mut button = Element::new(ElementKey::from_ffi(42), Role::Button);
+        button.title =
+            Some("Say \"hi\"\\again with enough text to prove it is not truncated".to_string());
+        button.description = Some("A \"quoted\" description".to_string());
+        button.help = Some("Help text".to_string());
+        button.identifier = Some("primary-button".to_string());
+        button.role_description = Some("button".to_string());
+        button.actions = vec!["AXPress".to_string()];
+
+        let selector = format_element_selector(&button);
+        let parsed = parse_query(&selector).unwrap();
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root: button,
+            element_count: 1,
+        };
+
+        let matches = find_matches(&parsed, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(42));
+    }
+
+    #[test]
+    fn formatted_selectors_round_trip_for_roles_emitted_by_llm_query() {
+        let roles = [
+            Role::Application,
+            Role::Window,
+            Role::Dialog,
+            Role::Button,
+            Role::Link,
+            Role::TextInput,
+            Role::MultilineTextInput,
+            Role::CheckBox,
+            Role::RadioButton,
+            Role::ComboBox,
+            Role::Slider,
+            Role::Tab,
+            Role::TabList,
+            Role::MenuItem,
+            Role::MenuBar,
+            Role::Menu,
+            Role::MenuItemCheckBox,
+            Role::MenuItemRadio,
+            Role::Switch,
+            Role::SpinButton,
+            Role::ProgressIndicator,
+            Role::Image,
+            Role::TextRun,
+            Role::Label,
+            Role::Group,
+            Role::List,
+            Role::ListItem,
+            Role::Cell,
+            Role::Row,
+            Role::Table,
+            Role::ScrollView,
+            Role::Toolbar,
+            Role::Article,
+            Role::Navigation,
+            Role::Region,
+            Role::Banner,
+            Role::Complementary,
+            Role::ContentInfo,
+            Role::Main,
+            Role::Search,
+            Role::Form,
+            Role::Section,
+            Role::Document,
+            Role::WebView,
+            Role::Heading,
+            Role::Unknown,
+        ];
+
+        for (index, role) in roles.into_iter().enumerate() {
+            let id = ElementKey::from_ffi(index as u64 + 1);
+            let element = Element::new(id, role);
+            let selector = format_element_selector(&element);
+            let parsed = parse_query(&selector).unwrap_or_else(|err| panic!("{selector}: {err}"));
+            let tree = ElementTree {
+                version: 1,
+                pid: None,
+                app_name: None,
+                root: element,
+                element_count: 1,
+            };
+
+            let matches = find_matches(&parsed, &tree);
+            assert_eq!(matches.len(), 1, "{selector}");
+            assert_eq!(matches[0].id, id, "{selector}");
+        }
+    }
+
+    #[test]
+    fn every_llm_query_output_line_round_trips() {
+        let tree = make_output_round_trip_tree();
+        assert_llm_query_output_round_trips(&tree, false);
+        assert_llm_query_output_round_trips(&tree, true);
     }
 }

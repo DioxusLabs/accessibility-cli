@@ -29,6 +29,14 @@ fn operational_flags_parse_before_backend_startup() {
 
     let cases: &[&[&str]] = &[
         &["--platform", "android", "--json", "--timeout", "0"],
+        &[
+            "--platform",
+            "android",
+            "--format",
+            "llm-query",
+            "--timeout",
+            "0",
+        ],
         &["--platform", "android", "--llm", "--timeout", "0"],
         &[
             "--platform",

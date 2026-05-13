@@ -75,9 +75,9 @@ pub use config::{AppConfig, LocatorOptions, Platform};
 pub use error::{Error, Result};
 pub use locator::Locator;
 pub use output::{
-    JsonPrinter, LlmPrinter, LlmQueryPrinter, Printer, TreePrinter, format_element_selector,
-    format_role_short, print_element_summary, print_formatted, print_statistics, print_tree,
-    truncate,
+    JsonPrinter, LlmPrinter, LlmQueryPrinter, OutputFormat, OutputPrinter, Printer, TreePrinter,
+    format_element_selector, format_role_short, print_element_summary, print_elements_formatted,
+    print_formatted, print_statistics, print_tree, truncate,
 };
 pub use screenshot::{
     AnnotatedScreenshot, annotate_elements, decode_screenshot, draw_grid_overlay, draw_rect_border,

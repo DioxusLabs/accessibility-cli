@@ -184,7 +184,7 @@ impl SelectorImpl for AccessibilitySelectors {
 /// Reference to an element with tree context for selector matching.
 pub struct ElementRef<'a> {
     element: &'a Element,
-    parent: Option<&'a Element>,
+    ancestors: Vec<&'a Element>,
     index_in_parent: usize,
     siblings: &'a [Element],
 }
@@ -194,7 +194,7 @@ impl<'a> ElementRef<'a> {
     pub fn root(element: &'a Element) -> Self {
         Self {
             element,
-            parent: None,
+            ancestors: Vec::new(),
             index_in_parent: 0,
             siblings: std::slice::from_ref(element),
         }
@@ -217,11 +217,14 @@ impl<'a> fmt::Debug for ElementRef<'a> {
 
 impl<'a> Clone for ElementRef<'a> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            element: self.element,
+            ancestors: self.ancestors.clone(),
+            index_in_parent: self.index_in_parent,
+            siblings: self.siblings,
+        }
     }
 }
-
-impl<'a> Copy for ElementRef<'a> {}
 
 impl<'a> PartialEq for ElementRef<'a> {
     fn eq(&self, other: &Self) -> bool {
@@ -239,7 +242,27 @@ impl<'a> SelectorElement for ElementRef<'a> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        self.parent.map(ElementRef::root)
+        let parent = *self.ancestors.last()?;
+        let mut ancestors = self.ancestors.clone();
+        ancestors.pop();
+
+        let (index_in_parent, siblings) = if let Some(grandparent) = ancestors.last() {
+            let index = grandparent
+                .children
+                .iter()
+                .position(|child| child.id == parent.id)
+                .unwrap_or(0);
+            (index, grandparent.children.as_slice())
+        } else {
+            (0, std::slice::from_ref(parent))
+        };
+
+        Some(Self {
+            element: parent,
+            ancestors,
+            index_in_parent,
+            siblings,
+        })
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
@@ -261,7 +284,7 @@ impl<'a> SelectorElement for ElementRef<'a> {
         let prev_index = self.index_in_parent - 1;
         self.siblings.get(prev_index).map(|sibling| ElementRef {
             element: sibling,
-            parent: self.parent,
+            ancestors: self.ancestors.clone(),
             index_in_parent: prev_index,
             siblings: self.siblings,
         })
@@ -271,16 +294,19 @@ impl<'a> SelectorElement for ElementRef<'a> {
         let next_index = self.index_in_parent + 1;
         self.siblings.get(next_index).map(|sibling| ElementRef {
             element: sibling,
-            parent: self.parent,
+            ancestors: self.ancestors.clone(),
             index_in_parent: next_index,
             siblings: self.siblings,
         })
     }
 
     fn first_element_child(&self) -> Option<Self> {
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push(self.element);
+
         self.element.children.first().map(|child| ElementRef {
             element: child,
-            parent: Some(self.element),
+            ancestors,
             index_in_parent: 0,
             siblings: &self.element.children,
         })
@@ -381,7 +407,7 @@ impl<'a> SelectorElement for ElementRef<'a> {
     }
 
     fn is_root(&self) -> bool {
-        self.parent.is_none()
+        self.ancestors.is_empty()
     }
 
     fn apply_selector_flags(&self, _flags: ElementSelectorFlags) {
@@ -404,24 +430,30 @@ fn apply_string_operator(actual: &str, expected: &str, operator: &AttrSelectorOp
     }
 }
 
+fn format_actions_query_value(actions: &[String]) -> String {
+    actions
+        .iter()
+        .filter_map(|action| match action.as_str() {
+            "AXPress" => Some("click"),
+            "AXConfirm" => Some("confirm"),
+            "AXCancel" => Some("cancel"),
+            "AXIncrement" => Some("inc"),
+            "AXDecrement" => Some("dec"),
+            "AXShowMenu" => Some("menu"),
+            "AXPick" => Some("pick"),
+            "AXRaise" => Some("raise"),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl<'a> ElementRef<'a> {
-    fn match_attribute(
+    fn match_string_attr(
         &self,
-        attr_name: &str,
+        attr_value: Option<&str>,
         operation: &AttrSelectorOperation<&AttrString>,
     ) -> bool {
-        let attr_value = match attr_name.to_lowercase().as_str() {
-            "title" => self.element.title.as_deref(),
-            "description" | "desc" => self.element.description.as_deref(),
-            "value" | "val" => self.element.value.as_deref(),
-            "url" | "href" => self.element.url.as_deref(),
-            "data-id" | "id" => return self.match_id_attr(operation),
-            "role" => return self.match_role_attr(operation),
-            "enabled" => return self.match_bool_attr(self.element.enabled, operation),
-            "focused" => return self.match_bool_attr(self.element.focused, operation),
-            _ => None,
-        };
-
         match operation {
             AttrSelectorOperation::Exists => {
                 attr_value.is_some() && !attr_value.unwrap_or("").is_empty()
@@ -447,6 +479,50 @@ impl<'a> ElementRef<'a> {
         }
     }
 
+    fn match_attribute(
+        &self,
+        attr_name: &str,
+        operation: &AttrSelectorOperation<&AttrString>,
+    ) -> bool {
+        let attr_value = match attr_name.to_lowercase().as_str() {
+            "title" => self.element.title.as_deref(),
+            "description" | "desc" => self.element.description.as_deref(),
+            "value" | "val" => self.element.value.as_deref(),
+            "url" | "href" => self.element.url.as_deref(),
+            "help" => self.element.help.as_deref(),
+            "identifier" => self.element.identifier.as_deref(),
+            "role-description" | "roledescription" => self.element.role_description.as_deref(),
+            "action" | "actions" => return self.match_actions_attr(operation),
+            "data-id" | "id" => return self.match_id_attr(operation),
+            "role" => return self.match_role_attr(operation),
+            "enabled" => return self.match_bool_attr(self.element.enabled, operation),
+            "focused" => return self.match_bool_attr(self.element.focused, operation),
+            _ => None,
+        };
+
+        self.match_string_attr(attr_value, operation)
+    }
+
+    fn match_actions_attr(&self, operation: &AttrSelectorOperation<&AttrString>) -> bool {
+        let actions = format_actions_query_value(&self.element.actions);
+        if actions.is_empty() {
+            return false;
+        }
+
+        match operation {
+            AttrSelectorOperation::Exists => true,
+            AttrSelectorOperation::WithValue {
+                operator: AttrSelectorOperator::Equal,
+                value,
+                ..
+            } => {
+                let expected = value.0.as_str();
+                actions == expected || actions.split_whitespace().any(|action| action == expected)
+            }
+            _ => self.match_string_attr(Some(actions.as_str()), operation),
+        }
+    }
+
     fn match_id_attr(&self, operation: &AttrSelectorOperation<&AttrString>) -> bool {
         match operation {
             AttrSelectorOperation::Exists => true,
@@ -466,7 +542,7 @@ impl<'a> ElementRef<'a> {
     }
 
     fn match_role_attr(&self, operation: &AttrSelectorOperation<&AttrString>) -> bool {
-        let role_name = format!("{:?}", self.element.role).to_lowercase();
+        let role_name = format!("{:?}", self.element.role);
         match operation {
             AttrSelectorOperation::Exists => true,
             AttrSelectorOperation::WithValue {
@@ -474,11 +550,13 @@ impl<'a> ElementRef<'a> {
                 case_sensitivity,
                 value,
             } => {
-                let expected = match case_sensitivity {
-                    CaseSensitivity::CaseSensitive => value.0.clone(),
-                    CaseSensitivity::AsciiCaseInsensitive => value.0.to_lowercase(),
+                let (actual, expected) = match case_sensitivity {
+                    CaseSensitivity::CaseSensitive => (role_name, value.0.clone()),
+                    CaseSensitivity::AsciiCaseInsensitive => {
+                        (role_name.to_lowercase(), value.0.to_lowercase())
+                    }
                 };
-                apply_string_operator(&role_name, &expected, operator)
+                apply_string_operator(&actual, &expected, operator)
             }
         }
     }
@@ -605,16 +683,18 @@ pub fn find_matches<'a>(
     tree: &'a ElementTree,
 ) -> Vec<&'a Element> {
     let mut results = Vec::new();
-    find_matches_recursive(selector_list, &tree.root, None, &mut results);
+    let mut ancestors = Vec::new();
+    find_matches_recursive(selector_list, &tree.root, &mut ancestors, &mut results);
     results
 }
 
 fn find_matches_recursive<'a>(
     selector_list: &SelectorList<AccessibilitySelectors>,
     element: &'a Element,
-    parent: Option<&'a Element>,
+    ancestors: &mut Vec<&'a Element>,
     results: &mut Vec<&'a Element>,
 ) {
+    let parent = ancestors.last().copied();
     let index_in_parent = parent
         .map(|p| {
             p.children
@@ -630,7 +710,7 @@ fn find_matches_recursive<'a>(
 
     let elem_ref = ElementRef {
         element,
-        parent,
+        ancestors: ancestors.clone(),
         index_in_parent,
         siblings,
     };
@@ -644,9 +724,11 @@ fn find_matches_recursive<'a>(
     }
 
     // Recurse into children
+    ancestors.push(element);
     for child in &element.children {
-        find_matches_recursive(selector_list, child, Some(element), results);
+        find_matches_recursive(selector_list, child, ancestors, results);
     }
+    ancestors.pop();
 }
 
 #[cfg(test)]
@@ -760,6 +842,32 @@ mod tests {
         }
     }
 
+    fn make_deep_test_tree() -> ElementTree {
+        let mut window = Element::new(ElementKey::from_ffi(10), Role::Window);
+        window.title = Some("Window".to_string());
+
+        let mut group = Element::new(ElementKey::from_ffi(11), Role::Group);
+        group.title = Some("Group".to_string());
+
+        let mut region = Element::new(ElementKey::from_ffi(12), Role::Region);
+        region.title = Some("Region".to_string());
+
+        let mut button = Element::new(ElementKey::from_ffi(13), Role::Button);
+        button.title = Some("Deep Button".to_string());
+
+        region.children.push(button);
+        group.children.push(region);
+        window.children.push(group);
+
+        ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            element_count: 4,
+            root: window,
+        }
+    }
+
     #[test]
     fn test_preprocess_numeric_id() {
         assert_eq!(preprocess_query("#42"), "[data-id=\"42\"]");
@@ -822,6 +930,27 @@ mod tests {
     }
 
     #[test]
+    fn test_find_by_action_membership() {
+        let mut tree = make_test_tree();
+        tree.root.children[0].actions = vec!["AXCancel".to_string(), "AXPress".to_string()];
+
+        let sel = parse("[actions=\"cancel\"]").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(2));
+
+        let sel = parse("[action=\"click\"]").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(2));
+
+        let sel = parse("[actions=\"cancel click\"]").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(2));
+    }
+
+    #[test]
     fn test_find_by_pseudo_focused() {
         let tree = make_test_tree();
         let sel = parse(":focused").unwrap();
@@ -853,6 +982,24 @@ mod tests {
         let sel = parse("Window > Button").unwrap();
         let matches = find_matches(&sel, &tree);
         assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn test_find_deep_descendant() {
+        let tree = make_deep_test_tree();
+        let sel = parse("Window Group Region Button").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(13));
+    }
+
+    #[test]
+    fn test_find_deep_child_chain() {
+        let tree = make_deep_test_tree();
+        let sel = parse("Window > Group > Region > Button").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(13));
     }
 
     #[test]

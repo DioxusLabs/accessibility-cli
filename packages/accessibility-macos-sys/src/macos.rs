@@ -23,7 +23,10 @@ pub use types::{
     RunningApplication, ScreenSpace, Size, WindowId,
 };
 pub use window::{capture_window, set_window_alpha};
-pub use workspace::{frontmost_application_pid, is_process_trusted, running_applications};
+pub use workspace::{
+    bundle_path_for_pid, frontmost_application_pid, is_chromium_based_app, is_process_trusted,
+    running_applications,
+};
 
 #[cfg(test)]
 mod tests;
