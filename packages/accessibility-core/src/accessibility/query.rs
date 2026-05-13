@@ -996,6 +996,21 @@ mod tests {
     }
 
     #[test]
+    fn test_find_nth_child() {
+        let tree = make_test_tree();
+
+        let sel = parse("Window > Button:nth-child(1)").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(2));
+
+        let sel = parse("Window > Button:nth-child(3)").unwrap();
+        let matches = find_matches(&sel, &tree);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(4));
+    }
+
+    #[test]
     fn test_find_deep_descendant() {
         let tree = make_deep_test_tree();
         let sel = parse("Window Group Region Button").unwrap();

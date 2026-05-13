@@ -1,6 +1,6 @@
 //! Output formatting utilities.
 
-use crate::accessibility::{Element, ElementKey, ElementTree, find_matches, parse_query};
+use crate::accessibility::{Element, ElementKey, ElementTree};
 use accesskit::Role;
 use std::collections::HashMap;
 
@@ -316,9 +316,17 @@ pub fn print_elements_formatted(elements: &[&Element], format: OutputFormat) {
 pub fn print_elements_formatted_with_tree(
     elements: &[&Element],
     format: OutputFormat,
-    _tree: &ElementTree,
+    tree: &ElementTree,
 ) {
-    print_elements_formatted(elements, format);
+    if format != OutputFormat::LlmQuery {
+        print_elements_formatted(elements, format);
+        return;
+    }
+
+    let mut formatter = MinimalQueryFormatter::new(tree);
+    for elem in elements {
+        println!("{}", formatter.selector_for(elem));
+    }
 }
 
 /// Format an element as a CSS selector string.
@@ -391,13 +399,9 @@ impl<'a> MinimalQueryFormatter<'a> {
     }
 
     fn selector_for(&mut self, elem: &Element) -> String {
-        let Some(mut candidate) = self.maximal_candidate(elem.id) else {
+        let Some(mut candidate) = self.unique_candidate_for(elem.id) else {
             return self.id_fallback_selector(elem);
         };
-
-        if !self.matches_target(&candidate, elem.id) {
-            return self.id_fallback_selector(elem);
-        }
 
         for removal in candidate.removal_candidates() {
             let mut trial = candidate.clone();
@@ -410,11 +414,27 @@ impl<'a> MinimalQueryFormatter<'a> {
         }
 
         let selector = candidate.to_selector();
-        if self.unique_match_id(&selector) == Some(elem.id) {
+        if self.unique_candidate_match_id(&candidate) == Some(elem.id) {
             selector
         } else {
             self.id_fallback_selector(elem)
         }
+    }
+
+    fn unique_candidate_for(&mut self, target_id: ElementKey) -> Option<SelectorCandidate> {
+        if let Some(candidate) = self.maximal_candidate(target_id)
+            && self.matches_target(&candidate, target_id)
+        {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = self.positional_candidate(target_id)
+            && self.matches_target(&candidate, target_id)
+        {
+            return Some(candidate);
+        }
+
+        None
     }
 
     fn index_tree(&mut self) {
@@ -432,9 +452,19 @@ impl<'a> MinimalQueryFormatter<'a> {
 
     fn maximal_candidate(&self, target_id: ElementKey) -> Option<SelectorCandidate> {
         let path = self.path_to(target_id)?;
+        let target_path_index = path.len().checked_sub(1)?;
+        let target_has_semantics = element_has_selector_semantics(path[target_path_index]);
         let steps = path
             .into_iter()
-            .map(|elem| {
+            .enumerate()
+            .filter(|(path_index, elem)| {
+                *path_index == 0
+                    || *path_index == target_path_index
+                    || is_top_level_selector_context(elem)
+                    || element_has_selector_semantics(elem)
+                    || (!target_has_semantics && *path_index + 1 == target_path_index)
+            })
+            .map(|(path_index, elem)| {
                 let nth_child = self
                     .parent_by_id
                     .get(&elem.id)
@@ -442,7 +472,27 @@ impl<'a> MinimalQueryFormatter<'a> {
                     .flatten()
                     .and_then(|_| self.child_index_by_id.get(&elem.id).copied())
                     .map(|child_index| child_index + 1);
-                SelectorStep::new(elem, nth_child)
+                SelectorStep::new(elem, nth_child, path_index)
+            })
+            .collect();
+
+        Some(SelectorCandidate { steps })
+    }
+
+    fn positional_candidate(&self, target_id: ElementKey) -> Option<SelectorCandidate> {
+        let steps = self
+            .path_to(target_id)?
+            .into_iter()
+            .enumerate()
+            .map(|(path_index, elem)| {
+                let nth_child = self
+                    .parent_by_id
+                    .get(&elem.id)
+                    .copied()
+                    .flatten()
+                    .and_then(|_| self.child_index_by_id.get(&elem.id).copied())
+                    .map(|child_index| child_index + 1);
+                SelectorStep::new(elem, nth_child, path_index)
             })
             .collect();
 
@@ -468,30 +518,79 @@ impl<'a> MinimalQueryFormatter<'a> {
     }
 
     fn matches_target(&mut self, candidate: &SelectorCandidate, target_id: ElementKey) -> bool {
-        let selector = candidate.to_selector();
-        self.unique_match_id(&selector) == Some(target_id)
+        self.unique_candidate_match_id(candidate) == Some(target_id)
     }
 
-    fn unique_match_id(&mut self, selector: &str) -> Option<ElementKey> {
+    fn unique_candidate_match_id(&mut self, candidate: &SelectorCandidate) -> Option<ElementKey> {
+        let selector = candidate.to_selector();
         if selector.is_empty() {
             return None;
         }
 
-        if let Some(cached) = self.match_cache.get(selector) {
+        if let Some(cached) = self.match_cache.get(&selector) {
             return *cached;
         }
 
-        let unique_id = parse_query(selector).ok().and_then(|parsed| {
-            let matches = find_matches(&parsed, self.tree);
-            if matches.len() == 1 {
-                Some(matches[0].id)
-            } else {
-                None
-            }
-        });
+        let unique_id = self.direct_unique_match_id(candidate);
 
-        self.match_cache.insert(selector.to_string(), unique_id);
+        self.match_cache.insert(selector, unique_id);
         unique_id
+    }
+
+    fn direct_unique_match_id(&self, candidate: &SelectorCandidate) -> Option<ElementKey> {
+        let active_steps = candidate.active_steps();
+        if active_steps.is_empty() {
+            return None;
+        }
+
+        let mut matched = None;
+        for element in self.elements_by_id.values() {
+            if self.matches_active_steps(element.id, &active_steps, active_steps.len() - 1) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(element.id);
+            }
+        }
+
+        matched
+    }
+
+    fn matches_active_steps(
+        &self,
+        element_id: ElementKey,
+        active_steps: &[(usize, &SelectorStep)],
+        active_index: usize,
+    ) -> bool {
+        let Some(element) = self.elements_by_id.get(&element_id).copied() else {
+            return false;
+        };
+        let (step_index, step) = active_steps[active_index];
+        if !step.matches(element, self.child_index_by_id.get(&element_id).copied()) {
+            return false;
+        }
+
+        if active_index == 0 {
+            return true;
+        }
+
+        let (previous_step_index, _) = active_steps[active_index - 1];
+        let parent_id = self.parent_by_id.get(&element_id).copied().flatten();
+        if previous_step_index + 1 == step_index {
+            return parent_id.is_some_and(|parent_id| {
+                self.matches_active_steps(parent_id, active_steps, active_index - 1)
+            });
+        }
+
+        let mut ancestor_id = parent_id;
+        while let Some(id) = ancestor_id {
+            if self.matches_active_steps(id, active_steps, active_index - 1) {
+                return true;
+            }
+            ancestor_id = self.parent_by_id.get(&id).copied().flatten();
+        }
+
+        false
     }
 
     fn id_fallback_selector(&mut self, elem: &Element) -> String {
@@ -501,12 +600,35 @@ impl<'a> MinimalQueryFormatter<'a> {
             format_attr_selector("data-id", &elem.id.to_string())
         );
 
-        if self.unique_match_id(&selector) == Some(elem.id) {
+        if self.elements_by_id.contains_key(&elem.id) {
             selector
         } else {
             format_element_selector(elem)
         }
     }
+}
+
+fn is_top_level_selector_context(elem: &Element) -> bool {
+    matches!(
+        elem.role,
+        Role::Application | Role::Window | Role::Dialog | Role::MenuBar
+    )
+}
+
+fn element_has_selector_semantics(elem: &Element) -> bool {
+    elem.title.as_ref().is_some_and(|s| !s.is_empty())
+        || elem.description.as_ref().is_some_and(|s| !s.is_empty())
+        || elem.value.as_ref().is_some_and(|s| !s.is_empty())
+        || elem.url.as_ref().is_some_and(|s| !s.is_empty())
+        || elem.help.as_ref().is_some_and(|s| !s.is_empty())
+        || elem.identifier.as_ref().is_some_and(|s| !s.is_empty())
+        || elem
+            .role_description
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        || !format_actions_query_value(&elem.actions).is_empty()
+        || elem.focused
+        || !elem.enabled
 }
 
 #[derive(Clone)]
@@ -515,11 +637,18 @@ struct SelectorCandidate {
 }
 
 impl SelectorCandidate {
+    fn active_steps(&self) -> Vec<(usize, &SelectorStep)> {
+        self.steps
+            .iter()
+            .filter_map(|step| step.active.then_some((step.path_index, step)))
+            .collect()
+    }
+
     fn to_selector(&self) -> String {
         let mut selector = String::new();
         let mut previous_step_index: Option<usize> = None;
 
-        for (index, step) in self.steps.iter().enumerate() {
+        for step in &self.steps {
             if !step.active {
                 continue;
             }
@@ -530,7 +659,7 @@ impl SelectorCandidate {
             }
 
             if let Some(previous_index) = previous_step_index {
-                if index == previous_index + 1 {
+                if step.path_index == previous_index + 1 {
                     selector.push_str(" > ");
                 } else {
                     selector.push(' ');
@@ -538,7 +667,7 @@ impl SelectorCandidate {
             }
 
             selector.push_str(&step_selector);
-            previous_step_index = Some(index);
+            previous_step_index = Some(step.path_index);
         }
 
         selector
@@ -638,13 +767,14 @@ impl SelectorCandidate {
 #[derive(Clone)]
 struct SelectorStep {
     active: bool,
+    path_index: usize,
     role: &'static str,
     attrs: Vec<SelectorAttr>,
     pseudos: Vec<SelectorPseudo>,
 }
 
 impl SelectorStep {
-    fn new(elem: &Element, nth_child: Option<usize>) -> Self {
+    fn new(elem: &Element, nth_child: Option<usize>, path_index: usize) -> Self {
         let mut attrs = Vec::new();
 
         if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
@@ -713,6 +843,7 @@ impl SelectorStep {
 
         Self {
             active: true,
+            path_index,
             role: format_role_query_name(elem.role),
             attrs,
             pseudos,
@@ -735,6 +866,22 @@ impl SelectorStep {
         }
 
         selector
+    }
+
+    fn matches(&self, elem: &Element, child_index: Option<usize>) -> bool {
+        if self.role != "*" && format_role_query_name(elem.role) != self.role {
+            return false;
+        }
+
+        self.attrs
+            .iter()
+            .filter(|attr| attr.active)
+            .all(|attr| attr.matches(elem))
+            && self
+                .pseudos
+                .iter()
+                .filter(|pseudo| pseudo.active)
+                .all(|pseudo| pseudo.matches(elem, child_index))
     }
 }
 
@@ -767,6 +914,28 @@ impl SelectorAttr {
             SelectorAttrKind::Title | SelectorAttrKind::Identifier if !is_target => 650,
             SelectorAttrKind::Title | SelectorAttrKind::Identifier => 100,
         }
+    }
+
+    fn matches(&self, elem: &Element) -> bool {
+        let actual = match self.kind {
+            SelectorAttrKind::Title => elem.title.as_deref(),
+            SelectorAttrKind::Description => elem.description.as_deref(),
+            SelectorAttrKind::Value => elem.value.as_deref(),
+            SelectorAttrKind::Url => elem.url.as_deref(),
+            SelectorAttrKind::Help => elem.help.as_deref(),
+            SelectorAttrKind::Identifier => elem.identifier.as_deref(),
+            SelectorAttrKind::RoleDescription => elem.role_description.as_deref(),
+            SelectorAttrKind::Actions => {
+                let actions = format_actions_query_value(&elem.actions);
+                return !actions.is_empty()
+                    && (actions == self.value
+                        || actions
+                            .split_whitespace()
+                            .any(|action| action == self.value.as_str()));
+            }
+        };
+
+        actual == Some(self.value.as_str())
     }
 }
 
@@ -805,6 +974,16 @@ impl SelectorPseudo {
         match self.kind {
             SelectorPseudoKind::NthChild(_) => 1_000,
             SelectorPseudoKind::Focused | SelectorPseudoKind::Disabled => 900,
+        }
+    }
+
+    fn matches(&self, elem: &Element, child_index: Option<usize>) -> bool {
+        match self.kind {
+            SelectorPseudoKind::Focused => elem.focused,
+            SelectorPseudoKind::Disabled => !elem.enabled,
+            SelectorPseudoKind::NthChild(index) => {
+                child_index.is_some_and(|child_index| child_index + 1 == index)
+            }
         }
     }
 }
@@ -1407,7 +1586,7 @@ mod tests {
     }
 
     fn assert_llm_query_output_round_trips(tree: &ElementTree, structure_only: bool) {
-        for raw_line in format_llm_query_lines(&tree.root, structure_only) {
+        for raw_line in format_llm_query_lines(tree, structure_only) {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
@@ -1419,8 +1598,29 @@ mod tests {
         }
     }
 
+    fn find_element_by_id(element: &Element, id: ElementKey) -> Option<&Element> {
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            if current.id == id {
+                return Some(current);
+            }
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        None
+    }
+
+    fn minimal_selector_for(tree: &ElementTree, id: u64) -> String {
+        let id = ElementKey::from_ffi(id);
+        let element = find_element_by_id(&tree.root, id).expect("test element should exist");
+        MinimalQueryFormatter::new(tree).selector_for(element)
+    }
+
     #[test]
     fn llm_menu_item_line_uses_query_selector_syntax() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut menubar = Element::new(ElementKey::from_ffi(2), Role::MenuBar);
         let mut item = Element::new(ElementKey::from_ffi(4_294_967_299), Role::MenuItem);
         item.title = Some("Apple".to_string());
         item.actions = vec![
@@ -1428,11 +1628,166 @@ mod tests {
             "AXPress".to_string(),
             "AXPick".to_string(),
         ];
+        menubar.children.push(item);
+        root.children.push(menubar);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 3,
+        };
+
+        assert_eq!(minimal_selector_for(&tree, 4_294_967_299), "MenuItem");
+    }
+
+    #[test]
+    fn minimal_selector_reduces_globally_unique_role_without_id() {
+        let tree = make_output_round_trip_tree();
+        let selector = minimal_selector_for(&tree, 5);
+
+        assert_eq!(selector, "Button");
+        assert!(!selector.contains("data-id"));
+    }
+
+    #[test]
+    fn minimal_selector_keeps_ancestor_context_for_duplicate_labels() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+
+        let mut editor = Element::new(ElementKey::from_ffi(3), Role::Toolbar);
+        editor.title = Some("Editor".to_string());
+        let mut editor_save = Element::new(ElementKey::from_ffi(4), Role::Button);
+        editor_save.title = Some("Save".to_string());
+        editor.children.push(editor_save);
+
+        let mut footer = Element::new(ElementKey::from_ffi(5), Role::Toolbar);
+        footer.title = Some("Footer".to_string());
+        let mut footer_save = Element::new(ElementKey::from_ffi(6), Role::Button);
+        footer_save.title = Some("Save".to_string());
+        footer.children.push(footer_save);
+
+        window.children.push(editor);
+        window.children.push(footer);
+        root.children.push(window);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 6,
+        };
 
         assert_eq!(
-            format_element_llm_line(&item, 1),
-            "  MenuItem[data-id=\"4294967299\"][role=\"MenuItem\"][title=\"Apple\"][actions=\"cancel click pick\"]"
+            minimal_selector_for(&tree, 4),
+            "Toolbar[title=\"Editor\"] > Button"
         );
+    }
+
+    #[test]
+    fn minimal_selector_uses_position_before_id_for_identical_siblings() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+        for id in 3..=4 {
+            let mut button = Element::new(ElementKey::from_ffi(id), Role::Button);
+            button.title = Some("Save".to_string());
+            window.children.push(button);
+        }
+        root.children.push(window);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 4,
+        };
+
+        let selector = minimal_selector_for(&tree, 3);
+        assert_eq!(selector, "Button:nth-child(1)");
+        assert!(!selector.contains("data-id"));
+    }
+
+    #[test]
+    fn minimal_selector_uses_position_for_anonymous_elements_before_id() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+        window
+            .children
+            .push(Element::new(ElementKey::from_ffi(3), Role::Unknown));
+        window
+            .children
+            .push(Element::new(ElementKey::from_ffi(4), Role::Unknown));
+        root.children.push(window);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 4,
+        };
+
+        let selector = minimal_selector_for(&tree, 3);
+        assert_eq!(selector, "Window > *:nth-child(1)");
+        assert!(!selector.contains("data-id"));
+    }
+
+    #[test]
+    fn minimal_selector_uses_full_positional_path_before_id() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut window = Element::new(ElementKey::from_ffi(2), Role::Window);
+
+        for group_id in [3, 5] {
+            let mut group = Element::new(ElementKey::from_ffi(group_id), Role::Group);
+            group.children.push(Element::new(
+                ElementKey::from_ffi(group_id + 1),
+                Role::Unknown,
+            ));
+            window.children.push(group);
+        }
+
+        root.children.push(window);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 6,
+        };
+
+        let selector = minimal_selector_for(&tree, 4);
+        let parsed = parse_query(&selector).unwrap();
+        let matches = find_matches(&parsed, &tree);
+
+        assert_eq!(selector, "Group:nth-child(1) > *");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(4));
+        assert!(!selector.contains("data-id"));
+    }
+
+    #[test]
+    fn minimal_selector_escapes_strings_when_attribute_is_needed() {
+        let mut root = Element::new(ElementKey::from_ffi(1), Role::Application);
+        let mut first = Element::new(ElementKey::from_ffi(2), Role::Button);
+        first.title = Some("Say \"hi\"\\again".to_string());
+        let mut second = Element::new(ElementKey::from_ffi(3), Role::Button);
+        second.title = Some("Other".to_string());
+        root.children.push(first);
+        root.children.push(second);
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 3,
+        };
+
+        let selector = minimal_selector_for(&tree, 2);
+        let parsed = parse_query(&selector).unwrap();
+        let matches = find_matches(&parsed, &tree);
+
+        assert_eq!(selector, "Button[title=\"Say \\\"hi\\\"\\\\again\"]");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ElementKey::from_ffi(2));
     }
 
     #[test]
@@ -1541,7 +1896,10 @@ mod tests {
     #[test]
     fn llm_query_output_handles_deep_tree_iteratively() {
         let tree = make_deep_output_tree(2048);
-        let lines = format_llm_query_lines(&tree.root, false);
-        assert!(lines.iter().any(|line| line.contains("[title=\"Needle\"]")));
+        let lines = format_llm_query_lines(&tree, false);
+        assert!(
+            lines.iter().any(|line| line.trim() == "Button"),
+            "{lines:?}"
+        );
     }
 }
