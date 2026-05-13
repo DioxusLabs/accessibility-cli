@@ -39,13 +39,15 @@ pub fn decode_screenshot(screenshot: &Screenshot) -> RgbaImage {
 /// * `screen_bounds` - The screen bounds for coordinate conversion
 /// * `screenshot` - The screenshot for dimensions
 /// * `draw_labels` - Whether to draw numbered labels on elements
+///
+/// Returns the number of elements that intersected the image and were drawn.
 pub fn annotate_elements(
     img: &mut RgbaImage,
     elements: &[&Element],
     screen_bounds: &Rect,
     screenshot: &Screenshot,
     draw_labels: bool,
-) {
+) -> usize {
     let scale_x = screenshot.width as f64 / screen_bounds.size.width;
     let scale_y = screenshot.height as f64 / screen_bounds.size.height;
     let red = Rgba([255u8, 0, 0, 255]);
@@ -55,6 +57,7 @@ pub fn annotate_elements(
     let font = get_font();
     let base_font_size = 24.0;
     let font_scale = PxScale::from(base_font_size);
+    let mut drawn = 0;
 
     for elem in elements {
         if let Some(bounds) = &elem.bounds {
@@ -64,12 +67,13 @@ pub fn annotate_elements(
             let ph = (bounds.size.height * scale_y).round() as i32;
 
             // Skip elements outside the image bounds
-            if px < 0 || py < 0 || px >= img.width() as i32 || py >= img.height() as i32 {
+            if !rect_intersects_image(px, py, pw, ph, img.width(), img.height()) {
                 continue;
             }
 
             // Draw rectangle border
             draw_rect_border(img, px, py, pw, ph, red, box_thickness);
+            drawn += 1;
 
             // Draw label if requested
             if draw_labels {
@@ -101,6 +105,17 @@ pub fn annotate_elements(
             }
         }
     }
+
+    drawn
+}
+
+fn rect_intersects_image(px: i32, py: i32, pw: i32, ph: i32, width: u32, height: u32) -> bool {
+    pw > 0
+        && ph > 0
+        && px < width as i32
+        && py < height as i32
+        && px.saturating_add(pw) > 0
+        && py.saturating_add(ph) > 0
 }
 
 /// Draw a coordinate grid overlay on an image.
@@ -298,15 +313,17 @@ impl AnnotatedScreenshot {
                     let px = ((bounds.origin.x - screen_bounds.origin.x) * scale_x).round() as i32;
                     let py = ((bounds.origin.y - screen_bounds.origin.y) * scale_y).round() as i32;
 
-                    if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32
-                    {
+                    let pw = (bounds.size.width * scale_x).round() as i32;
+                    let ph = (bounds.size.height * scale_y).round() as i32;
+
+                    if rect_intersects_image(px, py, pw, ph, image.width(), image.height()) {
                         labels.push(ElementLabel {
                             number: elem.id.to_ffi() as u32,
                             element_id: elem.id,
                             role: elem.role,
                             label: elem.display_label(),
-                            pixel_x: px,
-                            pixel_y: py,
+                            pixel_x: px.max(0),
+                            pixel_y: py.max(0),
                         });
                     }
                 }
@@ -371,5 +388,64 @@ impl AnnotatedScreenshot {
             .write_to(&mut buffer, image::ImageFormat::Png)
             .expect("Failed to encode PNG");
         buffer.into_inner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accessibility::{ElementKey, Point, Size};
+    use accesskit::Role;
+
+    fn test_screenshot() -> Screenshot {
+        Screenshot {
+            data: Vec::new(),
+            width: 100,
+            height: 100,
+        }
+    }
+
+    fn test_element(id: u64, x: f64, y: f64, width: f64, height: f64) -> Element {
+        let mut element = Element::new(ElementKey::from_ffi(id), Role::Button);
+        element.bounds = Some(Rect::new(Point::new(x, y), Size::new(width, height)));
+        element
+    }
+
+    #[test]
+    fn annotate_skips_empty_and_outside_bounds() {
+        let mut image = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
+        let screen_bounds = Rect::new(Point::new(0.0, 0.0), Size::new(100.0, 100.0));
+        let screenshot = test_screenshot();
+        let zero_width = test_element(1, 10.0, 10.0, 0.0, 20.0);
+        let outside = test_element(2, 120.0, 10.0, 20.0, 20.0);
+
+        let drawn = annotate_elements(
+            &mut image,
+            &[&zero_width, &outside],
+            &screen_bounds,
+            &screenshot,
+            false,
+        );
+
+        assert_eq!(drawn, 0);
+    }
+
+    #[test]
+    fn annotate_draws_partially_visible_bounds() {
+        let mut image = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
+        let screen_bounds = Rect::new(Point::new(0.0, 0.0), Size::new(100.0, 100.0));
+        let screenshot = test_screenshot();
+        let partially_visible = test_element(1, -5.0, 10.0, 20.0, 20.0);
+
+        let drawn = annotate_elements(
+            &mut image,
+            &[&partially_visible],
+            &screen_bounds,
+            &screenshot,
+            false,
+        );
+
+        assert_eq!(drawn, 1);
+        assert_eq!(*image.get_pixel(0, 10), Rgba([255, 0, 0, 255]));
     }
 }

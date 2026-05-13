@@ -27,7 +27,8 @@
 //! ```
 
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, ListenerConfig, TargetedAccessibility, TreeFilter,
+    AccessibilityEvent, AccessibilityEventType, Element, ListenerConfig, Rect,
+    TargetedAccessibility, TreeFilter,
 };
 use accessibility_core::api::{
     JsonPrinter, LlmPrinter, LlmQueryPrinter, Printer, TreePrinter, annotate_elements,
@@ -138,7 +139,27 @@ async fn handle_screenshot_screen(adapter: &TargetedAccessibility, args: &Common
     }
 }
 
-/// Handle annotate command.
+/// Check whether an element has a positive-area overlap with the captured bounds.
+fn element_overlaps_bounds(element: &Element, screen_bounds: &Rect) -> bool {
+    let Some(bounds) = &element.bounds else {
+        return false;
+    };
+
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return false;
+    }
+
+    let bounds_right = bounds.origin.x + bounds.size.width;
+    let bounds_bottom = bounds.origin.y + bounds.size.height;
+    let screen_right = screen_bounds.origin.x + screen_bounds.size.width;
+    let screen_bottom = screen_bounds.origin.y + screen_bounds.size.height;
+
+    bounds.origin.x < screen_right
+        && bounds_right > screen_bounds.origin.x
+        && bounds.origin.y < screen_bottom
+        && bounds_bottom > screen_bounds.origin.y
+}
+
 async fn handle_annotate(
     adapter: &TargetedAccessibility,
     tree: &accessibility_core::accessibility::ElementTree,
@@ -165,12 +186,6 @@ async fn handle_annotate(
         return;
     }
 
-    println!(
-        "Found {} {} elements with bounds",
-        elements.len(),
-        description
-    );
-
     // Capture screenshot
     let screenshot = match adapter.capture_screen() {
         Ok(s) => s,
@@ -188,9 +203,33 @@ async fn handle_annotate(
         }
     };
 
+    let candidate_count = elements.len();
+    let elements: Vec<_> = elements
+        .into_iter()
+        .filter(|element| element_overlaps_bounds(element, &screen_bounds))
+        .collect();
+
+    if elements.is_empty() {
+        println!("No elements to annotate in captured bounds.");
+        return;
+    }
+
+    println!(
+        "Found {} {} elements with drawable bounds",
+        elements.len(),
+        description
+    );
+    let skipped = candidate_count.saturating_sub(elements.len());
+    if skipped > 0 {
+        println!(
+            "Skipped {} elements outside the capture or with empty bounds",
+            skipped
+        );
+    }
+
     // Decode and annotate
     let mut img = decode_screenshot(&screenshot);
-    annotate_elements(&mut img, &elements, &screen_bounds, &screenshot, args.label);
+    let marked = annotate_elements(&mut img, &elements, &screen_bounds, &screenshot, args.label);
 
     if args.overlay {
         draw_grid_overlay(
@@ -214,7 +253,7 @@ async fn handle_annotate(
     println!(
         "Saved annotated screenshot to {} ({} elements marked)",
         filename.display(),
-        elements.len()
+        marked
     );
 
     if args.label {
@@ -226,7 +265,15 @@ async fn handle_annotate(
             if let Some(bounds) = &elem.bounds {
                 let px = ((bounds.origin.x - screen_bounds.origin.x) * scale_x) as i32;
                 let py = ((bounds.origin.y - screen_bounds.origin.y) * scale_y) as i32;
-                if px >= 0 && py >= 0 && px < img.width() as i32 && py < img.height() as i32 {
+                let pw = (bounds.size.width * scale_x) as i32;
+                let ph = (bounds.size.height * scale_y) as i32;
+                if pw > 0
+                    && ph > 0
+                    && px < img.width() as i32
+                    && py < img.height() as i32
+                    && px.saturating_add(pw) > 0
+                    && py.saturating_add(ph) > 0
+                {
                     let role_str = format_role_short(elem.role);
                     println!(
                         "  {}: [{}] {} \"{}\"",
@@ -575,12 +622,6 @@ async fn handle_screenshot_elements(
             std::process::exit(1);
         }
     };
-    println!(
-        "Found {} {} elements with bounds",
-        elements.len(),
-        description
-    );
-
     let screenshot = match adapter.capture_screen() {
         Ok(s) => s,
         Err(e) => {
@@ -596,6 +637,25 @@ async fn handle_screenshot_elements(
             std::process::exit(1);
         }
     };
+
+    let candidate_count = elements.len();
+    let elements: Vec<_> = elements
+        .into_iter()
+        .filter(|element| element_overlaps_bounds(element, &screen_bounds))
+        .collect();
+
+    println!(
+        "Found {} {} elements with drawable bounds",
+        elements.len(),
+        description
+    );
+    let skipped = candidate_count.saturating_sub(elements.len());
+    if skipped > 0 {
+        println!(
+            "Skipped {} elements outside the capture or with empty bounds",
+            skipped
+        );
+    }
 
     for (i, elem) in elements.iter().enumerate() {
         if let Some(bounds) = &elem.bounds {

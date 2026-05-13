@@ -12,13 +12,16 @@ use crate::accessibility::{
 };
 use crate::input::code_from_char;
 use accessibility_macos_sys::{
-    AxElement, AxObserver, ModifierFlags as MacModifierFlags, MouseButton as MacMouseButton,
-    MouseEventKind as MacMouseEventKind, RunLoop, WindowId,
+    AX_SEARCH_KEY_BUTTON, AX_SEARCH_KEY_CHECKBOX, AX_SEARCH_KEY_CONTROL, AX_SEARCH_KEY_GRAPHIC,
+    AX_SEARCH_KEY_HEADING, AX_SEARCH_KEY_LINK, AX_SEARCH_KEY_LIST, AX_SEARCH_KEY_RADIO_GROUP,
+    AX_SEARCH_KEY_STATIC_TEXT, AX_SEARCH_KEY_TABLE, AX_SEARCH_KEY_TEXT_FIELD, AxElement,
+    AxObserver, AxSearchPredicate, ModifierFlags as MacModifierFlags,
+    MouseButton as MacMouseButton, MouseEventKind as MacMouseEventKind, RunLoop, WindowId,
 };
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
 use keyboard_types::{Code, Modifiers};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -40,8 +43,9 @@ const AX_WINDOWS: &str = "AXWindows";
 const AX_MAIN_WINDOW: &str = "AXMainWindow";
 const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
 const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
-const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(100);
+const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(500);
 const AX_ENHANCED_USER_INTERFACE_SETTLE_DELAY: Duration = Duration::from_millis(25);
+const AX_FULL_ACCESSIBILITY_PRIME_DEPTH: usize = 8;
 const AX_VISIBLE_CHILDREN: &str = "AXVisibleChildren";
 const AX_CHILDREN_IN_NAVIGATION_ORDER: &str = "AXChildrenInNavigationOrder";
 const AX_CONTENTS: &str = "AXContents";
@@ -53,6 +57,7 @@ const AX_SPLITTERS: &str = "AXSplitters";
 const AX_SELECTED_CHILDREN: &str = "AXSelectedChildren";
 const AX_SELECTED_ROWS: &str = "AXSelectedRows";
 const AX_SELECTED_COLUMNS: &str = "AXSelectedColumns";
+const AX_WEB_SEARCH_RESULTS_LIMIT: i32 = 2000;
 const AX_CREATED_NOTIFICATION: &str = "AXCreated";
 const AX_LOAD_COMPLETE_NOTIFICATION: &str = "AXLoadComplete";
 const AX_LAYOUT_COMPLETE_NOTIFICATION: &str = "AXLayoutComplete";
@@ -81,6 +86,20 @@ const AX_CHILD_ATTRIBUTES: &[&str] = &[
     AX_SELECTED_CHILDREN,
     AX_SELECTED_ROWS,
     AX_SELECTED_COLUMNS,
+];
+
+const AX_WEB_SEARCH_KEYS: &[&str] = &[
+    AX_SEARCH_KEY_CONTROL,
+    AX_SEARCH_KEY_BUTTON,
+    AX_SEARCH_KEY_LINK,
+    AX_SEARCH_KEY_TEXT_FIELD,
+    AX_SEARCH_KEY_CHECKBOX,
+    AX_SEARCH_KEY_RADIO_GROUP,
+    AX_SEARCH_KEY_STATIC_TEXT,
+    AX_SEARCH_KEY_HEADING,
+    AX_SEARCH_KEY_LIST,
+    AX_SEARCH_KEY_TABLE,
+    AX_SEARCH_KEY_GRAPHIC,
 ];
 
 const AX_MATERIALIZATION_NOTIFICATIONS: &[&str] = &[
@@ -143,6 +162,85 @@ const ROLE_SPLITTER: &str = "AXSplitter";
 const ROLE_ROW: &str = "AXRow";
 const ROLE_COLUMN: &str = "AXColumn";
 const ROLE_CELL: &str = "AXCell";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraversalPurpose {
+    BuildTree,
+    MaterializationCheck,
+    PrimeAccessibility,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChildDiscovery {
+    purpose: TraversalPurpose,
+}
+
+impl ChildDiscovery {
+    fn new(purpose: TraversalPurpose) -> Self {
+        Self { purpose }
+    }
+
+    fn discover(self, element: &AxElement) -> Vec<AxElement> {
+        let mut children = self.structural_children(element);
+        if !self.should_include_search_descendants(element) {
+            return children;
+        }
+
+        let mut seen = HashSet::new();
+        self.collect_structural_signatures(element, &mut seen, 0);
+        for child in self.search_predicate_children(element) {
+            MacOSAccessibility::push_unique_element(&mut children, &mut seen, child);
+        }
+
+        children
+    }
+
+    fn structural_children(self, element: &AxElement) -> Vec<AxElement> {
+        let mut children = Vec::new();
+        let mut seen = HashSet::new();
+
+        for attribute in AX_CHILD_ATTRIBUTES {
+            for child in element.attribute_elements(attribute) {
+                MacOSAccessibility::push_unique_element(&mut children, &mut seen, child);
+            }
+        }
+
+        children
+    }
+
+    fn should_include_search_descendants(self, element: &AxElement) -> bool {
+        if self.purpose == TraversalPurpose::PrimeAccessibility {
+            return false;
+        }
+
+        MacOSAccessibility::get_string_attribute(element, AX_ROLE).as_deref() == Some(ROLE_WEB_AREA)
+            && element.supports_ui_elements_for_search_predicate()
+    }
+
+    fn search_predicate_children(self, element: &AxElement) -> Vec<AxElement> {
+        element.ui_elements_for_search_predicate(AxSearchPredicate::new(
+            AX_WEB_SEARCH_KEYS,
+            AX_WEB_SEARCH_RESULTS_LIMIT,
+        ))
+    }
+
+    fn collect_structural_signatures(
+        self,
+        element: &AxElement,
+        seen: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if depth > 24 {
+            return;
+        }
+
+        for child in self.structural_children(element) {
+            if seen.insert(MacOSAccessibility::element_signature(&child)) {
+                self.collect_structural_signatures(&child, seen, depth + 1);
+            }
+        }
+    }
+}
 
 /// macOS accessibility reader using AXUIElement API.
 pub struct MacOSAccessibility {
@@ -609,10 +707,41 @@ impl MacOSAccessibility {
     }
 
     fn enable_full_accessibility_for_app(app: &AxElement) -> bool {
-        let mut requested = Self::enable_full_accessibility(app);
+        let mut seen = std::collections::HashSet::new();
+        let mut requested = Self::enable_full_accessibility_for_subtree(
+            app,
+            AX_FULL_ACCESSIBILITY_PRIME_DEPTH,
+            &mut seen,
+        );
 
         for window in Self::get_application_windows(app) {
-            requested |= Self::enable_full_accessibility(&window);
+            requested |= Self::enable_full_accessibility_for_subtree(
+                &window,
+                AX_FULL_ACCESSIBILITY_PRIME_DEPTH,
+                &mut seen,
+            );
+        }
+
+        requested
+    }
+
+    fn enable_full_accessibility_for_subtree(
+        element: &AxElement,
+        remaining_depth: usize,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if !seen.insert(Self::element_signature(element)) {
+            return false;
+        }
+
+        let mut requested = Self::enable_full_accessibility(element);
+        if remaining_depth == 0 {
+            return requested;
+        }
+
+        for child in Self::discover_children(element, TraversalPurpose::PrimeAccessibility) {
+            requested |=
+                Self::enable_full_accessibility_for_subtree(&child, remaining_depth - 1, seen);
         }
 
         requested
@@ -620,10 +749,10 @@ impl MacOSAccessibility {
 
     fn prime_accessibility_roots(app: &AxElement) {
         let _ = app.attribute_string(AX_FOCUSED_UI_ELEMENT);
-        let _ = Self::get_children(app);
+        let _ = Self::discover_children(app, TraversalPurpose::PrimeAccessibility);
 
         for window in Self::get_application_windows(app) {
-            let _ = Self::get_children(&window);
+            let _ = Self::discover_children(&window, TraversalPurpose::PrimeAccessibility);
             let _ = window.attribute_string(AX_FOCUSED_UI_ELEMENT);
         }
     }
@@ -701,10 +830,13 @@ impl MacOSAccessibility {
                     | Some(ROLE_RADIO_BUTTON)
                     | Some(ROLE_COMBO_BOX)
                     | Some(ROLE_IMAGE)
+                    | Some(ROLE_GROUP)
+                    | Some(ROLE_ROW)
+                    | Some(ROLE_CELL)
             )
         }
 
-        fn walk_for_web_area(
+        fn walk_for_materialized_web_area(
             element: &AxElement,
             depth: usize,
             seen: &mut std::collections::HashSet<usize>,
@@ -718,14 +850,19 @@ impl MacOSAccessibility {
             }
 
             let role = MacOSAccessibility::get_string_attribute(element, AX_ROLE);
-            let children = MacOSAccessibility::get_children(element);
+            let children = MacOSAccessibility::discover_children(
+                element,
+                TraversalPurpose::MaterializationCheck,
+            );
             if role.as_deref() == Some(ROLE_WEB_AREA) && !children.is_empty() {
-                return true;
+                return children
+                    .iter()
+                    .any(|child| walk_for_page_content(child, depth + 1, f64::NEG_INFINITY, seen));
             }
 
             children
                 .iter()
-                .any(|child| walk_for_web_area(child, depth + 1, seen))
+                .any(|child| walk_for_materialized_web_area(child, depth + 1, seen))
         }
 
         fn walk_for_page_content(
@@ -751,21 +888,21 @@ impl MacOSAccessibility {
                 return true;
             }
 
-            MacOSAccessibility::get_children(element)
+            MacOSAccessibility::discover_children(element, TraversalPurpose::MaterializationCheck)
                 .iter()
                 .any(|child| walk_for_page_content(child, depth + 1, content_top, seen))
         }
 
         // Keep the explicit WebArea path for WebKit/Chromium builds that expose
-        // it, then fall back to the shape Chrome often produces after its
-        // screen-reader signal: real page text/controls below the browser chrome.
+        // it, but require real descendants. Chromium/Electron can expose a
+        // placeholder WebArea with empty groups before page AX has materialized.
         let mut seen = std::collections::HashSet::new();
-        if walk_for_web_area(element, 0, &mut seen) {
+        if walk_for_materialized_web_area(element, 0, &mut seen) {
             return true;
         }
 
         let mut windows = Self::get_application_windows(element);
-        for child in Self::get_children(element) {
+        for child in Self::discover_children(element, TraversalPurpose::MaterializationCheck) {
             if Self::get_string_attribute(&child, AX_ROLE).as_deref() == Some(ROLE_WINDOW) {
                 windows.push(child);
             }
@@ -790,10 +927,16 @@ impl MacOSAccessibility {
     }
 
     fn element_signature(element: &AxElement) -> String {
+        fn normalized_attribute(element: &AxElement, attribute: &str) -> Option<String> {
+            MacOSAccessibility::get_string_attribute(element, attribute)
+                .filter(|value| !value.is_empty())
+        }
+
         let pid = Self::get_pid_for_element(element);
-        let role = Self::get_string_attribute(element, AX_ROLE);
-        let title = Self::get_string_attribute(element, AX_TITLE);
-        let description = Self::get_string_attribute(element, AX_DESCRIPTION);
+        let role = normalized_attribute(element, AX_ROLE);
+        let title = normalized_attribute(element, AX_TITLE);
+        let description = normalized_attribute(element, AX_DESCRIPTION);
+        let value = normalized_attribute(element, AX_VALUE);
         let bounds = Self::get_bounds(element).map(|bounds| {
             (
                 bounds.origin.x.round() as i64,
@@ -803,7 +946,7 @@ impl MacOSAccessibility {
             )
         });
 
-        format!("{pid:?}|{role:?}|{title:?}|{description:?}|{bounds:?}")
+        format!("{pid:?}|{role:?}|{title:?}|{description:?}|{value:?}|{bounds:?}")
     }
 
     fn push_unique_element(
@@ -846,18 +989,14 @@ impl MacOSAccessibility {
         Some(Rect::new(position, Size::new(width, height)))
     }
 
-    /// Get the children of an element.
+    /// Discover children for the requested traversal purpose.
+    fn discover_children(element: &AxElement, purpose: TraversalPurpose) -> Vec<AxElement> {
+        ChildDiscovery::new(purpose).discover(element)
+    }
+
+    /// Get tree-building children for an element.
     fn get_children(element: &AxElement) -> Vec<AxElement> {
-        let mut children = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for attribute in AX_CHILD_ATTRIBUTES {
-            for child in element.attribute_elements(attribute) {
-                Self::push_unique_element(&mut children, &mut seen, child);
-            }
-        }
-
-        children
+        Self::discover_children(element, TraversalPurpose::BuildTree)
     }
 
     /// Get the windows of an application element.

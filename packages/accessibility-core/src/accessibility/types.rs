@@ -232,7 +232,14 @@ impl Element {
                 | Role::MenuItemRadio
                 | Role::Switch
                 | Role::SpinButton
-        )
+        ) || self.has_activation_action()
+    }
+
+    /// Check if this element exposes a platform activation action.
+    pub fn has_activation_action(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|action| matches!(action.as_str(), "AXPress" | "AXPick" | "AXConfirm"))
     }
 
     /// Recursively find all elements matching a predicate.
@@ -526,5 +533,28 @@ impl ListenerConfig {
             Some(types) => types.contains(&event_type),
             None => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit::Role;
+
+    #[test]
+    fn action_bearing_group_is_interactive() {
+        let mut element = Element::new(ElementKey::from_ffi(1), Role::Group);
+        element.actions.push("AXPress".to_string());
+
+        assert!(element.is_interactive());
+    }
+
+    #[test]
+    fn menu_only_group_is_not_interactive() {
+        let mut element = Element::new(ElementKey::from_ffi(1), Role::Group);
+        element.actions.push("AXShowMenu".to_string());
+        element.actions.push("AXScrollToVisible".to_string());
+
+        assert!(!element.is_interactive());
     }
 }

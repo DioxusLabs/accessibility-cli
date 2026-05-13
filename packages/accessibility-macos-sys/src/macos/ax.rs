@@ -2,8 +2,8 @@ use super::symbols::ax_ui_element_get_window;
 use super::{AxErrorCode, Point, Rect, Size, WindowId};
 use objc2_application_services::{AXError, AXObserver, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFIndex, CFRetained, CFRunLoop, CFRunLoopMode, CFRunLoopSource, CFString,
-    CFType, kCFRunLoopDefaultMode,
+    CFArray, CFBoolean, CFDictionary, CFIndex, CFNumber, CFRetained, CFRunLoop, CFRunLoopMode,
+    CFRunLoopSource, CFString, CFType, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::CGWindowID;
 use std::ffi::c_void;
@@ -12,10 +12,60 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_MESSAGING_TIMEOUT_SECONDS: f32 = 1.0;
+const AX_UI_ELEMENTS_FOR_SEARCH_PREDICATE: &str = "AXUIElementsForSearchPredicate";
+const AX_SEARCH_KEY: &str = "AXSearchKey";
+const AX_RESULTS_LIMIT: &str = "AXResultsLimit";
+const AX_DIRECTION: &str = "AXDirection";
+const AX_DIRECTION_NEXT: &str = "AXDirectionNext";
+const AX_DIRECTION_PREVIOUS: &str = "AXDirectionPrevious";
+
+pub const AX_SEARCH_KEY_BUTTON: &str = "AXButtonSearchKey";
+pub const AX_SEARCH_KEY_CHECKBOX: &str = "AXCheckBoxSearchKey";
+pub const AX_SEARCH_KEY_CONTROL: &str = "AXControlSearchKey";
+pub const AX_SEARCH_KEY_GRAPHIC: &str = "AXGraphicSearchKey";
+pub const AX_SEARCH_KEY_HEADING: &str = "AXHeadingSearchKey";
+pub const AX_SEARCH_KEY_LINK: &str = "AXLinkSearchKey";
+pub const AX_SEARCH_KEY_LIST: &str = "AXListSearchKey";
+pub const AX_SEARCH_KEY_RADIO_GROUP: &str = "AXRadioGroupSearchKey";
+pub const AX_SEARCH_KEY_STATIC_TEXT: &str = "AXStaticTextSearchKey";
+pub const AX_SEARCH_KEY_TABLE: &str = "AXTableSearchKey";
+pub const AX_SEARCH_KEY_TEXT_FIELD: &str = "AXTextFieldSearchKey";
 
 #[derive(Clone)]
 pub struct AxElement {
     inner: CFRetained<AXUIElement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxSearchDirection {
+    Next,
+    Previous,
+}
+
+impl AxSearchDirection {
+    fn as_ax_value(self) -> &'static str {
+        match self {
+            Self::Next => AX_DIRECTION_NEXT,
+            Self::Previous => AX_DIRECTION_PREVIOUS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AxSearchPredicate<'a> {
+    pub keys: &'a [&'a str],
+    pub limit: i32,
+    pub direction: AxSearchDirection,
+}
+
+impl<'a> AxSearchPredicate<'a> {
+    pub fn new(keys: &'a [&'a str], limit: i32) -> Self {
+        Self {
+            keys,
+            limit,
+            direction: AxSearchDirection::Next,
+        }
+    }
 }
 
 // AXUIElementRef is an opaque Core Foundation handle to a remote accessibility
@@ -119,6 +169,34 @@ impl AxElement {
         self.attribute_names().iter().any(|name| name == attribute)
     }
 
+    pub fn parameterized_attribute_names(&self) -> Vec<String> {
+        let mut names: *const CFArray = std::ptr::null();
+        let result = unsafe {
+            self.inner
+                .copy_parameterized_attribute_names(NonNull::new(&mut names).unwrap())
+        };
+        if result != AXError::Success || names.is_null() {
+            return Vec::new();
+        }
+
+        let names = NonNull::new(names as *mut CFArray as *mut CFArray<CFString>).unwrap();
+        let array: CFRetained<CFArray<CFString>> = unsafe { CFRetained::from_raw(names) };
+
+        (0..array.len())
+            .filter_map(|i| array.get(i).map(|name| name.to_string()))
+            .collect()
+    }
+
+    pub fn has_parameterized_attribute(&self, attribute: &str) -> bool {
+        self.parameterized_attribute_names()
+            .iter()
+            .any(|name| name == attribute)
+    }
+
+    pub fn supports_ui_elements_for_search_predicate(&self) -> bool {
+        self.has_parameterized_attribute(AX_UI_ELEMENTS_FOR_SEARCH_PREDICATE)
+    }
+
     pub fn attribute_string(&self, attribute: &str) -> Option<String> {
         self.copy_attribute_value(attribute)
             .ok()
@@ -200,6 +278,54 @@ impl AxElement {
         }
 
         elements
+    }
+
+    pub fn ui_elements_for_search_predicate(
+        &self,
+        predicate: AxSearchPredicate<'_>,
+    ) -> Vec<AxElement> {
+        if predicate.keys.is_empty() {
+            return Vec::new();
+        }
+
+        let search_key_values: Vec<CFRetained<CFString>> = predicate
+            .keys
+            .iter()
+            .map(|key| CFString::from_str(key))
+            .collect();
+        let search_key_refs: Vec<&CFString> =
+            search_key_values.iter().map(|key| key.as_ref()).collect();
+        let identifiers = CFArray::from_objects(&search_key_refs);
+
+        let search_key = CFString::from_str(AX_SEARCH_KEY);
+        let limit_key = CFString::from_str(AX_RESULTS_LIMIT);
+        let direction_key = CFString::from_str(AX_DIRECTION);
+        let direction_value = CFString::from_str(predicate.direction.as_ax_value());
+        let limit_value = CFNumber::new_i32(predicate.limit.max(1));
+
+        let keys: [&CFString; 3] = [&search_key, &limit_key, &direction_key];
+        let identifiers_value: &CFType = identifiers.as_ref();
+        let limit_value: &CFType = limit_value.as_ref();
+        let direction_value: &CFType = direction_value.as_ref();
+        let values: [&CFType; 3] = [identifiers_value, limit_value, direction_value];
+        let predicate = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+
+        let value = match self.copy_parameterized_attribute_value(
+            AX_UI_ELEMENTS_FOR_SEARCH_PREDICATE,
+            predicate.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+
+        let Ok(array) = value.downcast::<CFArray>() else {
+            return Vec::new();
+        };
+
+        let array: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(array) };
+        (0..array.len())
+            .filter_map(|i| array.get(i).map(Self::new))
+            .collect()
     }
 
     pub fn action_names(&self) -> Vec<String> {
@@ -331,6 +457,32 @@ impl AxElement {
         let result = unsafe {
             self.inner
                 .copy_attribute_value(&attr, NonNull::new(value_ptr).unwrap())
+        };
+
+        if result == AXError::Success && !value.is_null() {
+            let retained =
+                unsafe { CFRetained::from_raw(NonNull::new(value as *mut CFType).unwrap()) };
+            Ok(retained)
+        } else {
+            Err(AxErrorCode::from_ax_error(result))
+        }
+    }
+
+    fn copy_parameterized_attribute_value(
+        &self,
+        attribute: &str,
+        parameter: &CFType,
+    ) -> std::result::Result<CFRetained<CFType>, AxErrorCode> {
+        let attr = CFString::from_str(attribute);
+        let mut value: *const CFType = std::ptr::null();
+        let value_ptr: *mut *const CFType = &mut value;
+
+        let result = unsafe {
+            self.inner.copy_parameterized_attribute_value(
+                &attr,
+                parameter,
+                NonNull::new(value_ptr).unwrap(),
+            )
         };
 
         if result == AXError::Success && !value.is_null() {

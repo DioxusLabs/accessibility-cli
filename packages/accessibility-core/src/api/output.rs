@@ -157,6 +157,14 @@ pub fn escape_string(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
+fn format_attr_selector(name: &str, value: &str, max: usize) -> String {
+    let truncated = truncate(value, max);
+    let mut serialized = String::new();
+    cssparser::serialize_string(&truncated, &mut serialized)
+        .expect("serializing a CSS string into String should not fail");
+    format!("[{}={}]", name, serialized)
+}
+
 /// Print element summary for REPL/query output.
 pub fn print_element_summary(elem: &Element) {
     let role_str = format_role_short(elem.role);
@@ -199,26 +207,23 @@ pub fn format_element_selector(elem: &Element) -> String {
     let mut attrs: Vec<String> = Vec::new();
 
     if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format!("[title=\"{}\"]", truncate(title, 50)));
+        attrs.push(format_attr_selector("title", title, 50));
     }
 
     if let Some(desc) = elem.description.as_ref().filter(|s| !s.is_empty())
         && elem.title.as_deref() != Some(desc.as_str())
     {
-        attrs.push(format!("[description=\"{}\"]", truncate(desc, 50)));
+        attrs.push(format_attr_selector("description", desc, 50));
     }
 
     if let Some(value) = elem.value.as_ref().filter(|s| !s.is_empty())
         && elem.title.as_deref() != Some(value.as_str())
     {
-        attrs.push(format!(
-            "[value=\"{}\"]",
-            truncate(&escape_string(value), 40)
-        ));
+        attrs.push(format_attr_selector("value", value, 40));
     }
 
     if let Some(url) = elem.url.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format!("[url=\"{}\"]", truncate(url, 50)));
+        attrs.push(format_attr_selector("url", url, 50));
     }
 
     format!("{}{}", role_str, attrs.join(""))
@@ -631,54 +636,18 @@ fn print_menubar_llm(menubar: &Element) {
     println!("## [MenuBar]");
     for item in &menubar.children {
         if item.role == Role::MenuItem {
-            let label = item.display_label();
-            let actions = format_actions_short(&item.actions);
-            println!(
-                "  [{}] MenuItem \"{}\" {}",
-                item.id,
-                truncate(&label, 20),
-                actions
-            );
+            print_element_llm(item, 1);
         }
     }
 }
 
 fn print_element_llm(elem: &Element, indent: usize) {
+    println!("{}", format_element_llm_line(elem, indent));
+}
+
+fn format_element_llm_line(elem: &Element, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
-    let role_str = format_role_short(elem.role);
-
-    // Collect all non-empty attributes as CSS selector syntax [attr="value"]
-    let mut attrs: Vec<String> = Vec::new();
-
-    // Title
-    if let Some(title) = elem.title.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format!("[title=\"{}\"]", truncate(title, 50)));
-    }
-
-    // Description (only if different from title)
-    if let Some(desc) = elem.description.as_ref().filter(|s| !s.is_empty())
-        && elem.title.as_deref() != Some(desc.as_str())
-    {
-        attrs.push(format!("[description=\"{}\"]", truncate(desc, 50)));
-    }
-
-    // Value (only if different from title)
-    if let Some(value) = elem.value.as_ref().filter(|s| !s.is_empty())
-        && elem.title.as_deref() != Some(value.as_str())
-    {
-        attrs.push(format!(
-            "[value=\"{}\"]",
-            truncate(&escape_string(value), 40)
-        ));
-    }
-
-    // URL (for links)
-    if let Some(url) = elem.url.as_ref().filter(|s| !s.is_empty()) {
-        attrs.push(format!("[url=\"{}\"]", truncate(url, 50)));
-    }
-
-    // Format as CSS selector: Role[attr1="val1"][attr2="val2"]
-    let selector = format!("{}{}", role_str, attrs.join(""));
+    let selector = format_element_selector(elem);
 
     // Position
     let pos_str = elem
@@ -689,10 +658,10 @@ fn print_element_llm(elem: &Element, indent: usize) {
     // Actions
     let actions = format_actions_short(&elem.actions);
 
-    println!(
+    format!(
         "{}[{}] {}{} {}",
         prefix, elem.id, selector, pos_str, actions
-    );
+    )
 }
 
 fn collect_interactive<'a>(element: &'a Element, result: &mut Vec<&'a Element>) {
@@ -736,11 +705,7 @@ fn is_llm_relevant(elem: &Element) -> bool {
     }
 
     // Elements with clickable actions (AXPress, AXPick, AXConfirm)
-    let has_click_action = elem
-        .actions
-        .iter()
-        .any(|a| a == "AXPress" || a == "AXPick" || a == "AXConfirm");
-    if has_click_action && elem.bounds.is_some() {
+    if elem.has_activation_action() && elem.bounds.is_some() {
         return true;
     }
 

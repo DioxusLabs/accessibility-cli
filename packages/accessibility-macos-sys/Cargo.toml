@@ -21,6 +21,7 @@ objc2-foundation = "0.3"
 objc2-core-foundation = { version = "0.3", features = [
     "CFString",
     "CFArray",
+    "CFDictionary",
     "CFCGTypes",
     "CFBase",
     "CFRunLoop",
