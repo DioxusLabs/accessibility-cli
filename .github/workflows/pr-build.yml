@@ -219,6 +219,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
+      - name: Build Android Settings E2E
+        run: cargo test -p accessibility-core --test settings_android_e2e --no-run
       - name: Run Android Settings E2E
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -226,5 +228,5 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -no-metrics
           script: cargo test -p accessibility-core --test settings_android_e2e -- --ignored --nocapture --test-threads=1

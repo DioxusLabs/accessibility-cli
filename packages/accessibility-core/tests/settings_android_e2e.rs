@@ -18,9 +18,11 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 const SETTINGS_PACKAGE: &str = "com.android.settings";
+const SETTINGS_ACTION: &str = "android.settings.SETTINGS";
 const DEVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
-const UI_READY_TIMEOUT: Duration = Duration::from_secs(45);
-const POLL_INTERVAL: Duration = Duration::from_millis(750);
+const SETTINGS_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const UI_READY_TIMEOUT: Duration = Duration::from_secs(90);
+const POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 struct DeviceGuard {
@@ -69,6 +71,38 @@ fn stabilize_device(adb: &AdbClient) {
         "animator_duration_scale",
     ] {
         let _ = adb.shell(&["settings", "put", "global", setting, "0"]);
+    }
+}
+
+fn launch_settings(adb: &AdbClient) -> Result<()> {
+    adb.shell(&["am", "start", "-W", "-a", SETTINGS_ACTION])
+        .context("Failed to launch Android Settings")?;
+    Ok(())
+}
+
+fn wait_for_settings_foreground(adb: &AdbClient, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+
+    loop {
+        let observation = match adb.get_current_activity() {
+            Ok(activity) => {
+                if activity.contains(SETTINGS_PACKAGE) {
+                    return Ok(());
+                }
+                activity
+            }
+            Err(error) => error.to_string(),
+        };
+
+        if start.elapsed() >= timeout {
+            bail!(
+                "Android Settings did not become foreground within {} seconds: {}",
+                timeout.as_secs(),
+                observation
+            );
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -123,13 +157,11 @@ async fn reset_settings(accessibility: &mut AndroidAccessibility) -> Result<()> 
     let _ = accessibility.adb().stop_app(SETTINGS_PACKAGE);
     let _ = accessibility.wake_up().await;
     let _ = accessibility.press_home().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    accessibility
-        .launch_app(SETTINGS_PACKAGE)
-        .await
-        .context("Failed to launch Android Settings")?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    launch_settings(accessibility.adb())?;
+    wait_for_settings_foreground(accessibility.adb(), SETTINGS_FOREGROUND_TIMEOUT)?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     Ok(())
 }
 
@@ -197,8 +229,9 @@ async fn test_android_device_input_smoke() -> Result<()> {
     assert!(width > 0);
     assert!(height > 0);
 
-    accessibility.launch_app(SETTINGS_PACKAGE).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    launch_settings(accessibility.adb())?;
+    wait_for_settings_foreground(accessibility.adb(), SETTINGS_FOREGROUND_TIMEOUT)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let center_x = width as f64 / 2.0;
     let start_y = height as f64 * 0.7;

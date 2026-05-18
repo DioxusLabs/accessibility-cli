@@ -1069,10 +1069,10 @@ impl AccessibilityReader for LinuxAccessibility {
             Target::System => None,
             _ => bail!("Linux screenshot requires Target::Pid or Target::System"),
         };
-        if let Some(pid) = pid {
-            if let Ok(screenshot) = self.capture_window(pid) {
-                return Ok(screenshot);
-            }
+        if let Some(pid) = pid
+            && let Ok(screenshot) = self.capture_window(pid)
+        {
+            return Ok(screenshot);
         }
         LinuxAccessibility::capture_screen(self)
     }
