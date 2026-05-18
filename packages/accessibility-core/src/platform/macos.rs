@@ -208,6 +208,22 @@ impl BuildSeed {
 #[derive(Clone, Copy, Debug)]
 struct ChildDiscovery;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaterializationState {
+    NativeReady,
+    WebReady,
+    WebNeedsWait,
+}
+
+struct MaterializationContext<'a> {
+    pid: u32,
+    app: &'a AxElement,
+    app_name: Option<String>,
+    filter: &'a TreeFilter,
+    observer: Option<MaterializationObserver>,
+    root_requested: bool,
+}
+
 impl ChildDiscovery {
     const STRUCTURAL_ONLY: Self = Self;
     const ENRICHED: Self = Self;
@@ -737,7 +753,7 @@ impl MacOSAccessibility {
         manual || enhanced
     }
 
-    fn enable_full_accessibility_for_app(app: &AxElement) -> bool {
+    fn enable_accessibility_roots(app: &AxElement) -> bool {
         let mut requested = Self::enable_full_accessibility(app);
         for window in Self::get_application_windows(app) {
             requested |= Self::enable_full_accessibility(&window);
@@ -786,6 +802,20 @@ impl MacOSAccessibility {
                 .any(|window| Self::has_attribute_name(window, AX_ENHANCED_USER_INTERFACE))
     }
 
+    fn classify_materialization(tree: &ElementTree, pid: u32) -> MaterializationState {
+        if Self::tree_has_webview_content(tree) {
+            return MaterializationState::WebReady;
+        }
+
+        if Self::tree_has_webview_candidate(tree)
+            || accessibility_macos_sys::is_chromium_based_app(pid)
+        {
+            return MaterializationState::WebNeedsWait;
+        }
+
+        MaterializationState::NativeReady
+    }
+
     fn prepare_and_build_tree(
         &mut self,
         pid: u32,
@@ -794,52 +824,80 @@ impl MacOSAccessibility {
         filter: &TreeFilter,
     ) -> Result<ElementTree> {
         let observer = MaterializationObserver::start(pid, app);
-        let requested = Self::enable_full_accessibility_for_app(app);
+        let requested = Self::enable_accessibility_roots(app);
         Self::prime_accessibility_roots(app);
 
-        let mut tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
-        if Self::tree_has_webview_content(&tree) {
-            return Ok(tree);
+        let tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+        match Self::classify_materialization(&tree, pid) {
+            MaterializationState::NativeReady | MaterializationState::WebReady => Ok(tree),
+            MaterializationState::WebNeedsWait => self.materialize_web_content(
+                MaterializationContext {
+                    pid,
+                    app,
+                    app_name,
+                    filter,
+                    observer,
+                    root_requested: requested,
+                },
+                tree,
+            ),
         }
+    }
 
-        if !Self::tree_has_webview_candidate(&tree)
-            && !accessibility_macos_sys::is_chromium_based_app(pid)
-        {
-            return Ok(tree);
-        }
-
+    fn materialize_web_content(
+        &mut self,
+        context: MaterializationContext<'_>,
+        initial_tree: ElementTree,
+    ) -> Result<ElementTree> {
+        let mut tree = initial_tree;
         let targeted = self.enable_full_accessibility_for_cached_web_content();
         if targeted {
-            tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
-            if Self::tree_has_webview_content(&tree) {
+            tree = self.build_tree_snapshot(
+                context.pid,
+                context.app,
+                context.app_name.clone(),
+                context.filter,
+            )?;
+            if Self::classify_materialization(&tree, context.pid) == MaterializationState::WebReady
+            {
                 return Ok(tree);
             }
         }
 
-        if !requested && !targeted && !Self::has_full_accessibility_request(app) {
+        if !context.root_requested
+            && !targeted
+            && !Self::has_full_accessibility_request(context.app)
+        {
             return Ok(tree);
         }
 
         let deadline = std::time::Instant::now() + AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT;
-
         while std::time::Instant::now() < deadline {
             accessibility_macos_sys::run_default_loop_slice(
                 AX_ENHANCED_USER_INTERFACE_OBSERVER_SLICE_SECONDS,
                 true,
             );
-            if observer
+            if context
+                .observer
                 .as_ref()
                 .is_some_and(|observer| observer.take_notified())
             {
-                Self::prime_accessibility_roots(app);
-                tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
-                if Self::tree_has_webview_content(&tree) {
+                Self::prime_accessibility_roots(context.app);
+                tree = self.build_tree_snapshot(
+                    context.pid,
+                    context.app,
+                    context.app_name.clone(),
+                    context.filter,
+                )?;
+                if Self::classify_materialization(&tree, context.pid)
+                    == MaterializationState::WebReady
+                {
                     return Ok(tree);
                 }
             }
         }
 
-        self.build_tree_snapshot(pid, app, app_name, filter)
+        self.build_tree_snapshot(context.pid, context.app, context.app_name, context.filter)
     }
 
     fn build_tree_snapshot(
@@ -1422,7 +1480,7 @@ impl MacOSAccessibility {
     /// Get the main window for a given PID using accessibility APIs.
     fn get_window_for_pid(pid: u32) -> Option<AxElement> {
         let app = AxElement::application(pid);
-        Self::enable_full_accessibility_for_app(&app);
+        Self::enable_accessibility_roots(&app);
 
         for window in app.attribute_elements(AX_MAIN_WINDOW) {
             if let Some(bounds) = Self::get_bounds(&window)
@@ -1822,7 +1880,7 @@ impl AccessibilityReader for MacOSAccessibility {
 
                 let source = ax_observer.run_loop_source();
                 run_loop.add_default_source(&source);
-                Self::enable_full_accessibility_for_app(&app);
+                Self::enable_accessibility_roots(&app);
                 Self::prime_accessibility_roots(&app);
                 observer_source = Some(source);
                 observer = Some(ax_observer);
@@ -1836,7 +1894,7 @@ impl AccessibilityReader for MacOSAccessibility {
                     && let Some(pid) = pid
                 {
                     let app = AxElement::application(pid);
-                    Self::enable_full_accessibility_for_app(&app);
+                    Self::enable_accessibility_roots(&app);
                     Self::prime_accessibility_roots(&app);
                 }
 
