@@ -87,6 +87,7 @@ impl AndroidSettingsGuard {
 
         let config = AppConfig::new()
             .with_platform(Platform::Android)
+            .with_android_device()
             .with_timeout(UI_READY_TIMEOUT)
             .with_poll_interval(POLL_INTERVAL);
         let app = App::with_config(config)

@@ -3,18 +3,12 @@ use super::*;
 use crate::msft::input::{code_to_vk, send_key_event};
 
 impl WindowsAccessibility {
-    pub async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
+    pub async fn get_tree(&mut self, pid: u32, filter: &TreeFilter) -> Result<ElementTree> {
         // Clear previous state
         self.clear_cache();
         self.native_elements.clear();
 
-        // Get root element
-        let root_element = if let Some(pid) = pid {
-            self.find_root_for_pid(pid)?
-        } else {
-            // Get focused element's top-level window
-            unsafe { self.automation.GetFocusedElement()? }
-        };
+        let root_element = self.find_root_for_pid(pid)?;
 
         // Get app name
         let app_name: Option<String> = unsafe {
@@ -32,7 +26,7 @@ impl WindowsAccessibility {
 
         Ok(ElementTree {
             version: self.cache.version(),
-            pid,
+            pid: Some(pid),
             app_name,
             root,
             element_count,
@@ -143,19 +137,15 @@ impl WindowsAccessibility {
 
     // Platform adapter methods (merged from WindowsAdapter)
 
-    pub fn capture_screen_for_pid(&self, pid: Option<u32>) -> Result<Screenshot> {
-        if let Some(pid) = pid
-            && let Ok(screenshot) = WindowsAccessibility::capture_window(self, pid)
-        {
+    pub fn capture_screen_for_pid(&self, pid: u32) -> Result<Screenshot> {
+        if let Ok(screenshot) = WindowsAccessibility::capture_window(self, pid) {
             return Ok(screenshot);
         }
         WindowsAccessibility::capture_screen(self)
     }
 
-    pub async fn get_screen_bounds_for_pid(&self, pid: Option<u32>) -> Result<Rect> {
-        if let Some(pid) = pid
-            && let Some(bounds) = self.get_window_bounds_for_pid(pid)
-        {
+    pub async fn get_screen_bounds_for_pid(&self, pid: u32) -> Result<Rect> {
+        if let Some(bounds) = self.get_window_bounds_for_pid(pid) {
             return Ok(bounds);
         }
         Ok(Self::get_screen_bounds())
@@ -165,27 +155,11 @@ impl WindowsAccessibility {
         "Windows"
     }
 
-    pub async fn keystroke(
-        &mut self,
-        _pid: Option<u32>,
-        key: Code,
-        modifiers: Modifiers,
-    ) -> Result<()> {
-        // Windows doesn't support process-targeted input like macOS, so pid is ignored
+    pub async fn keystroke(&mut self, key: Code, modifiers: Modifiers) -> Result<()> {
         self.keystroke_internal(key, modifiers)
     }
 
-    pub async fn type_raw(&mut self, _pid: Option<u32>, _text: &str) -> Result<()> {
-        bail!("type_raw is implemented by accessibility-core")
-    }
-
-    pub async fn mouse_click_at(
-        &mut self,
-        _pid: Option<u32>,
-        x: f64,
-        y: f64,
-        button: MouseButton,
-    ) -> Result<()> {
+    pub async fn mouse_click_at(&mut self, x: f64, y: f64, button: MouseButton) -> Result<()> {
         // Send move + down + up as one atomic `SendInput` batch with absolute
         // coordinates on every event. Separate calls are flaky on UWP hosts
         // because the OS can coalesce or reorder them, dispatching the down
@@ -237,17 +211,17 @@ impl WindowsAccessibility {
         Ok(())
     }
 
-    pub async fn press_key(&mut self, _pid: Option<u32>, key: Code) -> Result<()> {
+    pub async fn press_key(&mut self, key: Code) -> Result<()> {
         let vk = code_to_vk(key);
         send_key_event(vk, false)
     }
 
-    pub async fn release_key(&mut self, _pid: Option<u32>, key: Code) -> Result<()> {
+    pub async fn release_key(&mut self, key: Code) -> Result<()> {
         let vk = code_to_vk(key);
         send_key_event(vk, true)
     }
 
-    pub async fn mouse_move(&mut self, _pid: Option<u32>, x: f64, y: f64) -> Result<()> {
+    pub async fn mouse_move(&mut self, x: f64, y: f64) -> Result<()> {
         // Get screen dimensions for absolute positioning
         let screen_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f64;
         let screen_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f64;
@@ -279,25 +253,16 @@ impl WindowsAccessibility {
         Ok(())
     }
 
-    pub async fn mouse_click(&mut self, _pid: Option<u32>, button: MouseButton) -> Result<()> {
+    pub async fn mouse_click(&mut self, button: MouseButton) -> Result<()> {
         self.mouse_click_internal(button)
     }
 
-    pub async fn mouse_double_click(
-        &mut self,
-        _pid: Option<u32>,
-        button: MouseButton,
-    ) -> Result<()> {
+    pub async fn mouse_double_click(&mut self, button: MouseButton) -> Result<()> {
         self.mouse_click_internal(button)?;
         self.mouse_click_internal(button)
     }
 
-    pub async fn mouse_scroll(
-        &mut self,
-        _pid: Option<u32>,
-        _delta_x: f64,
-        delta_y: f64,
-    ) -> Result<()> {
+    pub async fn mouse_scroll(&mut self, _delta_x: f64, delta_y: f64) -> Result<()> {
         // WHEEL_DELTA is 120. The mouseData field is interpreted as a signed value
         let wheel_delta_signed = (delta_y * 120.0) as i32;
         let wheel_delta = u32::from_ne_bytes(wheel_delta_signed.to_ne_bytes());

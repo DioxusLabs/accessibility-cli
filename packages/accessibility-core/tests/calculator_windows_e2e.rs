@@ -13,7 +13,9 @@
 
 #![cfg(target_os = "windows")]
 
-use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader, ListenerConfig};
+use accessibility_core::accessibility::{
+    AccessibilityEvent, AccessibilityReader, ListenerConfig, Target,
+};
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
 use accessibility_core::platform::msft::{
@@ -388,9 +390,9 @@ async fn test_calculator_screenshot() {
 /// Test capturing the entire screen.
 #[tokio::test]
 async fn test_screen_screenshot() {
-    let app = App::focused()
+    let app = App::system(Platform::Windows)
         .await
-        .expect("Failed to connect to focused app");
+        .expect("Failed to connect to Windows system scope");
 
     let screenshot = app.screenshot().await.expect("Failed to capture screen");
 
@@ -479,7 +481,12 @@ async fn test_calculator_mouse_click() {
         }
 
         input
-            .mouse_click_at(None, center.x, center.y, MouseButton::Left)
+            .mouse_click_at(
+                &Target::Pid(calc.pid),
+                center.x,
+                center.y,
+                MouseButton::Left,
+            )
             .await
             .expect("Failed to click");
 

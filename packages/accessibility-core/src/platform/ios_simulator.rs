@@ -15,7 +15,7 @@ use slotmap::SecondaryMap;
 
 use crate::accessibility::{
     AccessibilityReader, Element, ElementCache, ElementKey, ElementTree, Point, Rect, Screenshot,
-    Size, TreeFilter,
+    Size, Target, TreeFilter,
 };
 
 pub use sys::{ButtonDirection, HardwareButton};
@@ -229,7 +229,7 @@ impl IOSSimulatorAccessibility {
 impl AccessibilityReader for IOSSimulatorAccessibility {
     fn get_tree(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         filter: &TreeFilter,
     ) -> impl std::future::Future<Output = Result<ElementTree>> {
         future::ready(IOSSimulatorAccessibility::get_tree(self, filter))
@@ -276,13 +276,13 @@ impl AccessibilityReader for IOSSimulatorAccessibility {
         IOSSimulatorAccessibility::snapshot_version(self)
     }
 
-    fn capture_screen(&self, _pid: Option<u32>) -> Result<Screenshot> {
+    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
         IOSSimulatorAccessibility::capture_screen(self)
     }
 
     fn get_screen_bounds(
         &self,
-        _pid: Option<u32>,
+        _target: &Target,
     ) -> impl std::future::Future<Output = Result<Rect>> {
         future::ready(IOSSimulatorAccessibility::get_screen_bounds(self))
     }

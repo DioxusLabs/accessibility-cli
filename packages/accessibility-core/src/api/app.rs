@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::accessibility::{
-    Element, ElementTree, Rect, Screenshot, TargetedAccessibility, TreeFilter,
+    Element, ElementTree, Rect, Screenshot, Target, TargetedAccessibility, TreeFilter,
 };
 use crate::input::MouseButton;
 
@@ -14,13 +14,15 @@ use super::error::{Error, Result};
 use super::locator::Locator;
 use super::screenshot::AnnotatedScreenshot;
 
-fn require_app_pid(config: &AppConfig) -> Result<u32> {
-    config.pid.ok_or_else(|| Error::ConnectionFailed {
+fn invalid_target(config: &AppConfig, expected: &str) -> Error {
+    Error::ConnectionFailed {
         message: format!(
-            "{} app connections require a target PID; use App::connect(pid, platform) or AppConfig::with_pid(pid)",
-            config.platform.name()
+            "{} app connections require {}; got {:?}",
+            config.platform.name(),
+            expected,
+            config.target
         ),
-    })
+    }
 }
 
 /// Represents a connection to an application for accessibility automation.
@@ -66,12 +68,10 @@ impl App {
         Self::with_config(config).await
     }
 
-    /// Compatibility helper for platforms that do not use PID targeting.
-    ///
-    /// PID-targeted desktop platforms require explicit targeting; use
-    /// `App::connect(pid, platform)` for macOS, Windows, and Linux.
-    pub async fn focused() -> Result<Self> {
-        Self::with_config(AppConfig::default()).await
+    /// Connect to passive system scope for operations that do not address an app.
+    pub async fn system(platform: Platform) -> Result<Self> {
+        let config = AppConfig::default().with_platform(platform);
+        Self::with_config(config).await
     }
 
     /// Connect with a custom configuration.
@@ -85,57 +85,83 @@ impl App {
     /// ```
     pub async fn with_config(config: AppConfig) -> Result<Self> {
         let inner = Self::create_adapter(&config).await?;
+        Ok(Self::from_adapter(config, inner))
+    }
+
+    fn from_adapter(config: AppConfig, inner: TargetedAccessibility) -> Self {
         // Platform adapters wrap raw OS handles (e.g., AXUIElement, IUIAutomation)
         // that are not Send/Sync. The Arc/Mutex pair is for shared ownership within
         // a single runtime thread, not cross-thread movement.
         #[allow(clippy::arc_with_non_send_sync)]
         let inner = Arc::new(Mutex::new(inner));
-        Ok(Self {
+        Self {
             inner,
             config,
             #[allow(clippy::arc_with_non_send_sync)]
             cached_tree: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     /// Create the platform-specific adapter.
     async fn create_adapter(config: &AppConfig) -> Result<TargetedAccessibility> {
         match config.platform {
             #[cfg(target_os = "macos")]
-            Platform::MacOS => {
-                let pid = require_app_pid(config)?;
-                TargetedAccessibility::new_macos(pid).map_err(|e| Error::ConnectionFailed {
-                    message: format!("Failed to create macOS adapter: {}", e),
-                })
-            }
+            Platform::MacOS => match &config.target {
+                Target::Pid(pid) => {
+                    TargetedAccessibility::new_macos(*pid).map_err(|e| Error::ConnectionFailed {
+                        message: format!("Failed to create macOS adapter: {}", e),
+                    })
+                }
+                Target::System => {
+                    TargetedAccessibility::new_macos_system().map_err(|e| Error::ConnectionFailed {
+                        message: format!("Failed to create macOS adapter: {}", e),
+                    })
+                }
+                _ => Err(invalid_target(config, "Target::Pid(pid) or Target::System")),
+            },
             #[cfg(target_os = "macos")]
-            Platform::IOSSimulator => TargetedAccessibility::new_ios(config.udid.as_deref())
-                .map_err(|e| Error::ConnectionFailed {
-                    message: format!("Failed to create iOS Simulator adapter: {}", e),
-                }),
+            Platform::IOSSimulator => match &config.target {
+                Target::IosSimulator(target) => TargetedAccessibility::new_ios(target.clone())
+                    .map_err(|e| Error::ConnectionFailed {
+                        message: format!("Failed to create iOS Simulator adapter: {}", e),
+                    }),
+                _ => Err(invalid_target(config, "Target::IosSimulator(...)")),
+            },
             #[cfg(target_os = "windows")]
-            Platform::Windows => {
-                let pid = require_app_pid(config)?;
-                TargetedAccessibility::new_windows(pid).map_err(|e| Error::ConnectionFailed {
-                    message: format!("Failed to create Windows adapter: {}", e),
-                })
-            }
+            Platform::Windows => match &config.target {
+                Target::Pid(pid) => {
+                    TargetedAccessibility::new_windows(*pid).map_err(|e| Error::ConnectionFailed {
+                        message: format!("Failed to create Windows adapter: {}", e),
+                    })
+                }
+                Target::System => TargetedAccessibility::new_windows_system().map_err(|e| {
+                    Error::ConnectionFailed {
+                        message: format!("Failed to create Windows adapter: {}", e),
+                    }
+                }),
+                _ => Err(invalid_target(config, "Target::Pid(pid) or Target::System")),
+            },
             #[cfg(target_os = "linux")]
-            Platform::Linux => {
-                let pid = require_app_pid(config)?;
-                TargetedAccessibility::new_linux(pid)
+            Platform::Linux => match &config.target {
+                Target::Pid(pid) => TargetedAccessibility::new_linux(*pid).await.map_err(|e| {
+                    Error::ConnectionFailed {
+                        message: format!("Failed to create Linux adapter: {}", e),
+                    }
+                }),
+                Target::System => TargetedAccessibility::new_linux_system()
                     .await
                     .map_err(|e| Error::ConnectionFailed {
                         message: format!("Failed to create Linux adapter: {}", e),
-                    })
-            }
-            Platform::Android => {
-                TargetedAccessibility::new_android(config.android_serial.as_deref()).map_err(|e| {
-                    Error::ConnectionFailed {
+                    }),
+                _ => Err(invalid_target(config, "Target::Pid(pid) or Target::System")),
+            },
+            Platform::Android => match &config.target {
+                Target::Android(target) => TargetedAccessibility::new_android(target.clone())
+                    .map_err(|e| Error::ConnectionFailed {
                         message: format!("Failed to create Android adapter: {}", e),
-                    }
-                })
-            }
+                    }),
+                _ => Err(invalid_target(config, "Target::Android(...)")),
+            },
         }
     }
 
@@ -145,9 +171,9 @@ impl App {
         inner.platform_name()
     }
 
-    /// Get the target PID.
-    pub fn pid(&self) -> Option<u32> {
-        self.config.pid
+    /// Get the explicit target.
+    pub fn target(&self) -> &Target {
+        &self.config.target
     }
 
     /// Create a locator for finding elements.

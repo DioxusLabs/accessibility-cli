@@ -15,7 +15,9 @@ mod types;
 
 pub use cache::ElementCache;
 pub use query::{AccessibilityPseudoClass, Selector, find_matches, parse as parse_query};
-pub use targeted::TargetedAccessibility;
+#[cfg(target_os = "macos")]
+pub use targeted::IosSimulatorTarget;
+pub use targeted::{AndroidTarget, Target, TargetedAccessibility};
 pub use types::*;
 
 use crate::input::{Code, Modifiers, MouseButton};
@@ -32,17 +34,15 @@ use tokio::task::JoinHandle;
 /// - Windows: Uses UI Automation
 /// - Linux: Uses AT-SPI via D-Bus
 pub trait AccessibilityReader {
-    /// Snapshot the accessibility tree for an application.
+    /// Snapshot the accessibility tree for a target.
     ///
-    /// If `pid` is None, behavior is platform-specific. PID-targeted desktop
-    /// adapters require an explicit PID for app tree queries.
     /// The `filter` controls tree depth, element count limits, and filtering.
     ///
     /// Returns an `ElementTree` with all elements assigned sequential IDs.
     /// These IDs can be used with other methods until `clear_cache()` is called.
     fn get_tree(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         filter: &TreeFilter,
     ) -> impl std::future::Future<Output = Result<ElementTree>>;
 
@@ -93,21 +93,15 @@ pub trait AccessibilityReader {
 
     // Platform adapter methods (merged from PlatformAdapter trait)
 
-    /// Capture a screenshot of the screen or target window.
-    ///
-    /// If `pid` is Some, captures the window for that process.
-    /// If `pid` is None, captures the entire screen.
-    fn capture_screen(&self, _pid: Option<u32>) -> Result<Screenshot> {
+    /// Capture a screenshot for a target.
+    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
         anyhow::bail!("Screenshot not supported on this platform")
     }
 
-    /// Get the screen or window bounds for coordinate conversion.
-    ///
-    /// If `pid` is Some, returns the window bounds for that process.
-    /// If `pid` is None, returns the entire screen bounds.
+    /// Get bounds for coordinate conversion.
     fn get_screen_bounds(
         &self,
-        _pid: Option<u32>,
+        _target: &Target,
     ) -> impl std::future::Future<Output = Result<Rect>> {
         async { anyhow::bail!("Screen bounds not supported on this platform") }
     }
@@ -118,12 +112,9 @@ pub trait AccessibilityReader {
     }
 
     /// Send a keystroke with optional modifiers.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
-    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn keystroke(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _key: Code,
         _modifiers: Modifiers,
     ) -> impl std::future::Future<Output = Result<()>> {
@@ -131,24 +122,18 @@ pub trait AccessibilityReader {
     }
 
     /// Type raw text using keystroke simulation.
-    ///
-    /// If `pid` is Some, posts the events to that specific process (where supported).
-    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn type_raw(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _text: &str,
     ) -> impl std::future::Future<Output = Result<()>> {
         async { anyhow::bail!("Type raw not supported on this platform") }
     }
 
     /// Click mouse at screen coordinates.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
-    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn mouse_click_at(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _x: f64,
         _y: f64,
         _button: MouseButton,
@@ -159,32 +144,27 @@ pub trait AccessibilityReader {
     /// Press a key down (without releasing).
     ///
     /// Use `release_key` to release it later. Useful for holding modifiers.
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn press_key(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _key: Code,
     ) -> impl std::future::Future<Output = Result<()>> {
         async { anyhow::bail!("Press key not supported on this platform") }
     }
 
     /// Release a previously pressed key.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn release_key(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _key: Code,
     ) -> impl std::future::Future<Output = Result<()>> {
         async { anyhow::bail!("Release key not supported on this platform") }
     }
 
     /// Move the mouse to absolute screen coordinates.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn mouse_move(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _x: f64,
         _y: f64,
     ) -> impl std::future::Future<Output = Result<()>> {
@@ -192,22 +172,18 @@ pub trait AccessibilityReader {
     }
 
     /// Click a mouse button at the current position.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn mouse_click(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _button: MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
         async { anyhow::bail!("Mouse click not supported on this platform") }
     }
 
     /// Double-click a mouse button at the current position.
-    ///
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn mouse_double_click(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _button: MouseButton,
     ) -> impl std::future::Future<Output = Result<()>> {
         async { anyhow::bail!("Mouse double click not supported on this platform") }
@@ -216,10 +192,9 @@ pub trait AccessibilityReader {
     /// Scroll the mouse wheel.
     ///
     /// Positive delta scrolls up/left, negative scrolls down/right.
-    /// If `pid` is Some, posts the event to that specific process (where supported).
     fn mouse_scroll(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         _delta_x: f64,
         _delta_y: f64,
     ) -> impl std::future::Future<Output = Result<()>> {

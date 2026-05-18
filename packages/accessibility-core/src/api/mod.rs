@@ -8,7 +8,7 @@
 //!
 //! `accessibility-core` is pre-1.0 and the API surface in this module
 //! (`App`, `Locator`, `Error`, `Result`, `AppConfig`, `LocatorOptions`,
-//! `Platform`, `Element`) is considered the supported public API. Anything
+//! `Platform`, `Target`, `Element`) is considered the supported public API. Anything
 //! reachable only through `crate::accessibility::*` or `crate::platform::*`
 //! is implementation detail and may change between minor versions.
 //!
@@ -69,7 +69,9 @@ mod locator;
 mod output;
 mod screenshot;
 
-pub use crate::accessibility::Element;
+#[cfg(target_os = "macos")]
+pub use crate::accessibility::IosSimulatorTarget;
+pub use crate::accessibility::{AndroidTarget, Element, Target};
 pub use app::App;
 pub use config::{AppConfig, LocatorOptions, Platform};
 pub use error::{Error, Result};

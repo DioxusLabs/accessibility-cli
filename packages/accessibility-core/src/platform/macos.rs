@@ -8,7 +8,7 @@
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
     ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
-    StopReason, TreeFilter,
+    StopReason, Target, TreeFilter,
 };
 use crate::input::code_from_char;
 use accessibility_macos_sys::{
@@ -416,14 +416,9 @@ impl MacOSAccessibility {
     /// cannot wedge the caller indefinitely.
     fn get_tree_blocking_for_pid(
         &mut self,
-        pid: Option<u32>,
+        actual_pid: u32,
         filter: &TreeFilter,
     ) -> Result<ElementTree> {
-        let Some(actual_pid) = pid else {
-            bail!(
-                "macOS accessibility tree queries require a target pid; use --pid or list windows to choose a target"
-            );
-        };
         let app_element = AxElement::application(actual_pid);
         let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
 
@@ -1577,7 +1572,8 @@ impl AccessibilityReader for MacOSAccessibility {
         "macOS"
     }
 
-    async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
+    async fn get_tree(&mut self, target: &Target, filter: &TreeFilter) -> Result<ElementTree> {
+        let pid = target.require_pid("macOS", "accessibility tree queries")?;
         let filter = filter.clone();
         self.run_with_blocking_state(move |reader| reader.get_tree_blocking_for_pid(pid, &filter))
             .await
@@ -1694,17 +1690,13 @@ impl AccessibilityReader for MacOSAccessibility {
         self.cache.version()
     }
 
-    async fn keystroke(&mut self, pid: Option<u32>, key: Code, modifiers: Modifiers) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS keystroke requires a target pid");
-        };
+    async fn keystroke(&mut self, target: &Target, key: Code, modifiers: Modifiers) -> Result<()> {
+        let pid = target.require_pid("macOS", "keystroke")?;
         Self::post_keystroke(pid, key, modifiers)
     }
 
-    async fn type_raw(&mut self, pid: Option<u32>, text: &str) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS type_raw requires a target pid");
-        };
+    async fn type_raw(&mut self, target: &Target, text: &str) -> Result<()> {
+        let pid = target.require_pid("macOS", "type_raw")?;
         let text = text.to_string();
         Self::run_blocking_task(move || {
             for ch in text.chars() {
@@ -1725,35 +1717,27 @@ impl AccessibilityReader for MacOSAccessibility {
 
     async fn mouse_click_at(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         x: f64,
         y: f64,
         button: crate::input::MouseButton,
     ) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS mouse_click_at requires a target pid");
-        };
+        let pid = target.require_pid("macOS", "mouse_click_at")?;
         Self::post_mouse_click_sequence(pid, x, y, button, 1)
     }
 
-    async fn press_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS press_key requires a target pid");
-        };
+    async fn press_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("macOS", "press_key")?;
         Self::post_key_event(pid, key, Modifiers::empty(), true)
     }
 
-    async fn release_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS release_key requires a target pid");
-        };
+    async fn release_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("macOS", "release_key")?;
         Self::post_key_event(pid, key, Modifiers::empty(), false)
     }
 
-    async fn mouse_move(&mut self, pid: Option<u32>, x: f64, y: f64) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS mouse_move requires a target pid");
-        };
+    async fn mouse_move(&mut self, target: &Target, x: f64, y: f64) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_move")?;
         Self::post_mouse_event(
             pid,
             Point::new(x, y),
@@ -1766,12 +1750,10 @@ impl AccessibilityReader for MacOSAccessibility {
 
     async fn mouse_click(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         button: crate::input::MouseButton,
     ) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS mouse_click requires a target pid");
-        };
+        let pid = target.require_pid("macOS", "mouse_click")?;
         Self::run_blocking_task(move || {
             let point = Self::current_mouse_location()?;
             Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
@@ -1781,12 +1763,10 @@ impl AccessibilityReader for MacOSAccessibility {
 
     async fn mouse_double_click(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         button: crate::input::MouseButton,
     ) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS mouse_double_click requires a target pid");
-        };
+        let pid = target.require_pid("macOS", "mouse_double_click")?;
         Self::run_blocking_task(move || {
             let point = Self::current_mouse_location()?;
             Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
@@ -1796,10 +1776,8 @@ impl AccessibilityReader for MacOSAccessibility {
         .await
     }
 
-    async fn mouse_scroll(&mut self, pid: Option<u32>, delta_x: f64, delta_y: f64) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("macOS mouse_scroll requires a target pid");
-        };
+    async fn mouse_scroll(&mut self, target: &Target, delta_x: f64, delta_y: f64) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_scroll")?;
         accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y)
     }
 
@@ -1815,7 +1793,13 @@ impl AccessibilityReader for MacOSAccessibility {
         true
     }
 
-    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
+    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("macOS screenshot requires Target::Pid or Target::System"),
+        };
+
         if let Some(pid) = pid
             && let Ok(Some(screenshot)) = Self::capture_window_for_pid(pid)
         {
@@ -1836,7 +1820,12 @@ impl AccessibilityReader for MacOSAccessibility {
         Ok(screenshot)
     }
 
-    async fn get_screen_bounds(&self, pid: Option<u32>) -> Result<Rect> {
+    async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("macOS screen bounds require Target::Pid or Target::System"),
+        };
         Self::run_blocking_task(move || {
             Ok(pid
                 .and_then(Self::get_window_bounds_for_pid)
@@ -1914,7 +1903,7 @@ impl AccessibilityReader for MacOSAccessibility {
                     Self::prime_accessibility_roots(&app);
                 }
 
-                match reader.get_tree_blocking_for_pid(Some(pid), &TreeFilter::default()) {
+                match reader.get_tree_blocking_for_pid(pid, &TreeFilter::default()) {
                     Ok(tree) => {
                         let (values, focused) = MacOSAccessibility::listener_snapshots(&tree);
                         if let Some(ax_observer) = observer.as_ref() {

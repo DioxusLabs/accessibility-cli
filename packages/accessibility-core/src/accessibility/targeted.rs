@@ -1,4 +1,4 @@
-//! Targeted accessibility wrapper that stores a target PID and provides convenience methods.
+//! Targeted accessibility wrapper that stores an explicit target and provides convenience methods.
 
 use accesskit::Action;
 use anyhow::Result;
@@ -101,17 +101,63 @@ pub struct TargetedAccessibility {
     target: Target,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Target {
-    App(u32),
+/// Explicit target for a `TargetedAccessibility` reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Desktop application process target.
+    Pid(u32),
+    /// iOS Simulator target.
+    #[cfg(target_os = "macos")]
+    IosSimulator(IosSimulatorTarget),
+    /// Android target.
+    Android(AndroidTarget),
+    /// Passive system scope for operations that do not address an app.
     System,
 }
 
-impl Target {
-    fn pid(self) -> Option<u32> {
+/// iOS Simulator target selection.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IosSimulatorTarget {
+    /// Use the first booted simulator.
+    Booted,
+    /// Use a specific simulator UDID.
+    Udid(String),
+}
+
+#[cfg(target_os = "macos")]
+impl IosSimulatorTarget {
+    pub(crate) fn udid(&self) -> Option<&str> {
         match self {
-            Self::App(pid) => Some(pid),
-            Self::System => None,
+            Self::Booted => None,
+            Self::Udid(udid) => Some(udid.as_str()),
+        }
+    }
+}
+
+/// Android device target selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AndroidTarget {
+    /// Use the default connected device.
+    DefaultDevice,
+    /// Use a specific device serial from `adb devices`.
+    Serial(String),
+}
+
+impl AndroidTarget {
+    pub(crate) fn serial(&self) -> Option<&str> {
+        match self {
+            Self::DefaultDevice => None,
+            Self::Serial(serial) => Some(serial.as_str()),
+        }
+    }
+}
+
+impl Target {
+    pub(crate) fn require_pid(&self, platform: &str, operation: &str) -> Result<u32> {
+        match self {
+            Self::Pid(pid) => Ok(*pid),
+            _ => anyhow::bail!("{platform} {operation} requires Target::Pid"),
         }
     }
 }
@@ -125,7 +171,7 @@ impl TargetedAccessibility {
             inner: AccessibilityReaderImpl::MacOS(
                 crate::platform::macos::MacOSAccessibility::new()?
             ),
-            target: Target::App(pid),
+            target: Target::Pid(pid),
         })
     }
 
@@ -144,16 +190,13 @@ impl TargetedAccessibility {
     }
 
     /// Create a new iOS Simulator accessibility reader.
-    ///
-    /// The `udid` parameter identifies which simulator to target.
-    /// iOS doesn't use PID for targeting, so `target_pid` is always `None`.
     #[cfg(target_os = "macos")]
-    pub fn new_ios(udid: Option<&str>) -> Result<Self> {
+    pub fn new_ios(target: IosSimulatorTarget) -> Result<Self> {
         Ok(Self {
             inner: AccessibilityReaderImpl::IOSSimulator(
-                crate::platform::ios_simulator::IOSSimulatorAccessibility::new(udid)?,
+                crate::platform::ios_simulator::IOSSimulatorAccessibility::new(target.udid())?,
             ),
-            target: Target::System,
+            target: Target::IosSimulator(target),
         })
     }
 
@@ -164,7 +207,7 @@ impl TargetedAccessibility {
             inner: AccessibilityReaderImpl::Windows(
                 crate::platform::msft::WindowsAccessibility::new()?,
             ),
-            target: Target::App(pid),
+            target: Target::Pid(pid),
         })
     }
 
@@ -189,7 +232,7 @@ impl TargetedAccessibility {
             inner: AccessibilityReaderImpl::Linux(
                 crate::platform::x11::LinuxAccessibility::new().await?,
             ),
-            target: Target::App(pid),
+            target: Target::Pid(pid),
         })
     }
 
@@ -208,173 +251,125 @@ impl TargetedAccessibility {
     }
 
     /// Create a new Android accessibility reader.
-    ///
-    /// Android uses ADB and works on any host platform (macOS, Linux, Windows).
-    /// The `serial` parameter identifies which device to target (use `adb devices` to list).
-    /// If `serial` is None, uses the default (only) connected device.
-    ///
-    /// Note: Android doesn't use PID for targeting, so `target_pid` is always `None`.
-    pub fn new_android(serial: Option<&str>) -> Result<Self> {
+    pub fn new_android(target: AndroidTarget) -> Result<Self> {
         Ok(Self {
             inner: AccessibilityReaderImpl::Android(
-                crate::platform::android::AndroidAccessibility::new(serial)?,
+                crate::platform::android::AndroidAccessibility::new(target.serial())?,
             ),
-            target: Target::System,
+            target: Target::Android(target),
         })
     }
 
-    /// Get the target PID.
-    pub fn target_pid(&self) -> Option<u32> {
-        self.target.pid()
-    }
-
-    /// Set the target PID.
-    ///
-    /// This allows dynamically changing the target application without
-    /// creating a new accessibility reader.
-    pub fn set_target_pid(&mut self, pid: u32) {
-        self.target = Target::App(pid);
-    }
-
-    fn pid_target_platform_name(&self) -> Option<&'static str> {
-        match &self.inner {
-            #[cfg(target_os = "macos")]
-            AccessibilityReaderImpl::MacOS(_) => Some("macOS"),
-            #[cfg(target_os = "windows")]
-            AccessibilityReaderImpl::Windows(_) => Some("Windows"),
-            #[cfg(target_os = "linux")]
-            AccessibilityReaderImpl::Linux(_) => Some("Linux"),
-            _ => None,
-        }
-    }
-
-    fn ensure_target_pid(&self, operation: &str) -> Result<()> {
-        if let Some(platform) = self.pid_target_platform_name()
-            && self.target.pid().is_none()
-        {
-            anyhow::bail!(
-                "{operation} requires a target pid on {platform}; use an explicit --pid or construct the reader with a pid"
-            );
-        }
-
-        Ok(())
+    /// Get the explicit target.
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 }
 
-// Convenience methods that automatically use target_pid
+// Convenience methods that automatically use the stored target.
 impl TargetedAccessibility {
     /// Snapshot the accessibility tree for the target process.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn get_tree(&mut self, filter: &TreeFilter) -> Result<ElementTree> {
-        self.ensure_target_pid("get_tree")?;
-        dispatch_mut_async!(self, get_tree, self.target.pid(), filter)
+        dispatch_mut_async!(self, get_tree, &self.target, filter)
     }
 
     /// Capture a screenshot of the target window.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub fn capture_screen(&self) -> Result<Screenshot> {
-        dispatch!(self, capture_screen, self.target.pid())
+        dispatch!(self, capture_screen, &self.target)
     }
 
     /// Get the bounds of the target window.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn get_screen_bounds(&self) -> Result<Rect> {
         match &self.inner {
             #[cfg(target_os = "macos")]
             AccessibilityReaderImpl::MacOS(r) => {
-                AccessibilityReader::get_screen_bounds(r, self.target.pid()).await
+                AccessibilityReader::get_screen_bounds(r, &self.target).await
             }
             #[cfg(target_os = "macos")]
             AccessibilityReaderImpl::IOSSimulator(r) => {
-                AccessibilityReader::get_screen_bounds(r, self.target.pid()).await
+                AccessibilityReader::get_screen_bounds(r, &self.target).await
             }
             #[cfg(target_os = "windows")]
             AccessibilityReaderImpl::Windows(r) => {
-                AccessibilityReader::get_screen_bounds(r, self.target.pid()).await
+                AccessibilityReader::get_screen_bounds(r, &self.target).await
             }
             #[cfg(target_os = "linux")]
             AccessibilityReaderImpl::Linux(r) => {
-                AccessibilityReader::get_screen_bounds(r, self.target.pid()).await
+                AccessibilityReader::get_screen_bounds(r, &self.target).await
             }
             AccessibilityReaderImpl::Android(r) => {
-                AccessibilityReader::get_screen_bounds(r, self.target.pid()).await
+                AccessibilityReader::get_screen_bounds(r, &self.target).await
             }
         }
     }
 
     /// Send a keystroke to the target process.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn keystroke(&mut self, key: Code, modifiers: Modifiers) -> Result<()> {
-        self.ensure_target_pid("keystroke")?;
-        dispatch_mut_async!(self, keystroke, self.target.pid(), key, modifiers)
+        dispatch_mut_async!(self, keystroke, &self.target, key, modifiers)
     }
 
     /// Type raw text to the target process.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn type_raw(&mut self, text: &str) -> Result<()> {
-        self.ensure_target_pid("type_raw")?;
-        dispatch_mut_async!(self, type_raw, self.target.pid(), text)
+        dispatch_mut_async!(self, type_raw, &self.target, text)
     }
 
     /// Click mouse at coordinates (targeted to process where supported).
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn mouse_click_at(&mut self, x: f64, y: f64, button: MouseButton) -> Result<()> {
-        self.ensure_target_pid("mouse_click_at")?;
-        dispatch_mut_async!(self, mouse_click_at, self.target.pid(), x, y, button)
+        dispatch_mut_async!(self, mouse_click_at, &self.target, x, y, button)
     }
 
     /// Press a key down (without releasing).
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn press_key(&mut self, key: Code) -> Result<()> {
-        self.ensure_target_pid("press_key")?;
-        dispatch_mut_async!(self, press_key, self.target.pid(), key)
+        dispatch_mut_async!(self, press_key, &self.target, key)
     }
 
     /// Release a previously pressed key.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn release_key(&mut self, key: Code) -> Result<()> {
-        self.ensure_target_pid("release_key")?;
-        dispatch_mut_async!(self, release_key, self.target.pid(), key)
+        dispatch_mut_async!(self, release_key, &self.target, key)
     }
 
     /// Move the mouse to absolute screen coordinates.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn mouse_move(&mut self, x: f64, y: f64) -> Result<()> {
-        self.ensure_target_pid("mouse_move")?;
-        dispatch_mut_async!(self, mouse_move, self.target.pid(), x, y)
+        dispatch_mut_async!(self, mouse_move, &self.target, x, y)
     }
 
     /// Click a mouse button at the current position.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn mouse_click(&mut self, button: MouseButton) -> Result<()> {
-        self.ensure_target_pid("mouse_click")?;
-        dispatch_mut_async!(self, mouse_click, self.target.pid(), button)
+        dispatch_mut_async!(self, mouse_click, &self.target, button)
     }
 
     /// Double-click a mouse button at the current position.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn mouse_double_click(&mut self, button: MouseButton) -> Result<()> {
-        self.ensure_target_pid("mouse_double_click")?;
-        dispatch_mut_async!(self, mouse_double_click, self.target.pid(), button)
+        dispatch_mut_async!(self, mouse_double_click, &self.target, button)
     }
 
     /// Scroll the mouse wheel.
     ///
-    /// Uses the stored `target_pid` automatically.
+    /// Uses the stored target automatically.
     pub async fn mouse_scroll(&mut self, delta_x: f64, delta_y: f64) -> Result<()> {
-        self.ensure_target_pid("mouse_scroll")?;
-        dispatch_mut_async!(self, mouse_scroll, self.target.pid(), delta_x, delta_y)
+        dispatch_mut_async!(self, mouse_scroll, &self.target, delta_x, delta_y)
     }
 }
 
@@ -387,13 +382,11 @@ impl TargetedAccessibility {
 
     /// Perform an action on an element.
     pub async fn perform_action(&mut self, id: ElementKey, action: Action) -> Result<()> {
-        self.ensure_target_pid("perform_action")?;
         dispatch_mut_async!(self, perform_action, id, action)
     }
 
     /// Set the value of an element.
     pub async fn set_value(&mut self, id: ElementKey, value: &str) -> Result<()> {
-        self.ensure_target_pid("set_value")?;
         dispatch_mut_async!(self, set_value, id, value)
     }
 
@@ -476,21 +469,16 @@ impl TargetedAccessibility {
 
     /// Start listening for events.
     ///
-    /// Uses `ListenerConfig::pid` when set, otherwise uses the stored target PID.
+    /// Uses `ListenerConfig::pid` when set, otherwise uses the stored target.
     pub fn start_listening(
         &mut self,
         mut config: ListenerConfig,
         callback: Box<dyn FnMut(AccessibilityEvent) + Send + 'static>,
     ) -> Result<ListenerHandle> {
-        if let Some(platform) = self.pid_target_platform_name()
-            && config.pid.is_none()
+        if config.pid.is_none()
+            && let Target::Pid(pid) = &self.target
         {
-            config.pid = self.target.pid();
-            if config.pid.is_none() {
-                anyhow::bail!(
-                    "start_listening requires a target pid on {platform}; construct the reader with a pid or set ListenerConfig::with_pid(pid)"
-                );
-            }
+            config.pid = Some(*pid);
         }
         dispatch_mut!(self, start_listening, config, callback)
     }

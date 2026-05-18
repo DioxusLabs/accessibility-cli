@@ -16,7 +16,7 @@
 
 use accessibility_core::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ListenerConfig,
-    TreeFilter,
+    Target, TreeFilter,
 };
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
@@ -293,7 +293,7 @@ async fn wait_for_display_value(app: &App, expected: &str) -> Result<String, Str
 async fn click_calculator_buttons_fast(calc: &CalculatorGuard, sequence: &[&str]) {
     let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
     let tree = accessibility
-        .get_tree(Some(calc.pid), &TreeFilter::default())
+        .get_tree(&Target::Pid(calc.pid), &TreeFilter::default())
         .await
         .expect("Failed to get Calculator accessibility tree");
 
@@ -505,7 +505,7 @@ async fn test_screen_screenshot() {
     let accessibility = MacOSAccessibility::new().expect("Failed to create accessibility reader");
 
     let screenshot = accessibility
-        .capture_screen(None)
+        .capture_screen(&Target::System)
         .expect("Failed to capture screen");
 
     // Screen should have reasonable dimensions (at least 800x600)
@@ -584,7 +584,7 @@ async fn test_calculator_mouse_scroll_keeps_focus() {
     // chance to promote Calculator to key.
     for _ in 0..3 {
         accessibility
-            .mouse_scroll(Some(calc.pid), 0.0, -3.0)
+            .mouse_scroll(&Target::Pid(calc.pid), 0.0, -3.0)
             .await
             .expect("mouse_scroll failed");
         tokio::time::sleep(Duration::from_millis(20)).await;

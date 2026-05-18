@@ -6,7 +6,7 @@
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
     ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
-    StopReason, StructureChangeType, TreeFilter,
+    StopReason, StructureChangeType, Target, TreeFilter,
 };
 use accessibility_linux_sys::atspi::proxy::accessible::AccessibleProxy;
 use accessibility_linux_sys::atspi::proxy::action::ActionProxy;
@@ -797,7 +797,7 @@ impl LinuxAccessibility {
 }
 
 impl AccessibilityReader for LinuxAccessibility {
-    async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
+    async fn get_tree(&mut self, target: &Target, filter: &TreeFilter) -> Result<ElementTree> {
         // Clear previous cache
         self.clear_cache();
 
@@ -814,9 +814,7 @@ impl AccessibilityReader for LinuxAccessibility {
             .map_err(|e| anyhow!("Failed to get root accessible: {}", e))?;
 
         // Find target application
-        let Some(target_pid) = pid else {
-            bail!("Linux accessibility tree queries require a target pid");
-        };
+        let target_pid = target.require_pid("Linux", "accessibility tree queries")?;
         let (app_handle, actual_pid) = Self::find_app_by_pid(&conn, &root, target_pid)
             .await
             .ok_or_else(|| anyhow!("Application with PID {} not found", target_pid))?;
@@ -1065,16 +1063,26 @@ impl AccessibilityReader for LinuxAccessibility {
 
     // Platform adapter methods (merged from LinuxAdapter)
 
-    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
-        if let Some(pid) = pid
-            && let Ok(screenshot) = self.capture_window(pid)
-        {
-            return Ok(screenshot);
+    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("Linux screenshot requires Target::Pid or Target::System"),
+        };
+        if let Some(pid) = pid {
+            if let Ok(screenshot) = self.capture_window(pid) {
+                return Ok(screenshot);
+            }
         }
         LinuxAccessibility::capture_screen(self)
     }
 
-    async fn get_screen_bounds(&self, pid: Option<u32>) -> Result<Rect> {
+    async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("Linux screen bounds requires Target::Pid or Target::System"),
+        };
         if let Some(pid) = pid {
             if let Some(bounds) = self.get_window_bounds_for_pid_via_atspi(pid).await {
                 if bounds.origin.x == 0.0

@@ -16,7 +16,7 @@ use slotmap::SecondaryMap;
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
     ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
-    StopReason, StructureChangeType, TreeFilter,
+    StopReason, StructureChangeType, Target, TreeFilter,
 };
 use crate::input::{Code, Modifiers, MouseButton, code_from_char};
 
@@ -77,20 +77,10 @@ impl WindowsAccessibility {
         self.inner.capture_screen().map(from_sys_screenshot)
     }
 
-    async fn get_tree_for_pid(
-        &mut self,
-        pid: Option<u32>,
-        filter: &TreeFilter,
-    ) -> Result<ElementTree> {
+    async fn get_tree_for_pid(&mut self, pid: u32, filter: &TreeFilter) -> Result<ElementTree> {
         self.clear_local_cache();
 
-        let Some(pid) = pid else {
-            bail!("Windows accessibility tree queries require a target pid");
-        };
-        let sys_tree = self
-            .inner
-            .get_tree(Some(pid), &to_sys_filter(filter))
-            .await?;
+        let sys_tree = self.inner.get_tree(pid, &to_sys_filter(filter)).await?;
         let root = self.map_element(&sys_tree.root);
         let element_count = count_elements(&root);
 
@@ -154,7 +144,8 @@ impl WindowsAccessibility {
 }
 
 impl AccessibilityReader for WindowsAccessibility {
-    async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
+    async fn get_tree(&mut self, target: &Target, filter: &TreeFilter) -> Result<ElementTree> {
+        let pid = target.require_pid("Windows", "accessibility tree queries")?;
         self.get_tree_for_pid(pid, filter).await
     }
 
@@ -189,34 +180,37 @@ impl AccessibilityReader for WindowsAccessibility {
         self.cache.version()
     }
 
-    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
-        self.inner
-            .capture_screen_for_pid(pid)
-            .map(from_sys_screenshot)
+    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
+        let screenshot = match target {
+            Target::Pid(pid) => self.inner.capture_screen_for_pid(*pid),
+            Target::System => self.inner.capture_screen(),
+            _ => bail!("Windows screenshot requires Target::Pid or Target::System"),
+        };
+        screenshot.map(from_sys_screenshot)
     }
 
-    async fn get_screen_bounds(&self, pid: Option<u32>) -> Result<Rect> {
-        self.inner
-            .get_screen_bounds_for_pid(pid)
-            .await
-            .map(|rect| from_sys_rect(&rect))
+    async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {
+        let bounds = match target {
+            Target::Pid(pid) => self.inner.get_screen_bounds_for_pid(*pid).await?,
+            Target::System => sys::WindowsAccessibility::get_screen_bounds(),
+            _ => bail!("Windows screen bounds require Target::Pid or Target::System"),
+        };
+        Ok(from_sys_rect(&bounds))
     }
 
     fn platform_name(&self) -> &'static str {
         "Windows"
     }
 
-    async fn keystroke(&mut self, pid: Option<u32>, key: Code, modifiers: Modifiers) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows keystroke requires a target pid");
-        };
-        self.inner.keystroke(Some(pid), key, modifiers).await
+    async fn keystroke(&mut self, target: &Target, key: Code, modifiers: Modifiers) -> Result<()> {
+        let pid = target.require_pid("Windows", "keystroke")?;
+        self.focus_window(pid)?;
+        self.inner.keystroke(key, modifiers).await
     }
 
-    async fn type_raw(&mut self, pid: Option<u32>, text: &str) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows type_raw requires a target pid");
-        };
+    async fn type_raw(&mut self, target: &Target, text: &str) -> Result<()> {
+        let pid = target.require_pid("Windows", "type_raw")?;
+        self.focus_window(pid)?;
         for c in text.chars() {
             if let Some((key, needs_shift)) = code_from_char(c) {
                 let modifiers = if needs_shift {
@@ -224,7 +218,7 @@ impl AccessibilityReader for WindowsAccessibility {
                 } else {
                     Modifiers::empty()
                 };
-                self.inner.keystroke(Some(pid), key, modifiers).await?;
+                self.inner.keystroke(key, modifiers).await?;
             }
         }
         Ok(())
@@ -232,63 +226,54 @@ impl AccessibilityReader for WindowsAccessibility {
 
     async fn mouse_click_at(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         x: f64,
         y: f64,
         button: MouseButton,
     ) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows mouse_click_at requires a target pid");
-        };
+        let pid = target.require_pid("Windows", "mouse_click_at")?;
+        self.focus_window(pid)?;
         self.inner
-            .mouse_click_at(Some(pid), x, y, to_sys_mouse_button(button))
+            .mouse_click_at(x, y, to_sys_mouse_button(button))
             .await
     }
 
-    async fn press_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows press_key requires a target pid");
-        };
-        self.inner.press_key(Some(pid), key).await
+    async fn press_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("Windows", "press_key")?;
+        self.focus_window(pid)?;
+        self.inner.press_key(key).await
     }
 
-    async fn release_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows release_key requires a target pid");
-        };
-        self.inner.release_key(Some(pid), key).await
+    async fn release_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("Windows", "release_key")?;
+        self.focus_window(pid)?;
+        self.inner.release_key(key).await
     }
 
-    async fn mouse_move(&mut self, pid: Option<u32>, x: f64, y: f64) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows mouse_move requires a target pid");
-        };
-        self.inner.mouse_move(Some(pid), x, y).await
+    async fn mouse_move(&mut self, target: &Target, x: f64, y: f64) -> Result<()> {
+        let pid = target.require_pid("Windows", "mouse_move")?;
+        self.focus_window(pid)?;
+        self.inner.mouse_move(x, y).await
     }
 
-    async fn mouse_click(&mut self, pid: Option<u32>, button: MouseButton) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows mouse_click requires a target pid");
-        };
+    async fn mouse_click(&mut self, target: &Target, button: MouseButton) -> Result<()> {
+        let pid = target.require_pid("Windows", "mouse_click")?;
+        self.focus_window(pid)?;
+        self.inner.mouse_click(to_sys_mouse_button(button)).await
+    }
+
+    async fn mouse_double_click(&mut self, target: &Target, button: MouseButton) -> Result<()> {
+        let pid = target.require_pid("Windows", "mouse_double_click")?;
+        self.focus_window(pid)?;
         self.inner
-            .mouse_click(Some(pid), to_sys_mouse_button(button))
+            .mouse_double_click(to_sys_mouse_button(button))
             .await
     }
 
-    async fn mouse_double_click(&mut self, pid: Option<u32>, button: MouseButton) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows mouse_double_click requires a target pid");
-        };
-        self.inner
-            .mouse_double_click(Some(pid), to_sys_mouse_button(button))
-            .await
-    }
-
-    async fn mouse_scroll(&mut self, pid: Option<u32>, delta_x: f64, delta_y: f64) -> Result<()> {
-        let Some(pid) = pid else {
-            bail!("Windows mouse_scroll requires a target pid");
-        };
-        self.inner.mouse_scroll(Some(pid), delta_x, delta_y).await
+    async fn mouse_scroll(&mut self, target: &Target, delta_x: f64, delta_y: f64) -> Result<()> {
+        let pid = target.require_pid("Windows", "mouse_scroll")?;
+        self.focus_window(pid)?;
+        self.inner.mouse_scroll(delta_x, delta_y).await
     }
 
     fn supports_keystroke(&self) -> bool {

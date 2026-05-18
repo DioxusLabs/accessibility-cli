@@ -656,11 +656,12 @@ impl AdbClient {
     }
 
     fn dump_ui_via_file(&self) -> Result<String> {
-        let tmp_path = "/sdcard/window_dump.xml";
+        let tmp_path = "/data/local/tmp/window_dump.xml";
 
+        let _ = self.shell(&["rm", "-f", tmp_path]);
         self.shell(&["uiautomator", "dump", tmp_path])?;
         let xml = self.shell(&["cat", tmp_path])?;
-        let _ = self.shell(&["rm", tmp_path]);
+        let _ = self.shell(&["rm", "-f", tmp_path]);
 
         if let Some(start) = xml.find("<?xml") {
             Ok(xml[start..].to_string())

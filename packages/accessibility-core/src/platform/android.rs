@@ -35,7 +35,7 @@
 //! let mut reader = AndroidAccessibility::new(None)?;
 //!
 //! // Get the UI tree
-//! let tree = reader.get_tree(None, &TreeFilter::default()).await?;
+//! let tree = reader.get_tree(&Target::Android(AndroidTarget::DefaultDevice), &TreeFilter::default()).await?;
 //! println!("{:?}", tree);
 //!
 //! // Press the back button
@@ -52,7 +52,7 @@ use slotmap::SecondaryMap;
 
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
-    ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
+    ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size, Target,
     TreeFilter,
 };
 use crate::input::{Code, Modifiers, MouseButton};
@@ -559,7 +559,7 @@ impl AndroidAccessibility {
 impl AccessibilityReader for AndroidAccessibility {
     fn get_tree(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         filter: &TreeFilter,
     ) -> impl Future<Output = Result<ElementTree>> {
         async move {
@@ -702,7 +702,7 @@ impl AccessibilityReader for AndroidAccessibility {
         self.cache.version()
     }
 
-    fn capture_screen(&self, _pid: Option<u32>) -> Result<Screenshot> {
+    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
         let data = self.adb.screenshot()?;
 
         // Get image dimensions from PNG header
@@ -723,7 +723,7 @@ impl AccessibilityReader for AndroidAccessibility {
         })
     }
 
-    fn get_screen_bounds(&self, _pid: Option<u32>) -> impl Future<Output = Result<Rect>> {
+    fn get_screen_bounds(&self, _target: &Target) -> impl Future<Output = Result<Rect>> {
         async move {
             let (width, height) = self.screen_size.ok_or_else(|| {
                 anyhow!("Screen size not available. Call refresh_screen_size() first.")
@@ -741,7 +741,7 @@ impl AccessibilityReader for AndroidAccessibility {
 
     fn keystroke(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         key: Code,
         modifiers: Modifiers,
     ) -> impl Future<Output = Result<()>> {
@@ -771,7 +771,7 @@ impl AccessibilityReader for AndroidAccessibility {
         }
     }
 
-    fn type_raw(&mut self, _pid: Option<u32>, text: &str) -> impl Future<Output = Result<()>> {
+    fn type_raw(&mut self, _target: &Target, text: &str) -> impl Future<Output = Result<()>> {
         async move {
             self.adb.input_text(text)?;
             Ok(())
@@ -780,7 +780,7 @@ impl AccessibilityReader for AndroidAccessibility {
 
     fn mouse_click_at(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         x: f64,
         y: f64,
         _button: MouseButton,
@@ -794,7 +794,7 @@ impl AccessibilityReader for AndroidAccessibility {
 
     fn mouse_scroll(
         &mut self,
-        _pid: Option<u32>,
+        _target: &Target,
         delta_x: f64,
         delta_y: f64,
     ) -> impl Future<Output = Result<()>> {

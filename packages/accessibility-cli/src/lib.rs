@@ -27,9 +27,11 @@
 //! accessibility-cli --platform android --adb-swipe 100,200,100,800  # Swipe on Android
 //! ```
 
+#[cfg(target_os = "macos")]
+use accessibility_core::accessibility::IosSimulatorTarget;
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, Element, ElementKey, ElementTree, ListenerConfig,
-    Rect, TargetedAccessibility, TreeFilter,
+    AccessibilityEvent, AccessibilityEventType, AndroidTarget, Element, ElementKey, ElementTree,
+    ListenerConfig, Rect, TargetedAccessibility, TreeFilter,
 };
 use accessibility_core::api::{
     OutputFormat, OutputPrinter, annotate_elements, decode_screenshot, draw_grid_overlay,
@@ -980,10 +982,6 @@ async fn handle_event_listening(adapter: &mut TargetedAccessibility, args: &Comm
 
     // Build config with optional event type filter
     let mut config = ListenerConfig::new().with_buffer_size(256);
-
-    if let Some(pid) = adapter.target_pid() {
-        config = config.with_pid(pid);
-    }
 
     if let Some(filter_strs) = &args.listen_filter {
         let event_types: Vec<AccessibilityEventType> = filter_strs
@@ -2029,7 +2027,11 @@ pub async fn run_cli(cli: &Cli) {
             }
 
             // For common operations, use TargetedAccessibility
-            let mut adapter = match TargetedAccessibility::new_ios(cli.udid.as_deref()) {
+            let ios_target = match cli.udid.as_deref() {
+                Some(udid) => IosSimulatorTarget::Udid(udid.to_owned()),
+                None => IosSimulatorTarget::Booted,
+            };
+            let mut adapter = match TargetedAccessibility::new_ios(ios_target) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create iOS adapter: {}", e);
@@ -2107,7 +2109,11 @@ pub async fn run_cli(cli: &Cli) {
             }
 
             // For common operations, use TargetedAccessibility
-            let mut adapter = match TargetedAccessibility::new_android(cli.serial.as_deref()) {
+            let android_target = match cli.serial.as_deref() {
+                Some(serial) => AndroidTarget::Serial(serial.to_owned()),
+                None => AndroidTarget::DefaultDevice,
+            };
+            let mut adapter = match TargetedAccessibility::new_android(android_target) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Android adapter: {}", e);
