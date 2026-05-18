@@ -1,9 +1,13 @@
 //! Low-level ADB wrappers used by accessibility-cli's Android backend.
 
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use keyboard_types::Code;
+
+const UI_DUMP_ATTEMPTS: usize = 3;
+const UI_DUMP_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Android key codes for `input keyevent` command.
 ///
@@ -639,19 +643,41 @@ impl AdbClient {
 
     /// Dump the UI hierarchy as XML.
     pub fn dump_ui(&self) -> Result<String> {
+        let mut last_error = None;
+
+        for attempt in 1..=UI_DUMP_ATTEMPTS {
+            match self.dump_ui_once() {
+                Ok(xml) => return Ok(xml),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < UI_DUMP_ATTEMPTS {
+                        std::thread::sleep(UI_DUMP_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+
+        Err(last_error.expect("UI dump should be attempted")).context(format!(
+            "Failed to dump Android UI after {UI_DUMP_ATTEMPTS} attempts"
+        ))
+    }
+
+    fn dump_ui_once(&self) -> Result<String> {
         let result = self.shell(&["uiautomator", "dump", "/dev/tty"]);
 
         match result {
-            Ok(xml) => {
-                if let Some(start) = xml.find("<?xml") {
-                    Ok(xml[start..].to_string())
-                } else if let Some(start) = xml.find("<hierarchy") {
-                    Ok(xml[start..].to_string())
-                } else {
-                    self.dump_ui_via_file()
-                }
-            }
-            Err(_) => self.dump_ui_via_file(),
+            Ok(output) => match extract_ui_xml(&output) {
+                Some(xml) => Ok(xml),
+                None => self.dump_ui_via_file().with_context(|| {
+                    format!(
+                        "direct uiautomator dump did not contain XML: {}",
+                        truncate_for_error(&output)
+                    )
+                }),
+            },
+            Err(error) => self
+                .dump_ui_via_file()
+                .with_context(|| format!("direct uiautomator dump failed: {error}")),
         }
     }
 
@@ -659,19 +685,24 @@ impl AdbClient {
         let tmp_path = "/data/local/tmp/window_dump.xml";
 
         let _ = self.shell(&["rm", "-f", tmp_path]);
-        self.shell(&["uiautomator", "dump", tmp_path])?;
-        let xml = self.shell(&["cat", tmp_path])?;
+        let dump_output = self.shell(&["uiautomator", "dump", tmp_path])?;
+        if let Some(xml) = extract_ui_xml(&dump_output) {
+            let _ = self.shell(&["rm", "-f", tmp_path]);
+            return Ok(xml);
+        }
+
+        let xml = self.shell(&["cat", tmp_path]).with_context(|| {
+            format!(
+                "uiautomator dump did not create readable file at {tmp_path}; dump output: {}",
+                truncate_for_error(&dump_output)
+            )
+        })?;
         let _ = self.shell(&["rm", "-f", tmp_path]);
 
-        if let Some(start) = xml.find("<?xml") {
-            Ok(xml[start..].to_string())
-        } else if let Some(start) = xml.find("<hierarchy") {
-            Ok(xml[start..].to_string())
+        if let Some(xml) = extract_ui_xml(&xml) {
+            Ok(xml)
         } else {
-            bail!(
-                "Failed to parse UI dump XML: {}",
-                &xml[..xml.len().min(200)]
-            );
+            bail!("Failed to parse UI dump XML: {}", truncate_for_error(&xml));
         }
     }
 
@@ -758,6 +789,28 @@ pub fn escape_shell_text(text: &str) -> String {
     result
 }
 
+fn extract_ui_xml(output: &str) -> Option<String> {
+    output
+        .find("<?xml")
+        .or_else(|| output.find("<hierarchy"))
+        .map(|start| output[start..].to_string())
+}
+
+fn truncate_for_error(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut chars = trimmed.chars();
+    let truncated = chars.by_ref().take(200).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +821,19 @@ mod tests {
         assert_eq!(escape_shell_text("hello world"), "hello%sworld");
         assert_eq!(escape_shell_text("test$var"), "test\\$var");
         assert_eq!(escape_shell_text("a&b"), "a\\&b");
+    }
+
+    #[test]
+    fn test_extract_ui_xml() {
+        assert_eq!(
+            extract_ui_xml("UI dump\n<?xml version=\"1.0\" ?><hierarchy />"),
+            Some("<?xml version=\"1.0\" ?><hierarchy />".to_string())
+        );
+        assert_eq!(
+            extract_ui_xml("Noise <hierarchy rotation=\"0\" />"),
+            Some("<hierarchy rotation=\"0\" />".to_string())
+        );
+        assert_eq!(extract_ui_xml("UI hierchary dumped to file"), None);
     }
 
     #[test]
