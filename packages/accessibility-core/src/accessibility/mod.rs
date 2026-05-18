@@ -34,7 +34,8 @@ use tokio::task::JoinHandle;
 pub trait AccessibilityReader {
     /// Snapshot the accessibility tree for an application.
     ///
-    /// If `pid` is None, queries the focused application.
+    /// If `pid` is None, behavior is platform-specific. PID-targeted desktop
+    /// adapters require an explicit PID for app tree queries.
     /// The `filter` controls tree depth, element count limits, and filtering.
     ///
     /// Returns an `ElementTree` with all elements assigned sequential IDs.
@@ -119,7 +120,7 @@ pub trait AccessibilityReader {
     /// Send a keystroke with optional modifiers.
     ///
     /// If `pid` is Some, posts the event to that specific process (where supported).
-    /// If `pid` is None, posts the event globally.
+    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn keystroke(
         &mut self,
         _pid: Option<u32>,
@@ -132,7 +133,7 @@ pub trait AccessibilityReader {
     /// Type raw text using keystroke simulation.
     ///
     /// If `pid` is Some, posts the events to that specific process (where supported).
-    /// If `pid` is None, posts the events globally.
+    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn type_raw(
         &mut self,
         _pid: Option<u32>,
@@ -144,7 +145,7 @@ pub trait AccessibilityReader {
     /// Click mouse at screen coordinates.
     ///
     /// If `pid` is Some, posts the event to that specific process (where supported).
-    /// If `pid` is None, posts the event globally.
+    /// If `pid` is None, behavior is platform-specific; macOS rejects it.
     fn mouse_click_at(
         &mut self,
         _pid: Option<u32>,

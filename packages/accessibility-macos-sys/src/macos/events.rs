@@ -13,7 +13,7 @@ pub fn current_mouse_location() -> Result<Point> {
 }
 
 pub fn post_keyboard_event(
-    pid: Option<u32>,
+    pid: u32,
     key_code: u16,
     modifiers: ModifierFlags,
     key_down: bool,
@@ -26,7 +26,7 @@ pub fn post_keyboard_event(
 
 #[allow(clippy::too_many_arguments)]
 pub fn post_mouse_event(
-    pid: Option<u32>,
+    pid: u32,
     window_id: Option<WindowId>,
     x: f64,
     y: f64,
@@ -44,7 +44,7 @@ pub fn post_mouse_event(
     post_event(pid, &event)
 }
 
-pub fn post_scroll_event(pid: Option<u32>, delta_x: f64, delta_y: f64) -> Result<()> {
+pub fn post_scroll_event(pid: u32, delta_x: f64, delta_y: f64) -> Result<()> {
     let event = CGEvent::new_scroll_wheel_event2(
         None,
         CGScrollEventUnit::Pixel,
@@ -104,26 +104,24 @@ fn mouse_button_number(button: MouseButton) -> i64 {
 
 fn configure_mouse_event(
     event: &CGEvent,
-    pid: Option<u32>,
+    pid: u32,
     window_id: Option<WindowId>,
     button: MouseButton,
     click_state: i64,
     pressure: f64,
 ) {
-    if let Some(pid) = pid {
-        set_event_target_pid(event, pid);
-        if let Some(window_id) = window_id {
-            CGEvent::set_integer_value_field(
-                Some(event),
-                CGEventField::MouseEventWindowUnderMousePointer,
-                window_id.0 as i64,
-            );
-            CGEvent::set_integer_value_field(
-                Some(event),
-                CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
-                window_id.0 as i64,
-            );
-        }
+    set_event_target_pid(event, pid);
+    if let Some(window_id) = window_id {
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventWindowUnderMousePointer,
+            window_id.0 as i64,
+        );
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+            window_id.0 as i64,
+        );
     }
 
     CGEvent::set_integer_value_field(
@@ -144,10 +142,7 @@ fn set_event_target_pid(event: &CGEvent, pid: u32) {
     );
 }
 
-fn post_event(pid: Option<u32>, event: &CGEvent) -> Result<()> {
-    let pid = pid.ok_or_else(|| {
-        anyhow!("post_event requires a target pid on macOS (SkyLight has no global path)")
-    })?;
+fn post_event(pid: u32, event: &CGEvent) -> Result<()> {
     if !post_event_to_pid_via_skylight(pid, event) {
         bail!(
             "SkyLight SLEventPostToPid is unavailable; refusing to fall back to a focus-stealing post"

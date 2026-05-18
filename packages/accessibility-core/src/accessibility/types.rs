@@ -493,7 +493,8 @@ pub enum AccessibilityEventType {
 pub struct ListenerConfig {
     /// Event types to subscribe to. `None` means all events.
     pub event_types: Option<Vec<AccessibilityEventType>>,
-    /// Target PID. `None` uses the reader's target_pid.
+    /// Target PID for raw listeners. `TargetedAccessibility` fills this from
+    /// its stored PID when omitted.
     pub pid: Option<u32>,
     /// Size of the event channel buffer. Default: 256.
     pub buffer_size: usize,

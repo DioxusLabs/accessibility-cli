@@ -17,6 +17,7 @@
 //! ```text
 //! accessibility-cli --platform mac --pid 123 --llm           # Query specific macOS app
 //! accessibility-cli --platform mac --pid 123 --mouse-click 300,240  # Targeted macOS click
+//! accessibility-cli --platform mac --pid 123 --key "cmd+c" "[title=Username]"  # Targeted macOS key
 //! accessibility-cli --platform win --pid 123 --llm           # Query specific Windows app
 //! accessibility-cli --platform ios --udid ABC --annotate     # Annotated iOS screenshot
 //! accessibility-cli --platform ios --hid-tap 100,200         # HID tap on iOS Simulator
@@ -968,11 +969,7 @@ fn parse_event_type(s: &str) -> Option<AccessibilityEventType> {
 }
 
 /// Handle event listening mode.
-async fn handle_event_listening(
-    adapter: &mut TargetedAccessibility,
-    args: &CommonArgs,
-    target_pid: Option<u32>,
-) {
+async fn handle_event_listening(adapter: &mut TargetedAccessibility, args: &CommonArgs) {
     if !adapter.supports_event_listening() {
         eprintln!(
             "Event listening is not supported on {}",
@@ -984,9 +981,7 @@ async fn handle_event_listening(
     // Build config with optional event type filter
     let mut config = ListenerConfig::new().with_buffer_size(256);
 
-    // Honor --pid: start_listening reads the PID from ListenerConfig, not the
-    // adapter's target PID, so without this every process' events would stream in.
-    if let Some(pid) = target_pid {
+    if let Some(pid) = adapter.target_pid() {
         config = config.with_pid(pid);
     }
 
@@ -1249,7 +1244,6 @@ async fn run_platform(
     args: &CommonArgs,
     filter: &TreeFilter,
     hit_test_coords: Option<(f64, f64)>,
-    target_pid: Option<u32>,
 ) {
     if args.list_windows {
         handle_list_windows(adapter, args).await;
@@ -1258,7 +1252,7 @@ async fn run_platform(
 
     // Handle event listening mode
     if args.listen {
-        handle_event_listening(adapter, args, target_pid).await;
+        handle_event_listening(adapter, args).await;
         return;
     }
 
@@ -1270,6 +1264,11 @@ async fn run_platform(
 
     if let Some(click) = &args.mouse_click {
         handle_mouse_click(adapter, click).await;
+        return;
+    }
+
+    if let Some((x, y)) = hit_test_coords {
+        handle_hit_test(adapter, x, y).await;
         return;
     }
 
@@ -1339,12 +1338,6 @@ async fn run_platform(
             }
         };
 
-        // Handle hit test if coordinates provided
-        if let Some((x, y)) = hit_test_coords {
-            handle_hit_test(adapter, x, y).await;
-            return;
-        }
-
         // Handle annotate mode (with tree)
         if args.annotate || args.screenshot {
             handle_annotate(adapter, &tree, args).await;
@@ -1386,9 +1379,9 @@ Usage:
 Examples:
     accessibility-cli --platform mac --pid 123 --llm                    # Query specific macOS app
     accessibility-cli --platform mac --pid 123 --mouse-click 300,240    # Background pixel click on macOS
-    accessibility-cli --platform mac --key "cmd+c" "[title=Username]"   # Send Cmd+C to username field
+    accessibility-cli --platform mac --pid 123 --key "cmd+c" "[title=Username]"   # Send Cmd+C to username field
     accessibility-cli --platform win --pid 123 --llm                    # Query specific Windows app
-    accessibility-cli --platform win --key "ctrl+c" "[title=Username]"  # Send Ctrl+C to username field
+    accessibility-cli --platform win --pid 123 --key "ctrl+c" "[title=Username]"  # Send Ctrl+C to username field
     accessibility-cli --platform ios --udid ABC --annotate              # Annotated iOS screenshot
     accessibility-cli --platform linux --pid 123 --llm                  # Query specific Linux app
     accessibility-cli --platform android --serial ABC --llm             # Query Android device
@@ -1402,8 +1395,10 @@ pub struct Cli {
     #[arg(long, short = 'p', value_enum, default_value_t = PlatformType::default())]
     pub platform: PlatformType,
 
-    /// Target application by process ID (default: focused app)
-    /// Used for mac, win, linux platforms
+    /// Target application by process ID
+    /// Required for mac, win, and linux app tree/control/listen operations.
+    /// Use --list-windows to discover PIDs.
+    /// Used for mac, win, linux platforms.
     #[arg(long)]
     pub pid: Option<u32>,
 
@@ -1914,7 +1909,42 @@ fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
     if adb_set && cli.platform != PlatformType::Android {
         return Err("--adb-* flags require --platform android".into());
     }
+
+    if let Some(platform_name) = pid_target_platform_name(cli.platform)
+        && cli.pid.is_none()
+        && !pid_target_operation_allows_missing_pid(cli)
+    {
+        return Err(format!(
+            "{platform_name} app operations require --pid; use --list-windows to find a target PID"
+        ));
+    }
+
     Ok(())
+}
+
+fn pid_target_platform_name(platform: PlatformType) -> Option<&'static str> {
+    match platform {
+        #[cfg(target_os = "macos")]
+        PlatformType::MacOS => Some("macOS"),
+        #[cfg(not(target_os = "macos"))]
+        PlatformType::MacOS => None,
+        #[cfg(target_os = "windows")]
+        PlatformType::Windows => Some("Windows"),
+        #[cfg(not(target_os = "windows"))]
+        PlatformType::Windows => None,
+        #[cfg(target_os = "linux")]
+        PlatformType::Linux => Some("Linux"),
+        #[cfg(not(target_os = "linux"))]
+        PlatformType::Linux => None,
+        PlatformType::IOS | PlatformType::Android => None,
+    }
+}
+
+fn pid_target_operation_allows_missing_pid(cli: &Cli) -> bool {
+    cli.common.list_windows
+        || cli.common.screenshot_screen
+        || (cli.common.overlay && !cli.common.annotate)
+        || cli.hit.is_some()
 }
 
 pub async fn run_cli(cli: &Cli) {
@@ -1957,14 +1987,18 @@ pub async fn run_cli(cli: &Cli) {
                 std::process::exit(1);
             }
 
-            let mut adapter = match TargetedAccessibility::new_macos(cli.pid) {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_macos(pid),
+                None => TargetedAccessibility::new_macos_system(),
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create macOS adapter: {}", e);
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
         }
 
         #[cfg(target_os = "macos")]
@@ -2002,24 +2036,32 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, None, None).await;
+            run_platform(&mut adapter, &cli.common, &filter, None).await;
         }
 
         #[cfg(target_os = "windows")]
         PlatformType::Windows => {
-            let mut adapter = match TargetedAccessibility::new_windows(cli.pid) {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_windows(pid),
+                None => TargetedAccessibility::new_windows_system(),
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Windows adapter: {}", e);
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
         }
 
         #[cfg(target_os = "linux")]
         PlatformType::Linux => {
-            let mut adapter = match TargetedAccessibility::new_linux(cli.pid).await {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_linux(pid).await,
+                None => TargetedAccessibility::new_linux_system().await,
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Linux adapter: {}", e);
@@ -2030,7 +2072,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, cli.hit, cli.pid).await;
+            run_platform(&mut adapter, &cli.common, &filter, cli.hit).await;
         }
 
         // Android works on all host platforms via ADB
@@ -2072,7 +2114,7 @@ pub async fn run_cli(cli: &Cli) {
                     std::process::exit(1);
                 }
             };
-            run_platform(&mut adapter, &cli.common, &filter, None, None).await;
+            run_platform(&mut adapter, &cli.common, &filter, None).await;
         }
 
         // Unsupported platform combinations

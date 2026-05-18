@@ -124,6 +124,48 @@ fn adb_flag_rejected_on_non_android_platform() {
         ));
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[test]
+fn pid_target_app_operations_require_pid_before_backend_startup() {
+    let platform = if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(target_os = "windows") {
+        "win"
+    } else {
+        "linux"
+    };
+
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["--platform", platform, "--llm"],
+        vec![
+            "--platform",
+            platform,
+            "--click",
+            "Button",
+            "--timeout",
+            "0",
+        ],
+        vec![
+            "--platform",
+            platform,
+            "--key",
+            "enter",
+            "TextField",
+            "--timeout",
+            "0",
+        ],
+        vec!["--platform", platform, "--mouse-click", "10,10"],
+    ];
+
+    for args in cases {
+        let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+        cmd.args(args).assert().failure().stderr(
+            predicate::str::contains("app operations require --pid")
+                .and(predicate::str::contains("--list-windows")),
+        );
+    }
+}
+
 #[test]
 fn adb_swipe_invalid_duration_rejected() {
     // Regression for silently-defaulted duration: 'abc' must error, not run at 300ms.

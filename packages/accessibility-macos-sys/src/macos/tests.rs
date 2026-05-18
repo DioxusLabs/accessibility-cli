@@ -210,8 +210,8 @@ fn exercise_event_api(pid: u32, window_id: Option<WindowId>) {
         alt: true,
         meta: true,
     };
-    assert_anyhow_result(post_keyboard_event(Some(pid), 0, modifiers, false));
-    assert_anyhow_result(post_scroll_event(Some(pid), 0.0, 0.0));
+    assert_anyhow_result(post_keyboard_event(pid, 0, modifiers, false));
+    assert_anyhow_result(post_scroll_event(pid, 0.0, 0.0));
     for button_kind in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         for event_kind in [
             MouseEventKind::Move,
@@ -219,7 +219,7 @@ fn exercise_event_api(pid: u32, window_id: Option<WindowId>) {
             MouseEventKind::Up,
         ] {
             assert_anyhow_result(post_mouse_event(
-                Some(pid),
+                pid,
                 window_id,
                 -1.0,
                 -1.0,
@@ -417,9 +417,9 @@ fn public_api_runs_against_real_dialog_process() {
             "text field value write should trigger AXValueChanged"
         );
 
-        post_keyboard_event(Some(pid), 0, ModifierFlags::default(), false)
+        post_keyboard_event(pid, 0, ModifierFlags::default(), false)
             .expect("per-pid key-up post should succeed");
-        post_scroll_event(Some(pid), 0.0, 0.0).expect("per-pid scroll post should succeed");
+        post_scroll_event(pid, 0.0, 0.0).expect("per-pid scroll post should succeed");
         for button_kind in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
             for event_kind in [
                 MouseEventKind::Move,
@@ -427,7 +427,7 @@ fn public_api_runs_against_real_dialog_process() {
                 MouseEventKind::Up,
             ] {
                 post_mouse_event(
-                    Some(pid),
+                    pid,
                     Some(window_id),
                     -1.0,
                     -1.0,

@@ -51,7 +51,10 @@ pub struct AppConfig {
     /// Target platform.
     pub platform: Platform,
 
-    /// Process ID to target (None for focused app).
+    /// Process ID to target.
+    ///
+    /// macOS, Windows, and Linux app connections require this to be set.
+    /// Platforms without process IDs use their platform-specific target fields.
     pub pid: Option<u32>,
 
     /// Simulator UDID for iOS (macOS only).

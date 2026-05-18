@@ -14,6 +14,15 @@ use super::error::{Error, Result};
 use super::locator::Locator;
 use super::screenshot::AnnotatedScreenshot;
 
+fn require_app_pid(config: &AppConfig) -> Result<u32> {
+    config.pid.ok_or_else(|| Error::ConnectionFailed {
+        message: format!(
+            "{} app connections require a target PID; use App::connect(pid, platform) or AppConfig::with_pid(pid)",
+            config.platform.name()
+        ),
+    })
+}
+
 /// Represents a connection to an application for accessibility automation.
 ///
 /// This is the main entry point for the Playwright-like API. Create an `App`
@@ -57,12 +66,10 @@ impl App {
         Self::with_config(config).await
     }
 
-    /// Connect to the focused application on the current platform.
+    /// Compatibility helper for platforms that do not use PID targeting.
     ///
-    /// # Example
-    /// ```ignore
-    /// let app = App::focused().await?;
-    /// ```
+    /// PID-targeted desktop platforms require explicit targeting; use
+    /// `App::connect(pid, platform)` for macOS, Windows, and Linux.
     pub async fn focused() -> Result<Self> {
         Self::with_config(AppConfig::default()).await
     }
@@ -96,7 +103,8 @@ impl App {
         match config.platform {
             #[cfg(target_os = "macos")]
             Platform::MacOS => {
-                TargetedAccessibility::new_macos(config.pid).map_err(|e| Error::ConnectionFailed {
+                let pid = require_app_pid(config)?;
+                TargetedAccessibility::new_macos(pid).map_err(|e| Error::ConnectionFailed {
                     message: format!("Failed to create macOS adapter: {}", e),
                 })
             }
@@ -106,17 +114,21 @@ impl App {
                     message: format!("Failed to create iOS Simulator adapter: {}", e),
                 }),
             #[cfg(target_os = "windows")]
-            Platform::Windows => TargetedAccessibility::new_windows(config.pid).map_err(|e| {
-                Error::ConnectionFailed {
+            Platform::Windows => {
+                let pid = require_app_pid(config)?;
+                TargetedAccessibility::new_windows(pid).map_err(|e| Error::ConnectionFailed {
                     message: format!("Failed to create Windows adapter: {}", e),
-                }
-            }),
+                })
+            }
             #[cfg(target_os = "linux")]
-            Platform::Linux => TargetedAccessibility::new_linux(config.pid)
-                .await
-                .map_err(|e| Error::ConnectionFailed {
-                    message: format!("Failed to create Linux adapter: {}", e),
-                }),
+            Platform::Linux => {
+                let pid = require_app_pid(config)?;
+                TargetedAccessibility::new_linux(pid)
+                    .await
+                    .map_err(|e| Error::ConnectionFailed {
+                        message: format!("Failed to create Linux adapter: {}", e),
+                    })
+            }
             Platform::Android => {
                 TargetedAccessibility::new_android(config.android_serial.as_deref()).map_err(|e| {
                     Error::ConnectionFailed {

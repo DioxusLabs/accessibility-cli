@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 
 use accessibility_windows_sys as sys;
 use accesskit::Action;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use slotmap::SecondaryMap;
 
 use crate::accessibility::{
@@ -84,7 +84,13 @@ impl WindowsAccessibility {
     ) -> Result<ElementTree> {
         self.clear_local_cache();
 
-        let sys_tree = self.inner.get_tree(pid, &to_sys_filter(filter)).await?;
+        let Some(pid) = pid else {
+            bail!("Windows accessibility tree queries require a target pid");
+        };
+        let sys_tree = self
+            .inner
+            .get_tree(Some(pid), &to_sys_filter(filter))
+            .await?;
         let root = self.map_element(&sys_tree.root);
         let element_count = count_elements(&root);
 
@@ -201,10 +207,16 @@ impl AccessibilityReader for WindowsAccessibility {
     }
 
     async fn keystroke(&mut self, pid: Option<u32>, key: Code, modifiers: Modifiers) -> Result<()> {
-        self.inner.keystroke(pid, key, modifiers).await
+        let Some(pid) = pid else {
+            bail!("Windows keystroke requires a target pid");
+        };
+        self.inner.keystroke(Some(pid), key, modifiers).await
     }
 
     async fn type_raw(&mut self, pid: Option<u32>, text: &str) -> Result<()> {
+        let Some(pid) = pid else {
+            bail!("Windows type_raw requires a target pid");
+        };
         for c in text.chars() {
             if let Some((key, needs_shift)) = code_from_char(c) {
                 let modifiers = if needs_shift {
@@ -212,7 +224,7 @@ impl AccessibilityReader for WindowsAccessibility {
                 } else {
                     Modifiers::empty()
                 };
-                self.inner.keystroke(pid, key, modifiers).await?;
+                self.inner.keystroke(Some(pid), key, modifiers).await?;
             }
         }
         Ok(())
@@ -225,37 +237,58 @@ impl AccessibilityReader for WindowsAccessibility {
         y: f64,
         button: MouseButton,
     ) -> Result<()> {
+        let Some(pid) = pid else {
+            bail!("Windows mouse_click_at requires a target pid");
+        };
         self.inner
-            .mouse_click_at(pid, x, y, to_sys_mouse_button(button))
+            .mouse_click_at(Some(pid), x, y, to_sys_mouse_button(button))
             .await
     }
 
     async fn press_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        self.inner.press_key(pid, key).await
+        let Some(pid) = pid else {
+            bail!("Windows press_key requires a target pid");
+        };
+        self.inner.press_key(Some(pid), key).await
     }
 
     async fn release_key(&mut self, pid: Option<u32>, key: Code) -> Result<()> {
-        self.inner.release_key(pid, key).await
+        let Some(pid) = pid else {
+            bail!("Windows release_key requires a target pid");
+        };
+        self.inner.release_key(Some(pid), key).await
     }
 
     async fn mouse_move(&mut self, pid: Option<u32>, x: f64, y: f64) -> Result<()> {
-        self.inner.mouse_move(pid, x, y).await
+        let Some(pid) = pid else {
+            bail!("Windows mouse_move requires a target pid");
+        };
+        self.inner.mouse_move(Some(pid), x, y).await
     }
 
     async fn mouse_click(&mut self, pid: Option<u32>, button: MouseButton) -> Result<()> {
+        let Some(pid) = pid else {
+            bail!("Windows mouse_click requires a target pid");
+        };
         self.inner
-            .mouse_click(pid, to_sys_mouse_button(button))
+            .mouse_click(Some(pid), to_sys_mouse_button(button))
             .await
     }
 
     async fn mouse_double_click(&mut self, pid: Option<u32>, button: MouseButton) -> Result<()> {
+        let Some(pid) = pid else {
+            bail!("Windows mouse_double_click requires a target pid");
+        };
         self.inner
-            .mouse_double_click(pid, to_sys_mouse_button(button))
+            .mouse_double_click(Some(pid), to_sys_mouse_button(button))
             .await
     }
 
     async fn mouse_scroll(&mut self, pid: Option<u32>, delta_x: f64, delta_y: f64) -> Result<()> {
-        self.inner.mouse_scroll(pid, delta_x, delta_y).await
+        let Some(pid) = pid else {
+            bail!("Windows mouse_scroll requires a target pid");
+        };
+        self.inner.mouse_scroll(Some(pid), delta_x, delta_y).await
     }
 
     fn supports_keystroke(&self) -> bool {

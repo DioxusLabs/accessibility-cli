@@ -814,15 +814,12 @@ impl AccessibilityReader for LinuxAccessibility {
             .map_err(|e| anyhow!("Failed to get root accessible: {}", e))?;
 
         // Find target application
-        let (app_handle, actual_pid) = if let Some(target_pid) = pid {
-            Self::find_app_by_pid(&conn, &root, target_pid)
-                .await
-                .ok_or_else(|| anyhow!("Application with PID {} not found", target_pid))?
-        } else {
-            Self::find_focused_app(&conn, &root)
-                .await
-                .ok_or_else(|| anyhow!("No focused application found"))?
+        let Some(target_pid) = pid else {
+            bail!("Linux accessibility tree queries require a target pid");
         };
+        let (app_handle, actual_pid) = Self::find_app_by_pid(&conn, &root, target_pid)
+            .await
+            .ok_or_else(|| anyhow!("Application with PID {} not found", target_pid))?;
 
         // Get app name
         let app_proxy =
@@ -1111,8 +1108,10 @@ impl AccessibilityReader for LinuxAccessibility {
         config: ListenerConfig,
         callback: Box<dyn FnMut(AccessibilityEvent) + Send + 'static>,
     ) -> Result<ListenerHandle> {
-        // Use PID from config (optional for Linux - can listen globally)
-        let target_pid = config.pid;
+        let Some(target_pid) = config.pid else {
+            return Err(anyhow!("Linux event listening requires a target pid"));
+        };
+        let target_pid = Some(target_pid);
 
         // Create stop flag
         let stop_flag = Arc::new(AtomicBool::new(false));
