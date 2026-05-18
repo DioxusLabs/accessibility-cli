@@ -21,7 +21,8 @@ const SETTINGS_PACKAGE: &str = "com.android.settings";
 const SETTINGS_ACTION: &str = "android.settings.SETTINGS";
 const DEVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTINGS_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
-const UI_READY_TIMEOUT: Duration = Duration::from_secs(90);
+const UI_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const SETTINGS_RELAUNCH_INTERVAL: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
@@ -75,7 +76,8 @@ fn stabilize_device(adb: &AdbClient) {
 }
 
 fn launch_settings(adb: &AdbClient) -> Result<()> {
-    adb.shell(&[
+    let launcher_result = adb.launch_app(SETTINGS_PACKAGE, None);
+    let settings_result = adb.shell(&[
         "am",
         "start",
         "-W",
@@ -83,8 +85,17 @@ fn launch_settings(adb: &AdbClient) -> Result<()> {
         SETTINGS_ACTION,
         "-p",
         SETTINGS_PACKAGE,
-    ])
-    .context("Failed to launch Android Settings")?;
+    ]);
+
+    match (launcher_result, settings_result) {
+        (Ok(()), _) | (_, Ok(_)) => {}
+        (Err(launcher_error), Err(settings_error)) => {
+            return Err(settings_error).context(format!(
+                "Failed to launch Android Settings; launcher fallback also failed: {launcher_error}"
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -148,7 +159,7 @@ impl AndroidSettingsGuard {
             .await
             .context("Failed to connect to Android accessibility adapter")?;
 
-        let tree = wait_for_settings_tree(&app, UI_READY_TIMEOUT).await?;
+        let tree = wait_for_settings_tree(&app, &device.adb, UI_READY_TIMEOUT).await?;
         println!(
             "Settings tree ready: {} elements, {} labels",
             tree.element_count,
@@ -185,8 +196,13 @@ async fn reset_settings(accessibility: &mut AndroidAccessibility) -> Result<()> 
     Ok(())
 }
 
-async fn wait_for_settings_tree(app: &App, timeout: Duration) -> Result<ElementTree> {
+async fn wait_for_settings_tree(
+    app: &App,
+    adb: &AdbClient,
+    timeout: Duration,
+) -> Result<ElementTree> {
     let start = Instant::now();
+    let mut next_relaunch = SETTINGS_RELAUNCH_INTERVAL;
     let mut last_observation: String;
 
     loop {
@@ -212,6 +228,11 @@ async fn wait_for_settings_tree(app: &App, timeout: Duration) -> Result<ElementT
                 timeout.as_secs(),
                 last_observation
             );
+        }
+
+        if start.elapsed() >= next_relaunch {
+            let _ = launch_settings(adb);
+            next_relaunch = start.elapsed() + SETTINGS_RELAUNCH_INTERVAL;
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
