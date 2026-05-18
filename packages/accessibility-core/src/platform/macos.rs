@@ -42,10 +42,11 @@ const AX_FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
 const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_WINDOWS: &str = "AXWindows";
 const AX_MAIN_WINDOW: &str = "AXMainWindow";
+const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
 const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
 const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
-const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(500);
-const AX_FULL_ACCESSIBILITY_PRIME_DEPTH: usize = 8;
+const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(200);
+const AX_ENHANCED_USER_INTERFACE_OBSERVER_SLICE_SECONDS: f64 = 0.016;
 const AX_VISIBLE_CHILDREN: &str = "AXVisibleChildren";
 const AX_CHILDREN_IN_NAVIGATION_ORDER: &str = "AXChildrenInNavigationOrder";
 const AX_CONTENTS: &str = "AXContents";
@@ -737,44 +738,26 @@ impl MacOSAccessibility {
     }
 
     fn enable_full_accessibility_for_app(app: &AxElement) -> bool {
-        let mut seen = Vec::new();
-        let mut requested = Self::enable_full_accessibility_for_subtree(
-            app,
-            AX_FULL_ACCESSIBILITY_PRIME_DEPTH,
-            &mut seen,
-        );
-
+        let mut requested = Self::enable_full_accessibility(app);
         for window in Self::get_application_windows(app) {
-            requested |= Self::enable_full_accessibility_for_subtree(
-                &window,
-                AX_FULL_ACCESSIBILITY_PRIME_DEPTH,
-                &mut seen,
-            );
+            requested |= Self::enable_full_accessibility(&window);
         }
 
         requested
     }
 
-    fn enable_full_accessibility_for_subtree(
-        element: &AxElement,
-        remaining_depth: usize,
-        seen: &mut Vec<AxElement>,
-    ) -> bool {
-        if seen.iter().any(|seen| seen.is_same_element(element)) {
-            return false;
+    fn enable_full_accessibility_for_cached_web_content(&self) -> bool {
+        let mut requested = false;
+        for (id, element) in self.cache.iter() {
+            if element.role != Role::WebView {
+                continue;
+            }
+            let Some(handle) = self.handles.get(&id) else {
+                continue;
+            };
+            requested |= Self::enable_full_accessibility(handle);
+            requested |= !Self::search_predicate_children(handle).is_empty();
         }
-        seen.push(element.clone());
-
-        let mut requested = Self::enable_full_accessibility(element);
-        if remaining_depth == 0 {
-            return requested;
-        }
-
-        for child in Self::discover_children(element, ChildDiscovery::STRUCTURAL_ONLY) {
-            requested |=
-                Self::enable_full_accessibility_for_subtree(&child, remaining_depth - 1, seen);
-        }
-
         requested
     }
 
@@ -814,26 +797,49 @@ impl MacOSAccessibility {
         let requested = Self::enable_full_accessibility_for_app(app);
         Self::prime_accessibility_roots(app);
 
-        if !requested && !Self::has_full_accessibility_request(app) {
-            return self.build_tree_snapshot(pid, app, app_name, filter);
+        let mut tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+        if Self::tree_has_webview_content(&tree) {
+            return Ok(tree);
+        }
+
+        if !Self::tree_has_webview_candidate(&tree)
+            && !accessibility_macos_sys::is_chromium_based_app(pid)
+        {
+            return Ok(tree);
+        }
+
+        let targeted = self.enable_full_accessibility_for_cached_web_content();
+        if targeted {
+            tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+            if Self::tree_has_webview_content(&tree) {
+                return Ok(tree);
+            }
+        }
+
+        if !requested && !targeted && !Self::has_full_accessibility_request(app) {
+            return Ok(tree);
         }
 
         let deadline = std::time::Instant::now() + AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT;
 
-        loop {
-            let tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
-            if Self::tree_has_webview_content(&tree) || std::time::Instant::now() >= deadline {
-                return Ok(tree);
-            }
-
-            accessibility_macos_sys::run_default_loop_slice(0.05, true);
+        while std::time::Instant::now() < deadline {
+            accessibility_macos_sys::run_default_loop_slice(
+                AX_ENHANCED_USER_INTERFACE_OBSERVER_SLICE_SECONDS,
+                true,
+            );
             if observer
                 .as_ref()
                 .is_some_and(|observer| observer.take_notified())
             {
                 Self::prime_accessibility_roots(app);
+                tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+                if Self::tree_has_webview_content(&tree) {
+                    return Ok(tree);
+                }
             }
         }
+
+        self.build_tree_snapshot(pid, app, app_name, filter)
     }
 
     fn build_tree_snapshot(
@@ -889,6 +895,19 @@ impl MacOSAccessibility {
             }
         }
 
+        false
+    }
+
+    fn tree_has_webview_candidate(tree: &ElementTree) -> bool {
+        let mut stack = vec![&tree.root];
+        while let Some(element) = stack.pop() {
+            if element.role == Role::WebView {
+                return true;
+            }
+            for child in element.children.iter().rev() {
+                stack.push(child);
+            }
+        }
         false
     }
 
@@ -957,6 +976,13 @@ impl MacOSAccessibility {
             value.as_deref(),
             bounds.as_ref(),
         )
+    }
+
+    fn handle_for_id(&mut self, id: ElementKey) -> Result<AxElement> {
+        self.handles
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))
     }
 
     /// Get a string attribute value.
@@ -1111,8 +1137,9 @@ impl MacOSAccessibility {
     ///
     /// For a non-frontmost application, `AXChildren` typically omits the visible
     /// windows. Empirically on macOS, `AXWindows` is *also* often empty for
-    /// backgrounded apps, but `AXMainWindow` still returns the focused window;
-    /// we use both so single-window apps still walk correctly when backgrounded.
+    /// backgrounded apps, but `AXMainWindow` or `AXFocusedWindow` may still
+    /// return the visible window; we use all three so single-window apps still
+    /// walk correctly when backgrounded.
     /// The returned list is deduped by window title — macOS hands out fresh
     /// AX element wrappers per call so raw-pointer dedup doesn't work.
     fn get_application_windows(element: &AxElement) -> Vec<AxElement> {
@@ -1133,6 +1160,10 @@ impl MacOSAccessibility {
         }
 
         for window in element.attribute_elements(AX_MAIN_WINDOW) {
+            push(window, &mut windows, &mut seen_titles);
+        }
+
+        for window in element.attribute_elements(AX_FOCUSED_WINDOW) {
             push(window, &mut windows, &mut seen_titles);
         }
 
@@ -1511,10 +1542,7 @@ impl AccessibilityReader for MacOSAccessibility {
 
     async fn perform_action(&mut self, id: ElementKey, action: Action) -> Result<()> {
         self.run_with_blocking_state(move |reader| {
-            let handle = reader
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+            let handle = reader.handle_for_id(id)?;
 
             // Focus/Blur aren't AX actions on macOS — they're attribute writes.
             if matches!(action, Action::Focus | Action::Blur) {
@@ -1554,7 +1582,7 @@ impl AccessibilityReader for MacOSAccessibility {
             if matches!(action, Action::Click)
                 && let Some(element) = reader.cache.get(id)
                 && let Some(bounds) = element.bounds
-                && let Some(pid) = Self::get_pid_for_element(handle)
+                && let Some(pid) = Self::get_pid_for_element(&handle)
                 && (matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
                     || accessibility_macos_sys::is_chromium_based_app(pid))
             {
@@ -1584,10 +1612,7 @@ impl AccessibilityReader for MacOSAccessibility {
     async fn set_value(&mut self, id: ElementKey, value: &str) -> Result<()> {
         let value = value.to_string();
         self.run_with_blocking_state(move |reader| {
-            let handle = reader
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+            let handle = reader.handle_for_id(id)?;
 
             if let Err(result) = handle.set_string_attribute(AX_VALUE, &value) {
                 bail!("Failed to set value: {:?}", result);

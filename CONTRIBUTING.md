@@ -8,10 +8,11 @@ Thanks for your interest in contributing.
 cargo build --workspace
 ```
 
-The workspace contains two crates:
+The workspace contains these main crates:
 
 - `accessibility-core` — the cross-platform library (`packages/accessibility-core`).
 - `accessibility-cli` — the binary (`packages/accessibility-cli`).
+- `accessibility-*-sys` — platform-specific low-level bindings (`packages/accessibility-*-sys`).
 
 ## System dependencies
 

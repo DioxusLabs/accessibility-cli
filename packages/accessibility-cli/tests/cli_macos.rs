@@ -97,7 +97,7 @@ fn calculator_has_buttons(pid: u32) -> bool {
         .output();
     let Ok(out) = out else { return false };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout.contains("Found ") && stdout.contains("match")
+    stdout.contains("Button")
 }
 
 /// Calc process exists with no AX window (the user closed it without

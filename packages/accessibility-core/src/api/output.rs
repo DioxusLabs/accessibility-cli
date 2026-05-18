@@ -769,9 +769,7 @@ impl<'a> MinimalQueryFormatter<'a> {
         active_steps: &[(usize, &SelectorStep)],
         active_index: usize,
     ) -> Option<ElementKey> {
-        let Some(element) = self.elements_by_id.get(&element_id).copied() else {
-            return None;
-        };
+        let element = self.elements_by_id.get(&element_id).copied()?;
         let (step_index, step) = active_steps[active_index];
         if !step.matches(element, self.child_index_by_id.get(&element_id).copied()) {
             return None;
@@ -1578,7 +1576,7 @@ fn render_css_tree_lines(
         }
     }
 
-    while let Some(_) = open_elements.pop() {
+    while open_elements.pop().is_some() {
         let close_indent = "  ".repeat(open_elements.len());
         lines.push(format!("{}}}", close_indent));
     }
