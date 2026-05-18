@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const SETTINGS_PACKAGE: &str = "com.android.settings";
 const SETTINGS_ACTION: &str = "android.settings.SETTINGS";
 const DEVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
-const SETTINGS_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const SETTINGS_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const UI_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
@@ -75,28 +75,48 @@ fn stabilize_device(adb: &AdbClient) {
 }
 
 fn launch_settings(adb: &AdbClient) -> Result<()> {
-    adb.shell(&["am", "start", "-W", "-a", SETTINGS_ACTION])
-        .context("Failed to launch Android Settings")?;
+    adb.shell(&[
+        "am",
+        "start",
+        "-W",
+        "-a",
+        SETTINGS_ACTION,
+        "-p",
+        SETTINGS_PACKAGE,
+    ])
+    .context("Failed to launch Android Settings")?;
     Ok(())
 }
 
-fn wait_for_settings_foreground(adb: &AdbClient, timeout: Duration) -> Result<()> {
+fn wait_for_settings_process(adb: &AdbClient, timeout: Duration) -> Result<()> {
     let start = Instant::now();
 
     loop {
-        let observation = match adb.get_current_activity() {
-            Ok(activity) => {
-                if activity.contains(SETTINGS_PACKAGE) {
+        let observation = match adb.shell(&["pidof", SETTINGS_PACKAGE]) {
+            Ok(pid) => {
+                let pid = pid.trim();
+                if !pid.is_empty() {
                     return Ok(());
                 }
-                activity
+                "pidof returned no Settings process".to_string()
             }
-            Err(error) => error.to_string(),
+            Err(pidof_error) => match adb.shell(&["ps", "-A"]) {
+                Ok(processes) => {
+                    if processes
+                        .lines()
+                        .any(|line| line.contains(SETTINGS_PACKAGE))
+                    {
+                        return Ok(());
+                    }
+                    format!("Settings process was not listed by ps: {pidof_error}")
+                }
+                Err(ps_error) => format!("pidof failed: {pidof_error}; ps failed: {ps_error}"),
+            },
         };
 
         if start.elapsed() >= timeout {
             bail!(
-                "Android Settings did not become foreground within {} seconds: {}",
+                "Android Settings process did not start within {} seconds: {}",
                 timeout.as_secs(),
                 observation
             );
@@ -160,7 +180,7 @@ async fn reset_settings(accessibility: &mut AndroidAccessibility) -> Result<()> 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     launch_settings(accessibility.adb())?;
-    wait_for_settings_foreground(accessibility.adb(), SETTINGS_FOREGROUND_TIMEOUT)?;
+    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     Ok(())
 }
@@ -230,7 +250,7 @@ async fn test_android_device_input_smoke() -> Result<()> {
     assert!(height > 0);
 
     launch_settings(accessibility.adb())?;
-    wait_for_settings_foreground(accessibility.adb(), SETTINGS_FOREGROUND_TIMEOUT)?;
+    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT)?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let center_x = width as f64 / 2.0;
