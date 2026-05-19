@@ -232,7 +232,14 @@ impl Element {
                 | Role::MenuItemRadio
                 | Role::Switch
                 | Role::SpinButton
-        )
+        ) || self.has_activation_action()
+    }
+
+    /// Check if this element exposes a platform activation action.
+    pub fn has_activation_action(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|action| matches!(action.as_str(), "AXPress" | "AXPick" | "AXConfirm"))
     }
 
     /// Recursively find all elements matching a predicate.
@@ -241,12 +248,18 @@ impl Element {
         F: Fn(&Element) -> bool,
     {
         let mut results = Vec::new();
-        if predicate(self) {
-            results.push(self);
+        let mut stack = vec![self];
+
+        while let Some(element) = stack.pop() {
+            if predicate(element) {
+                results.push(element);
+            }
+
+            for child in element.children.iter().rev() {
+                stack.push(child);
+            }
         }
-        for child in &self.children {
-            results.extend(child.find_all(predicate));
-        }
+
         results
     }
 }
@@ -480,7 +493,8 @@ pub enum AccessibilityEventType {
 pub struct ListenerConfig {
     /// Event types to subscribe to. `None` means all events.
     pub event_types: Option<Vec<AccessibilityEventType>>,
-    /// Target PID. `None` uses the reader's target_pid.
+    /// Target PID for raw listeners. `TargetedAccessibility` fills this from
+    /// its stored PID when omitted.
     pub pid: Option<u32>,
     /// Size of the event channel buffer. Default: 256.
     pub buffer_size: usize,
@@ -526,5 +540,28 @@ impl ListenerConfig {
             Some(types) => types.contains(&event_type),
             None => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit::Role;
+
+    #[test]
+    fn action_bearing_group_is_interactive() {
+        let mut element = Element::new(ElementKey::from_ffi(1), Role::Group);
+        element.actions.push("AXPress".to_string());
+
+        assert!(element.is_interactive());
+    }
+
+    #[test]
+    fn menu_only_group_is_not_interactive() {
+        let mut element = Element::new(ElementKey::from_ffi(1), Role::Group);
+        element.actions.push("AXShowMenu".to_string());
+        element.actions.push("AXScrollToVisible".to_string());
+
+        assert!(!element.is_interactive());
     }
 }

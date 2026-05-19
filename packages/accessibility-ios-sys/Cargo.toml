@@ -1,0 +1,28 @@
+[package]
+name = "accessibility-ios-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Safe low-level wrappers around iOS Simulator private accessibility and HID APIs used by accessibility-cli."
+readme = "../../README.md"
+keywords = ["accessibility", "ios", "simulator", "automation"]
+categories = ["accessibility", "api-bindings", "os::macos-apis"]
+
+[dependencies]
+accesskit.workspace = true
+anyhow.workspace = true
+euclid.workspace = true
+image.workspace = true
+slotmap.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFCGTypes",
+] }

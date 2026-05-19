@@ -2,6 +2,10 @@
 
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use crate::accessibility::IosSimulatorTarget;
+use crate::accessibility::{AndroidTarget, Target};
+
 /// Target platform for accessibility operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Platform {
@@ -51,15 +55,8 @@ pub struct AppConfig {
     /// Target platform.
     pub platform: Platform,
 
-    /// Process ID to target (None for focused app).
-    pub pid: Option<u32>,
-
-    /// Simulator UDID for iOS (macOS only).
-    #[cfg(target_os = "macos")]
-    pub udid: Option<String>,
-
-    /// Device serial for Android (from `adb devices`).
-    pub android_serial: Option<String>,
+    /// Explicit target for the connection.
+    pub target: Target,
 
     /// Default timeout for locator operations.
     pub default_timeout: Duration,
@@ -72,10 +69,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             platform: Platform::default(),
-            pid: None,
-            #[cfg(target_os = "macos")]
-            udid: None,
-            android_serial: None,
+            target: Target::System,
             default_timeout: Duration::from_secs(30),
             default_poll_interval: Duration::from_millis(100),
         }
@@ -90,7 +84,13 @@ impl AppConfig {
 
     /// Set the target PID.
     pub fn with_pid(mut self, pid: u32) -> Self {
-        self.pid = Some(pid);
+        self.target = Target::Pid(pid);
+        self
+    }
+
+    /// Set the explicit target.
+    pub fn with_target(mut self, target: Target) -> Self {
+        self.target = target;
         self
     }
 
@@ -115,13 +115,26 @@ impl AppConfig {
     /// Set the simulator UDID (iOS only).
     #[cfg(target_os = "macos")]
     pub fn with_udid(mut self, udid: impl Into<String>) -> Self {
-        self.udid = Some(udid.into());
+        self.target = Target::IosSimulator(IosSimulatorTarget::Udid(udid.into()));
+        self
+    }
+
+    /// Use the first booted iOS Simulator.
+    #[cfg(target_os = "macos")]
+    pub fn with_booted_ios_simulator(mut self) -> Self {
+        self.target = Target::IosSimulator(IosSimulatorTarget::Booted);
+        self
+    }
+
+    /// Use the default connected Android device.
+    pub fn with_android_device(mut self) -> Self {
+        self.target = Target::Android(AndroidTarget::DefaultDevice);
         self
     }
 
     /// Set the Android device serial (from `adb devices`).
     pub fn with_android_serial(mut self, serial: impl Into<String>) -> Self {
-        self.android_serial = Some(serial.into());
+        self.target = Target::Android(AndroidTarget::Serial(serial.into()));
         self
     }
 }

@@ -4,13 +4,15 @@ Cross-platform accessibility tree reading, querying, screenshots, and input
 automation for **macOS**, **Windows**, **Linux**, **iOS Simulator**, and
 **Android**.
 
-The repository contains two crates:
+The repository contains:
 
 - [`accessibility-core`](packages/accessibility-core) — reusable Rust library
   exposing a high-level `App` / `Locator` API and platform accessibility
   adapters.
 - [`accessibility-cli`](packages/accessibility-cli) — the `accessibility-cli`
   command-line interface.
+- `packages/accessibility-*-sys` — platform-specific low-level bindings used by
+  the core adapter.
 
 ## Platform support
 

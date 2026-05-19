@@ -8,7 +8,7 @@
 //!
 //! `accessibility-core` is pre-1.0 and the API surface in this module
 //! (`App`, `Locator`, `Error`, `Result`, `AppConfig`, `LocatorOptions`,
-//! `Platform`, `Element`) is considered the supported public API. Anything
+//! `Platform`, `Target`, `Element`) is considered the supported public API. Anything
 //! reachable only through `crate::accessibility::*` or `crate::platform::*`
 //! is implementation detail and may change between minor versions.
 //!
@@ -44,7 +44,7 @@
 //!
 //! # Filling and waiting
 //!
-//! ```no_run
+//! ```no_run,ignore
 //! use accessibility_core::api::{App, Platform};
 //!
 //! # async fn run(pid: u32) -> Result<(), accessibility_core::api::Error> {
@@ -69,15 +69,17 @@ mod locator;
 mod output;
 mod screenshot;
 
-pub use crate::accessibility::Element;
+#[cfg(target_os = "macos")]
+pub use crate::accessibility::IosSimulatorTarget;
+pub use crate::accessibility::{AndroidTarget, Element, Target};
 pub use app::App;
 pub use config::{AppConfig, LocatorOptions, Platform};
 pub use error::{Error, Result};
 pub use locator::Locator;
 pub use output::{
-    JsonPrinter, LlmPrinter, LlmQueryPrinter, Printer, TreePrinter, format_element_selector,
-    format_role_short, print_element_summary, print_formatted, print_statistics, print_tree,
-    truncate,
+    JsonPrinter, LlmPrinter, LlmQueryPrinter, OutputFormat, OutputPrinter, Printer, TreePrinter,
+    format_element_selector, format_role_short, print_element_summary, print_elements_formatted,
+    print_elements_formatted_with_tree, print_formatted, print_statistics, print_tree, truncate,
 };
 pub use screenshot::{
     AnnotatedScreenshot, annotate_elements, decode_screenshot, draw_grid_overlay, draw_rect_border,

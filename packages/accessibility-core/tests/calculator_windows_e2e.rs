@@ -13,20 +13,21 @@
 
 #![cfg(target_os = "windows")]
 
-use accessibility_core::accessibility::{AccessibilityEvent, AccessibilityReader, ListenerConfig};
+use accessibility_core::accessibility::{
+    AccessibilityEvent, AccessibilityReader, ListenerConfig, Target,
+};
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
-use accessibility_core::platform::msft::WindowsAccessibility;
+use accessibility_core::platform::msft::{
+    WindowBlockerSpec, WindowsAccessibility, hide_top_level_windows_matching,
+    hide_windows_matching_at_point,
+};
+use accesskit::Role;
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetWindowTextW, IsWindowVisible, SW_HIDE,
-    ShowWindow, WindowFromPoint,
-};
 
 // ============================================================================
 // CI-only blocker dismissal
@@ -40,75 +41,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // (rather than killing the host process) so the OS doesn't immediately respawn
 // a fresh popup. Two passes — one over all top-level windows, one driven by
 // what's actually under the click pixel — to handle the layered z-order.
-
-/// A window matches if its title equals any string in `titles` OR its class
-/// equals any string in `classes`.
-struct BlockerSpec<'a> {
-    titles: &'a [&'a str],
-    classes: &'a [&'a str],
-}
-
-fn window_class(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..len])
-}
-
-fn window_title(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..len])
-}
-
-fn matches_blocker(hwnd: HWND, spec: &BlockerSpec<'_>) -> bool {
-    spec.titles.iter().any(|t| *t == window_title(hwnd))
-        || spec.classes.iter().any(|c| *c == window_class(hwnd))
-}
-
-/// Hide every visible top-level window matching `spec`.
-fn hide_top_level_blockers(spec: &BlockerSpec<'_>) -> usize {
-    struct Ctx<'a> {
-        spec: &'a BlockerSpec<'a>,
-        hidden: usize,
-    }
-    let mut ctx = Ctx { spec, hidden: 0 };
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-        let ctx = unsafe { &mut *(lparam.0 as *mut Ctx) };
-        if unsafe { IsWindowVisible(hwnd).as_bool() } && matches_blocker(hwnd, ctx.spec) {
-            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-            ctx.hidden += 1;
-        }
-        true.into()
-    }
-    let lparam = LPARAM(&mut ctx as *mut _ as isize);
-    let _ = unsafe { EnumWindows(Some(enum_proc), lparam) };
-    ctx.hidden
-}
-
-/// Repeatedly probe the window directly under `(x, y)` and hide its top-level
-/// root if it matches `spec`. Stops once the window at the point is no longer
-/// a blocker, or after six attempts.
-fn hide_blockers_at_point(x: f64, y: f64, spec: &BlockerSpec<'_>) -> usize {
-    let pt = POINT {
-        x: x as i32,
-        y: y as i32,
-    };
-    let mut hidden = 0;
-    for _ in 0..6 {
-        let hwnd = unsafe { WindowFromPoint(pt) };
-        if hwnd.is_invalid() {
-            break;
-        }
-        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let to_hide = if root.is_invalid() { hwnd } else { root };
-        if !matches_blocker(to_hide, spec) && !matches_blocker(hwnd, spec) {
-            break;
-        }
-        let _ = unsafe { ShowWindow(to_hide, SW_HIDE) };
-        hidden += 1;
-    }
-    hidden
-}
 
 /// Drop guard that ensures Calculator is closed when the test exits.
 ///
@@ -242,6 +174,23 @@ impl std::ops::Deref for CalculatorGuard {
 
     fn deref(&self) -> &Self::Target {
         &self.app
+    }
+}
+
+fn hide_ci_blockers_at_point(x: f64, y: f64) {
+    let blockers = WindowBlockerSpec {
+        titles: &["Microsoft account"],
+        classes: &["Shell_OOBEProxy", "UserOOBEWindowClass"],
+    };
+    let pre_hidden = hide_top_level_windows_matching(&blockers);
+    let point_hidden = hide_windows_matching_at_point(x, y, &blockers);
+    if pre_hidden + point_hidden > 0 {
+        println!(
+            "Hid {} blocker popup(s) before hit/click ({} via enum, {} at point)",
+            pre_hidden + point_hidden,
+            pre_hidden,
+            point_hidden
+        );
     }
 }
 
@@ -459,9 +408,9 @@ async fn test_calculator_screenshot() {
 /// Test capturing the entire screen.
 #[tokio::test]
 async fn test_screen_screenshot() {
-    let app = App::focused()
+    let app = App::system(Platform::Windows)
         .await
-        .expect("Failed to connect to focused app");
+        .expect("Failed to connect to Windows system scope");
 
     let screenshot = app.screenshot().await.expect("Failed to capture screen");
 
@@ -534,23 +483,15 @@ async fn test_calculator_mouse_click() {
         // point-driven pass that hides whatever's actually under the click
         // pixel. ShowWindow(SW_HIDE) keeps the host alive so the OS doesn't
         // respawn a fresh popup.
-        let blockers = BlockerSpec {
-            titles: &["Microsoft account"],
-            classes: &["Shell_OOBEProxy", "UserOOBEWindowClass"],
-        };
-        let pre_hidden = hide_top_level_blockers(&blockers);
-        let point_hidden = hide_blockers_at_point(center.x, center.y, &blockers);
-        if pre_hidden + point_hidden > 0 {
-            println!(
-                "Hid {} blocker popup(s) before click ({} via enum, {} at click point)",
-                pre_hidden + point_hidden,
-                pre_hidden,
-                point_hidden
-            );
-        }
+        hide_ci_blockers_at_point(center.x, center.y);
 
         input
-            .mouse_click_at(None, center.x, center.y, MouseButton::Left)
+            .mouse_click_at(
+                &Target::Pid(calc.pid),
+                center.x,
+                center.y,
+                MouseButton::Left,
+            )
             .await
             .expect("Failed to click");
 
@@ -568,6 +509,46 @@ async fn test_calculator_mouse_click() {
     } else {
         panic!("Button '9' has no bounds");
     }
+}
+
+/// Hit testing should populate caches even without a preceding tree snapshot.
+#[tokio::test]
+#[serial]
+async fn test_hit_test_populates_empty_windows_cache() {
+    let calc = CalculatorGuard::launch_for_input().await;
+
+    let btn_9 = calc
+        .locator("Button[title='Nine']")
+        .first()
+        .wait()
+        .await
+        .expect("Button '9' not found");
+    let bounds = btn_9.bounds.expect("Button '9' should have bounds");
+    let center = bounds.center();
+
+    let mut accessibility =
+        WindowsAccessibility::new().expect("Failed to create WindowsAccessibility");
+    accessibility
+        .focus_window(calc.pid)
+        .expect("Failed to focus Calculator");
+    hide_ci_blockers_at_point(center.x, center.y);
+
+    let id = accessibility
+        .hit_test(center.x, center.y)
+        .await
+        .expect("Hit test failed")
+        .expect("Hit test should find Calculator button");
+    let element = accessibility
+        .get_element(id)
+        .expect("Hit test should populate the element cache");
+
+    assert_eq!(element.role, Role::Button);
+    assert!(
+        element.title.as_deref() == Some("Nine") || element.display_label().contains("Nine"),
+        "Expected hit element to be the Nine button, got {:?} '{}'",
+        element.role,
+        element.display_label()
+    );
 }
 
 /// Test finding elements by various properties using locators.

@@ -6,24 +6,27 @@
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
     ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
-    StopReason, StructureChangeType, TreeFilter,
+    StopReason, StructureChangeType, Target, TreeFilter,
 };
+use accessibility_linux_sys::atspi::proxy::accessible::AccessibleProxy;
+use accessibility_linux_sys::atspi::proxy::action::ActionProxy;
+use accessibility_linux_sys::atspi::proxy::component::ComponentProxy;
+use accessibility_linux_sys::atspi::proxy::editable_text::EditableTextProxy;
+use accessibility_linux_sys::atspi::proxy::text::TextProxy;
+use accessibility_linux_sys::atspi::proxy::value::ValueProxy;
+use accessibility_linux_sys::atspi::{
+    InterfaceSet, Role as AtspiRole, connection::AccessibilityConnection,
+};
+use accessibility_linux_sys::atspi_common::CoordType;
+use accessibility_linux_sys::zbus::fdo::DBusProxy;
+use accessibility_linux_sys::zbus::proxy::CacheProperties;
+use accessibility_linux_sys::{atspi, x11rb, zbus};
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
-use atspi::proxy::accessible::AccessibleProxy;
-use atspi::proxy::action::ActionProxy;
-use atspi::proxy::component::ComponentProxy;
-use atspi::proxy::editable_text::EditableTextProxy;
-use atspi::proxy::text::TextProxy;
-use atspi::proxy::value::ValueProxy;
-use atspi::{InterfaceSet, Role as AtspiRole, connection::AccessibilityConnection};
-use atspi_common::CoordType;
 use slotmap::SecondaryMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use zbus::fdo::DBusProxy;
-use zbus::proxy::CacheProperties;
 
 /// Macro to generate D-Bus proxy factory functions with consistent error handling.
 macro_rules! create_proxy_fn {
@@ -87,7 +90,7 @@ impl LinuxAccessibility {
 
     /// Get the PID of a D-Bus bus name owner.
     async fn get_pid_for_bus_name(conn: &zbus::Connection, bus_name: &str) -> Option<u32> {
-        use zbus::names::BusName;
+        use accessibility_linux_sys::zbus::names::BusName;
         let dbus_proxy = DBusProxy::new(conn).await.ok()?;
         let bus_name = BusName::try_from(bus_name).ok()?;
         dbus_proxy
@@ -211,68 +214,57 @@ impl LinuxAccessibility {
         }
 
         // Get bounds from Component interface if available
-        if interfaces.contains(atspi::Interface::Component) {
-            if let Ok(component) =
+        if interfaces.contains(atspi::Interface::Component)
+            && let Ok(component) =
                 Self::create_component_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await {
-                    element.bounds = Some(Rect::new(
-                        Point::new(x as f64, y as f64),
-                        Size::new(width as f64, height as f64),
-                    ));
-                }
-            }
+            && let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
+        {
+            element.bounds = Some(Rect::new(
+                Point::new(x as f64, y as f64),
+                Size::new(width as f64, height as f64),
+            ));
         }
 
         // Get actions from Action interface if available
         // NOTE: Some older GTK applications (like Ubuntu 20.04's gnome-calculator) have
         // a buggy GetActions implementation that crashes when called. We use NActions
         // and GetName instead which work correctly.
-        if interfaces.contains(atspi::Interface::Action) {
-            if let Ok(action_proxy) =
+        if interfaces.contains(atspi::Interface::Action)
+            && let Ok(action_proxy) =
                 Self::create_action_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                // Use nactions + get_name instead of get_actions for compatibility
-                if let Ok(n_actions) = action_proxy.nactions().await {
-                    let mut actions = Vec::new();
-                    for i in 0..n_actions {
-                        if let Ok(name) = action_proxy.get_name(i).await {
-                            actions.push(name);
-                        }
-                    }
-                    element.actions = actions;
+            && let Ok(n_actions) = action_proxy.nactions().await
+        {
+            // Use nactions + get_name instead of get_actions for compatibility
+            let mut actions = Vec::new();
+            for i in 0..n_actions {
+                if let Ok(name) = action_proxy.get_name(i).await {
+                    actions.push(name);
                 }
             }
+            element.actions = actions;
         }
 
         // Get value if Value interface is available
-        if interfaces.contains(atspi::Interface::Value) {
-            if let Ok(value_proxy) =
+        if interfaces.contains(atspi::Interface::Value)
+            && let Ok(value_proxy) =
                 Self::create_value_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok(value) = value_proxy.current_value().await {
-                    element.value = Some(value.to_string());
-                }
-            }
+            && let Ok(value) = value_proxy.current_value().await
+        {
+            element.value = Some(value.to_string());
         }
 
         // Get text content if Text interface is available (for text inputs)
         // Only read if we don't already have a value from Value interface
-        if element.value.is_none() && interfaces.contains(atspi::Interface::Text) {
-            if let Ok(text_proxy) =
+        if element.value.is_none()
+            && interfaces.contains(atspi::Interface::Text)
+            && let Ok(text_proxy) =
                 Self::create_text_proxy(conn, &handle.bus_name, &handle.object_path).await
-            {
-                // Get character count first, then read all text
-                if let Ok(char_count) = text_proxy.character_count().await {
-                    if char_count > 0 {
-                        if let Ok(text) = text_proxy.get_text(0, char_count).await {
-                            if !text.is_empty() {
-                                element.value = Some(text);
-                            }
-                        }
-                    }
-                }
-            }
+            && let Ok(char_count) = text_proxy.character_count().await
+            && char_count > 0
+            && let Ok(text) = text_proxy.get_text(0, char_count).await
+            && !text.is_empty()
+        {
+            element.value = Some(text);
         }
 
         Some(element)
@@ -327,10 +319,10 @@ impl LinuxAccessibility {
 
             while let Some(entry) = stack.pop() {
                 // Check element count limit
-                if let Some(max) = filter.max_elements {
-                    if element_count >= max {
-                        continue;
-                    }
+                if let Some(max) = filter.max_elements
+                    && element_count >= max
+                {
+                    continue;
                 }
 
                 // Allocate temporary ID (will be remapped later)
@@ -371,32 +363,29 @@ impl LinuxAccessibility {
                 handles_to_insert.push((temp_id, entry.handle.clone()));
 
                 // Get children if we should recurse
-                let should_recurse = filter.max_depth.map_or(true, |max| entry.depth < max);
-                if should_recurse {
-                    if let Ok(children) = proxy.get_children().await {
-                        // Push children to stack in reverse order so first child is processed first
-                        for child_ref in children.into_iter().rev() {
-                            let child_handle = NativeHandle {
-                                bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
-                                object_path: child_ref.path_as_str().to_string(),
-                            };
+                let should_recurse = filter.max_depth.is_none_or(|max| entry.depth < max);
+                if should_recurse && let Ok(children) = proxy.get_children().await {
+                    // Push children to stack in reverse order so first child is processed first
+                    for child_ref in children.into_iter().rev() {
+                        let child_handle = NativeHandle {
+                            bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
+                            object_path: child_ref.path_as_str().to_string(),
+                        };
 
-                            if let Ok(child_proxy) = Self::create_accessible_proxy(
-                                &conn,
-                                &child_handle.bus_name,
-                                &child_handle.object_path,
-                            )
-                            .await
-                            {
-                                if let Ok(child_interfaces) = child_proxy.get_interfaces().await {
-                                    stack.push(StackEntry {
-                                        handle: child_handle,
-                                        interfaces: child_interfaces,
-                                        parent_temp_id: Some(temp_id),
-                                        depth: entry.depth + 1,
-                                    });
-                                }
-                            }
+                        if let Ok(child_proxy) = Self::create_accessible_proxy(
+                            &conn,
+                            &child_handle.bus_name,
+                            &child_handle.object_path,
+                        )
+                        .await
+                            && let Ok(child_interfaces) = child_proxy.get_interfaces().await
+                        {
+                            stack.push(StackEntry {
+                                handle: child_handle,
+                                interfaces: child_interfaces,
+                                parent_temp_id: Some(temp_id),
+                                depth: entry.depth + 1,
+                            });
                         }
                     }
                 }
@@ -509,16 +498,16 @@ impl LinuxAccessibility {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
 
             // Get PID from D-Bus
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid == target_pid {
-                    return Some((
-                        NativeHandle {
-                            bus_name,
-                            object_path: child_ref.path_as_str().to_string(),
-                        },
-                        pid,
-                    ));
-                }
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid == target_pid
+            {
+                return Some((
+                    NativeHandle {
+                        bus_name,
+                        object_path: child_ref.path_as_str().to_string(),
+                    },
+                    pid,
+                ));
             }
         }
 
@@ -541,17 +530,14 @@ impl LinuxAccessibility {
 
             if let Ok(proxy) =
                 Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
+                && let Ok(states) = proxy.get_state().await
             {
-                if let Ok(states) = proxy.get_state().await {
-                    // Check for Active or Focused state
-                    if states.contains(atspi::State::Active)
-                        || states.contains(atspi::State::Focused)
-                    {
-                        let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
-                            .await
-                            .unwrap_or(0);
-                        return Some((handle, pid));
-                    }
+                // Check for Active or Focused state
+                if states.contains(atspi::State::Active) || states.contains(atspi::State::Focused) {
+                    let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
+                        .await
+                        .unwrap_or(0);
+                    return Some((handle, pid));
                 }
             }
         }
@@ -559,16 +545,16 @@ impl LinuxAccessibility {
         // Fallback: return first application with a valid PID
         for child_ref in &children {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid > 0 {
-                    return Some((
-                        NativeHandle {
-                            bus_name,
-                            object_path: child_ref.path_as_str().to_string(),
-                        },
-                        pid,
-                    ));
-                }
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid > 0
+            {
+                return Some((
+                    NativeHandle {
+                        bus_name,
+                        object_path: child_ref.path_as_str().to_string(),
+                    },
+                    pid,
+                ));
             }
         }
 
@@ -658,44 +644,41 @@ impl LinuxAccessibility {
             let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
 
             // Check PID
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await {
-                if pid == target_pid {
-                    // Get the application's first window with bounds
-                    let handle = NativeHandle {
-                        bus_name: bus_name.clone(),
-                        object_path: child_ref.path_as_str().to_string(),
-                    };
+            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
+                && pid == target_pid
+            {
+                // Get the application's first window with bounds
+                let handle = NativeHandle {
+                    bus_name: bus_name.clone(),
+                    object_path: child_ref.path_as_str().to_string(),
+                };
 
-                    if let Ok(proxy) =
-                        Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path)
+                if let Ok(proxy) =
+                    Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
+                {
+                    // Try to find a window child with bounds
+                    if let Ok(app_children) = proxy.get_children().await {
+                        for win_ref in app_children {
+                            let win_handle = NativeHandle {
+                                bus_name: win_ref.name_as_str().unwrap_or_default().to_string(),
+                                object_path: win_ref.path_as_str().to_string(),
+                            };
+
+                            if let Ok(component) = Self::create_component_proxy(
+                                conn,
+                                &win_handle.bus_name,
+                                &win_handle.object_path,
+                            )
                             .await
-                    {
-                        // Try to find a window child with bounds
-                        if let Ok(app_children) = proxy.get_children().await {
-                            for win_ref in app_children {
-                                let win_handle = NativeHandle {
-                                    bus_name: win_ref.name_as_str().unwrap_or_default().to_string(),
-                                    object_path: win_ref.path_as_str().to_string(),
-                                };
-
-                                if let Ok(component) = Self::create_component_proxy(
-                                    conn,
-                                    &win_handle.bus_name,
-                                    &win_handle.object_path,
-                                )
-                                .await
-                                {
-                                    if let Ok((x, y, width, height)) =
-                                        component.get_extents(CoordType::Screen).await
-                                    {
-                                        if width > 0 && height > 0 {
-                                            return Some(Rect::new(
-                                                Point::new(x as f64, y as f64),
-                                                Size::new(width as f64, height as f64),
-                                            ));
-                                        }
-                                    }
-                                }
+                                && let Ok((x, y, width, height)) =
+                                    component.get_extents(CoordType::Screen).await
+                                && width > 0
+                                && height > 0
+                            {
+                                return Some(Rect::new(
+                                    Point::new(x as f64, y as f64),
+                                    Size::new(width as f64, height as f64),
+                                ));
                             }
                         }
                     }
@@ -710,7 +693,7 @@ impl LinuxAccessibility {
     ///
     /// Returns screen coordinates and dimensions.
     pub fn get_global_screen_bounds() -> Result<Rect> {
-        use x11rb::connection::Connection;
+        use accessibility_linux_sys::x11rb::connection::Connection;
 
         // Connect to X11 display
         let (conn, screen_num) =
@@ -731,8 +714,8 @@ impl LinuxAccessibility {
     ///
     /// Searches through X11 windows to find one matching the PID.
     pub fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::ConnectionExt as _;
+        use accessibility_linux_sys::x11rb::connection::Connection;
+        use accessibility_linux_sys::x11rb::protocol::xproto::ConnectionExt as _;
 
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let screen = &conn.setup().roots[screen_num];
@@ -757,7 +740,7 @@ impl LinuxAccessibility {
         pid_atom: u32,
         target_pid: u32,
     ) -> Option<Rect> {
-        use x11rb::protocol::xproto::ConnectionExt as _;
+        use accessibility_linux_sys::x11rb::protocol::xproto::ConnectionExt as _;
 
         // Check if this window has the target PID
         if let Ok(reply) = conn
@@ -771,28 +754,28 @@ impl LinuxAccessibility {
             )
             .ok()?
             .reply()
+            && reply.value_len == 1
+            && reply.format == 32
         {
-            if reply.value_len == 1 && reply.format == 32 {
-                let window_pid = u32::from_ne_bytes([
-                    reply.value[0],
-                    reply.value[1],
-                    reply.value[2],
-                    reply.value[3],
-                ]);
-                if window_pid == target_pid {
-                    // Get window geometry
-                    if let Ok(geom) = conn.get_geometry(window).ok()?.reply() {
-                        // Translate coordinates to root window
-                        if let Ok(trans) = conn
-                            .translate_coordinates(window, conn.setup().roots[0].root, 0, 0)
-                            .ok()?
-                            .reply()
-                        {
-                            return Some(Rect::new(
-                                Point::new(trans.dst_x as f64, trans.dst_y as f64),
-                                Size::new(geom.width as f64, geom.height as f64),
-                            ));
-                        }
+            let window_pid = u32::from_ne_bytes([
+                reply.value[0],
+                reply.value[1],
+                reply.value[2],
+                reply.value[3],
+            ]);
+            if window_pid == target_pid {
+                // Get window geometry
+                if let Ok(geom) = conn.get_geometry(window).ok()?.reply() {
+                    // Translate coordinates to root window
+                    if let Ok(trans) = conn
+                        .translate_coordinates(window, conn.setup().roots[0].root, 0, 0)
+                        .ok()?
+                        .reply()
+                    {
+                        return Some(Rect::new(
+                            Point::new(trans.dst_x as f64, trans.dst_y as f64),
+                            Size::new(geom.width as f64, geom.height as f64),
+                        ));
                     }
                 }
             }
@@ -814,7 +797,7 @@ impl LinuxAccessibility {
 }
 
 impl AccessibilityReader for LinuxAccessibility {
-    async fn get_tree(&mut self, pid: Option<u32>, filter: &TreeFilter) -> Result<ElementTree> {
+    async fn get_tree(&mut self, target: &Target, filter: &TreeFilter) -> Result<ElementTree> {
         // Clear previous cache
         self.clear_cache();
 
@@ -831,15 +814,10 @@ impl AccessibilityReader for LinuxAccessibility {
             .map_err(|e| anyhow!("Failed to get root accessible: {}", e))?;
 
         // Find target application
-        let (app_handle, actual_pid) = if let Some(target_pid) = pid {
-            Self::find_app_by_pid(&conn, &root, target_pid)
-                .await
-                .ok_or_else(|| anyhow!("Application with PID {} not found", target_pid))?
-        } else {
-            Self::find_focused_app(&conn, &root)
-                .await
-                .ok_or_else(|| anyhow!("No focused application found"))?
-        };
+        let target_pid = target.require_pid("Linux", "accessibility tree queries")?;
+        let (app_handle, actual_pid) = Self::find_app_by_pid(&conn, &root, target_pid)
+            .await
+            .ok_or_else(|| anyhow!("Application with PID {} not found", target_pid))?;
 
         // Get app name
         let app_proxy =
@@ -969,23 +947,21 @@ impl AccessibilityReader for LinuxAccessibility {
         // Try EditableText interface first (for text fields)
         if let Ok(editable) =
             Self::create_editable_text_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && editable.set_text_contents(&value).await.is_ok()
         {
-            if editable.set_text_contents(&value).await.is_ok() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         // Fallback to Value interface (for sliders, spin buttons)
         if let Ok(value_proxy) =
             Self::create_value_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && let Ok(numeric_value) = value.parse::<f64>()
         {
-            if let Ok(numeric_value) = value.parse::<f64>() {
-                value_proxy
-                    .set_current_value(numeric_value)
-                    .await
-                    .map_err(|e| anyhow!("Failed to set value: {}", e))?;
-                return Ok(());
-            }
+            value_proxy
+                .set_current_value(numeric_value)
+                .await
+                .map_err(|e| anyhow!("Failed to set value: {}", e))?;
+            return Ok(());
         }
 
         bail!("Element does not support setting value")
@@ -1016,60 +992,57 @@ impl AccessibilityReader for LinuxAccessibility {
 
             if let Ok(component) =
                 Self::create_component_proxy(&conn, &handle.bus_name, &handle.object_path).await
-            {
-                if let Ok(accessible_ref) = component
+                && let Ok(accessible_ref) = component
                     .get_accessible_at_point(x as i32, y as i32, CoordType::Screen)
                     .await
-                {
-                    // Check if we got a valid object (not null path)
-                    if accessible_ref.path_as_str() != "/org/a11y/atspi/null" {
-                        let hit_handle = NativeHandle {
-                            bus_name: accessible_ref.name_as_str().unwrap_or_default().to_string(),
-                            object_path: accessible_ref.path_as_str().to_string(),
-                        };
+            {
+                // Check if we got a valid object (not null path)
+                if accessible_ref.path_as_str() != "/org/a11y/atspi/null" {
+                    let hit_handle = NativeHandle {
+                        bus_name: accessible_ref.name_as_str().unwrap_or_default().to_string(),
+                        object_path: accessible_ref.path_as_str().to_string(),
+                    };
 
-                        if let Ok(proxy) = Self::create_accessible_proxy(
+                    if let Ok(proxy) = Self::create_accessible_proxy(
+                        &conn,
+                        &hit_handle.bus_name,
+                        &hit_handle.object_path,
+                    )
+                    .await
+                        && let Ok(interfaces) = proxy.get_interfaces().await
+                    {
+                        // Build element with placeholder ID (will be assigned when stored)
+                        let placeholder_key = ElementKey::from_ffi(1);
+                        if let Some(element) = Self::build_single_element(
                             &conn,
-                            &hit_handle.bus_name,
-                            &hit_handle.object_path,
+                            &proxy,
+                            &hit_handle,
+                            interfaces,
+                            placeholder_key,
                         )
                         .await
                         {
-                            if let Ok(interfaces) = proxy.get_interfaces().await {
-                                // Build element with placeholder ID (will be assigned when stored)
-                                let placeholder_key = ElementKey::from_ffi(1);
-                                if let Some(element) = Self::build_single_element(
-                                    &conn,
-                                    &proxy,
-                                    &hit_handle,
-                                    interfaces,
-                                    placeholder_key,
-                                )
-                                .await
-                                {
-                                    // Store in cache using store_with_clone to assign proper ID
-                                    let (id, _) = self.cache.store_with_clone(|id| Element {
-                                        id,
-                                        role: element.role,
-                                        title: element.title.clone(),
-                                        description: element.description.clone(),
-                                        value: element.value.clone(),
-                                        url: element.url.clone(),
-                                        help: element.help.clone(),
-                                        role_description: element.role_description.clone(),
-                                        identifier: element.identifier.clone(),
-                                        bounds: element.bounds.clone(),
-                                        enabled: element.enabled,
-                                        focused: element.focused,
-                                        actions: element.actions.clone(),
-                                        children: vec![], // hit_test returns a single element without children
-                                    });
+                            // Store in cache using store_with_clone to assign proper ID
+                            let (id, _) = self.cache.store_with_clone(|id| Element {
+                                id,
+                                role: element.role,
+                                title: element.title.clone(),
+                                description: element.description.clone(),
+                                value: element.value.clone(),
+                                url: element.url.clone(),
+                                help: element.help.clone(),
+                                role_description: element.role_description.clone(),
+                                identifier: element.identifier.clone(),
+                                bounds: element.bounds,
+                                enabled: element.enabled,
+                                focused: element.focused,
+                                actions: element.actions.clone(),
+                                children: vec![], // hit_test returns a single element without children
+                            });
 
-                                    // Store the handle
-                                    self.handles.insert(id, hit_handle);
-                                    return Ok(Some(id));
-                                }
-                            }
+                            // Store the handle
+                            self.handles.insert(id, hit_handle);
+                            return Ok(Some(id));
                         }
                     }
                 }
@@ -1090,16 +1063,26 @@ impl AccessibilityReader for LinuxAccessibility {
 
     // Platform adapter methods (merged from LinuxAdapter)
 
-    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
-        if let Some(pid) = pid {
-            if let Ok(screenshot) = self.capture_window(pid) {
-                return Ok(screenshot);
-            }
+    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("Linux screenshot requires Target::Pid or Target::System"),
+        };
+        if let Some(pid) = pid
+            && let Ok(screenshot) = self.capture_window(pid)
+        {
+            return Ok(screenshot);
         }
         LinuxAccessibility::capture_screen(self)
     }
 
-    async fn get_screen_bounds(&self, pid: Option<u32>) -> Result<Rect> {
+    async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("Linux screen bounds requires Target::Pid or Target::System"),
+        };
         if let Some(pid) = pid {
             if let Some(bounds) = self.get_window_bounds_for_pid_via_atspi(pid).await {
                 if bounds.origin.x == 0.0
@@ -1133,8 +1116,10 @@ impl AccessibilityReader for LinuxAccessibility {
         config: ListenerConfig,
         callback: Box<dyn FnMut(AccessibilityEvent) + Send + 'static>,
     ) -> Result<ListenerHandle> {
-        // Use PID from config (optional for Linux - can listen globally)
-        let target_pid = config.pid;
+        let Some(target_pid) = config.pid else {
+            return Err(anyhow!("Linux event listening requires a target pid"));
+        };
+        let target_pid = Some(target_pid);
 
         // Create stop flag
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1212,22 +1197,33 @@ async fn build_element_from_event(
     }
 
     // Try to get bounds from Component interface
-    if let Ok(interfaces) = proxy.get_interfaces().await {
-        if interfaces.contains(atspi::Interface::Component) {
-            if let Ok(component) =
-                LinuxAccessibility::create_component_proxy(conn, bus_name, object_path).await
-            {
-                if let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await {
-                    element.bounds = Some(Rect::new(
-                        Point::new(x as f64, y as f64),
-                        Size::new(width as f64, height as f64),
-                    ));
-                }
-            }
-        }
+    if let Ok(interfaces) = proxy.get_interfaces().await
+        && interfaces.contains(atspi::Interface::Component)
+        && let Ok(component) =
+            LinuxAccessibility::create_component_proxy(conn, bus_name, object_path).await
+        && let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
+    {
+        element.bounds = Some(Rect::new(
+            Point::new(x as f64, y as f64),
+            Size::new(width as f64, height as f64),
+        ));
     }
 
     Some(element)
+}
+
+async fn event_matches_target_pid(
+    conn: &zbus::Connection,
+    bus_name: &str,
+    target_pid: Option<u32>,
+) -> bool {
+    match target_pid {
+        Some(pid) => match LinuxAccessibility::get_pid_for_bus_name(conn, bus_name).await {
+            Some(event_pid) => event_pid == pid,
+            None => true,
+        },
+        None => true,
+    }
 }
 
 /// Run the Linux event loop using AT-SPI D-Bus signals.
@@ -1241,7 +1237,7 @@ async fn run_linux_event_loop(
     callback: Arc<Mutex<EventCallback>>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    use futures_lite::StreamExt;
+    use accessibility_linux_sys::futures_lite::StreamExt;
 
     // Create a new accessibility connection for event listening
     let atspi_conn = match AccessibilityConnection::new().await {
@@ -1278,60 +1274,55 @@ async fn run_linux_event_loop(
     }
 
     // Register for focus events if enabled
-    if config.should_capture(AccessibilityEventType::FocusChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::FocusChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::focus::FocusEvent>()
             .await
-        {
-            eprintln!("Warning: Failed to register for focus events: {}", e);
-        }
+    {
+        eprintln!("Warning: Failed to register for focus events: {}", e);
     }
 
     // Register for object events
-    if config.should_capture(AccessibilityEventType::StructureChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::StructureChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::object::ChildrenChangedEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for children changed events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for children changed events: {}",
+            e
+        );
     }
 
-    if config.should_capture(AccessibilityEventType::ValueChanged) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::ValueChanged)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::object::TextChangedEvent>()
             .await
-        {
-            eprintln!("Warning: Failed to register for text changed events: {}", e);
-        }
+    {
+        eprintln!("Warning: Failed to register for text changed events: {}", e);
     }
 
     // Register for window events
-    if config.should_capture(AccessibilityEventType::WindowCreated) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::WindowCreated)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::window::CreateEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for window create events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for window create events: {}",
+            e
+        );
     }
 
-    if config.should_capture(AccessibilityEventType::WindowDestroyed) {
-        if let Err(e) = atspi_conn
+    if config.should_capture(AccessibilityEventType::WindowDestroyed)
+        && let Err(e) = atspi_conn
             .register_event::<atspi::events::window::DestroyEvent>()
             .await
-        {
-            eprintln!(
-                "Warning: Failed to register for window destroy events: {}",
-                e
-            );
-        }
+    {
+        eprintln!(
+            "Warning: Failed to register for window destroy events: {}",
+            e
+        );
     }
 
     // Get the event stream
@@ -1361,14 +1352,8 @@ async fn run_linux_event_loop(
             atspi::Event::Focus(atspi::events::FocusEvents::Focus(focus_event)) => {
                 // Check PID if filtering
                 let bus_name = focus_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1385,14 +1370,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Object(atspi::events::ObjectEvents::ChildrenChanged(children_event)) => {
                 let bus_name = children_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let parent =
@@ -1414,14 +1393,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Object(atspi::events::ObjectEvents::TextChanged(text_event)) => {
                 let bus_name = text_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1437,14 +1410,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Window(atspi::events::WindowEvents::Create(create_event)) => {
                 let bus_name = create_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let element =
@@ -1462,14 +1429,8 @@ async fn run_linux_event_loop(
 
             atspi::Event::Window(atspi::events::WindowEvents::Destroy(destroy_event)) => {
                 let bus_name = destroy_event.item.name_as_str().unwrap_or_default();
-                if let Some(pid) = target_pid {
-                    if let Some(event_pid) =
-                        LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await
-                    {
-                        if event_pid != pid {
-                            continue;
-                        }
-                    }
+                if !event_matches_target_pid(&conn, bus_name, target_pid).await {
+                    continue;
                 }
 
                 let event_pid = LinuxAccessibility::get_pid_for_bus_name(&conn, bus_name).await;

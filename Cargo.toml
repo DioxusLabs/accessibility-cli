@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "packages/accessibility-android-sys",
+    "packages/accessibility-linux-sys",
+    "packages/accessibility-macos-sys",
+    "packages/accessibility-windows-sys",
+    "packages/accessibility-ios-sys",
     "packages/accessibility-core",
     "packages/accessibility-cli",
 ]
@@ -15,6 +20,11 @@ homepage = "https://github.com/DioxusLabs/accessibility-cli"
 [workspace.dependencies]
 accessibility-core = { path = "packages/accessibility-core", version = "0.1.0" }
 accessibility-cli = { path = "packages/accessibility-cli", version = "0.1.0" }
+accessibility-android-sys = { path = "packages/accessibility-android-sys", version = "0.1.0" }
+accessibility-linux-sys = { path = "packages/accessibility-linux-sys", version = "0.1.0" }
+accessibility-macos-sys = { path = "packages/accessibility-macos-sys", version = "0.1.0" }
+accessibility-windows-sys = { path = "packages/accessibility-windows-sys", version = "0.1.0" }
+accessibility-ios-sys = { path = "packages/accessibility-ios-sys", version = "0.1.0" }
 ab_glyph = "0.2"
 accesskit = { version = "0.22", features = ["enumn", "schemars", "serde"] }
 anyhow = "1.0.100"
@@ -33,7 +43,7 @@ quick-xml = "0.37"
 selectors = "0.25"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
-serial_test = "3"
+serial_test = { version = "3", features = ["file_locks"] }
 slotmap = { version = "1.1", features = ["serde"] }
 tokio = { version = "1.49.0", features = ["full"] }
 viuer = "0.9"

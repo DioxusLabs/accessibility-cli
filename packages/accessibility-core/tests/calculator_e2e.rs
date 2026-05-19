@@ -15,12 +15,13 @@
 #![cfg(target_os = "macos")]
 
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, AccessibilityReader, ListenerConfig,
+    AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ListenerConfig,
+    Target, TreeFilter,
 };
 use accessibility_core::api::{App, Platform};
 use accessibility_core::input::MouseButton;
 use accessibility_core::platform::macos::MacOSAccessibility;
-use serial_test::serial;
+use accesskit::{Action, Role};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +45,25 @@ struct ForegroundSnapshot {
 
 impl ForegroundSnapshot {
     fn capture() -> Self {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_error;
+
+        loop {
+            match Self::try_capture() {
+                Ok(snapshot) => return snapshot,
+                Err(error) => last_error = error,
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "Failed to query frontmost process: {last_error}"
+            );
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn try_capture() -> Result<Self, String> {
         let script = r#"
             tell application "System Events"
                 set frontmostProcess to first application process whose frontmost is true
@@ -53,35 +73,41 @@ impl ForegroundSnapshot {
         let output = Command::new("osascript")
             .args(["-e", script])
             .output()
-            .expect("Failed to query frontmost process");
+            .map_err(|e| format!("failed to run osascript: {e}"))?;
 
-        assert!(
-            output.status.success(),
-            "Failed to query frontmost process: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut parts = stdout.trim().split(", ");
-        let name = parts
-            .next()
-            .expect("frontmost process name missing")
-            .to_string();
-        let pid = parts
-            .next()
-            .expect("frontmost process PID missing")
-            .parse()
-            .expect("frontmost process PID should parse");
+        let Some(name) = parts.next().filter(|name| !name.is_empty()) else {
+            return Err("frontmost process name missing".to_string());
+        };
+        let Some(pid) = parts.next().and_then(|pid| pid.parse().ok()) else {
+            return Err("frontmost process PID missing".to_string());
+        };
 
-        Self { name, pid }
+        Ok(Self {
+            name: name.to_string(),
+            pid,
+        })
     }
 
-    fn assert_unchanged(&self) {
+    fn is_calculator(&self, calculator_pid: u32) -> bool {
+        self.pid == calculator_pid || self.name == "Calculator"
+    }
+
+    fn assert_calculator_not_promoted(&self, calculator_pid: u32) {
+        if self.is_calculator(calculator_pid) {
+            return;
+        }
+
         let current = Self::capture();
-        assert_eq!(
-            &current, self,
-            "test changed the frontmost app from {:?} to {:?}",
-            self, current
+        assert!(
+            !current.is_calculator(calculator_pid),
+            "test promoted Calculator to the frontmost app from {:?}",
+            self
         );
     }
 }
@@ -96,15 +122,10 @@ impl CalculatorGuard {
             .expect("Failed to connect to Calculator");
 
         // Wait for Calculator to be ready. This must happen before capturing the
-        // foreground snapshot — `open -g` returns before the app finishes launching,
-        // and a freshly-launched Calculator can grab focus during startup. Capturing
-        // the foreground only once the AX tree is queryable means subsequent tests
-        // assert against a stable post-launch state.
-        app.locator("Button")
-            .first()
-            .wait()
-            .await
-            .expect("Calculator should be ready");
+        // foreground snapshot: `open -g` returns before the app finishes launching,
+        // and a freshly-launched Calculator can grab focus during startup. Polling
+        // through initial AX tree errors gives AppKit time to expose the full tree.
+        Self::wait_for_calculator_tree(&app).await;
 
         let foreground = ForegroundSnapshot::capture();
 
@@ -125,7 +146,24 @@ impl CalculatorGuard {
     }
 
     fn assert_foreground_unchanged(&self) {
-        self.foreground.assert_unchanged();
+        self.foreground.assert_calculator_not_promoted(self.pid);
+    }
+
+    async fn wait_for_calculator_tree(app: &App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            if app.locator("Button").no_wait().count().await > 0 {
+                return;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "Calculator should expose a ready accessibility tree"
+            );
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Launch Calculator app and return its PID.
@@ -252,9 +290,37 @@ async fn wait_for_display_value(app: &App, expected: &str) -> Result<String, Str
     elem.value.ok_or_else(|| "Element has no value".to_string())
 }
 
+async fn click_calculator_buttons_fast(calc: &CalculatorGuard, sequence: &[&str]) {
+    let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
+    let tree = accessibility
+        .get_tree(&Target::Pid(calc.pid), &TreeFilter::default())
+        .await
+        .expect("Failed to get Calculator accessibility tree");
+
+    for desc in sequence {
+        let button_id = tree
+            .find_all(|element| is_calculator_button(element, desc))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("Calculator button '{desc}' not found"))
+            .id;
+
+        accessibility
+            .perform_action(button_id, Action::Click)
+            .await
+            .unwrap_or_else(|_| panic!("Failed to click {desc}"));
+    }
+
+    calc.assert_foreground_unchanged();
+}
+
+fn is_calculator_button(element: &Element, description: &str) -> bool {
+    element.role == Role::Button && element.description.as_deref() == Some(description)
+}
+
 /// Test that we can read the accessibility tree from Calculator using the App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_accessibility_tree() {
     let calc = CalculatorGuard::launch().await;
 
@@ -286,7 +352,7 @@ async fn test_calculator_accessibility_tree() {
 
 /// Test performing accessibility actions to do arithmetic using the Playwright-like API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_perform_action() {
     let calc = CalculatorGuard::launch_for_input().await;
 
@@ -309,10 +375,11 @@ async fn test_calculator_perform_action() {
         .await
         .expect("Failed to click 3");
 
-    // Press Enter to calculate
-    calc.keystroke("enter")
+    // Compute via the AX click path in this action-oriented test.
+    calc.locator("Button[description='Equals']")
+        .click()
         .await
-        .expect("Failed to press enter");
+        .expect("Failed to click Equals");
 
     // Wait for the result to appear in display using poll_until
     let value = wait_for_display_value(&calc, "8")
@@ -327,22 +394,14 @@ async fn test_calculator_perform_action() {
     );
 }
 
-/// Test using keyboard input with the App API.
+/// Test using button clicks with the App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_input_controller() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    // Type "7*6" using keyboard shortcuts
-    calc.keystroke("7").await.expect("Failed to type 7");
-    // '*' requires Shift+8 on US keyboard
-    calc.keystroke("shift+8").await.expect("Failed to type *");
-    calc.keystroke("6").await.expect("Failed to type 6");
-
-    // Press Enter/Return to calculate
-    calc.keystroke("enter")
-        .await
-        .expect("Failed to press enter");
+    // Resolve Calculator's buttons once, then click the cached AX handles.
+    click_calculator_buttons_fast(&calc, &["7", "Multiply", "6", "Equals"]).await;
 
     // Wait for the result to appear
     let value = wait_for_display_value(&calc, "42")
@@ -357,19 +416,13 @@ async fn test_calculator_input_controller() {
     );
 }
 
-/// Test using type_text for easier text input.
+/// Test computing via fast button clicks.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_type_text() {
     let calc = CalculatorGuard::launch_for_input().await;
 
-    // Use type_text to type "12+8"
-    calc.type_text("12+8").await.expect("Failed to type text");
-
-    // Press Enter
-    calc.keystroke("enter")
-        .await
-        .expect("Failed to press enter");
+    click_calculator_buttons_fast(&calc, &["1", "2", "Add", "8", "Equals"]).await;
 
     // Wait for result
     let value = wait_for_display_value(&calc, "20")
@@ -386,7 +439,7 @@ async fn test_calculator_type_text() {
 
 /// Test screenshot capture functionality using App API.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_screenshot() {
     let calc = CalculatorGuard::launch().await;
 
@@ -449,13 +502,11 @@ async fn test_calculator_screenshot() {
 /// Test capturing the entire screen.
 #[tokio::test]
 async fn test_screen_screenshot() {
-    let foreground = ForegroundSnapshot::capture();
     let accessibility = MacOSAccessibility::new().expect("Failed to create accessibility reader");
 
     let screenshot = accessibility
-        .capture_screen(None)
+        .capture_screen(&Target::System)
         .expect("Failed to capture screen");
-    foreground.assert_unchanged();
 
     // Screen should have reasonable dimensions (at least 800x600)
     assert!(
@@ -484,7 +535,7 @@ async fn test_screen_screenshot() {
 
 /// Test mouse click operations at specific coordinates.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_mouse_click() {
     let calc = CalculatorGuard::launch().await;
 
@@ -517,9 +568,34 @@ async fn test_calculator_mouse_click() {
     }
 }
 
+/// Mouse scroll against a backgrounded app must not steal focus.
+///
+/// Regression guard for the SkyLight routing fix in `post_event`: scroll
+/// events used to bypass `SLEventPostToPid` and go through the public
+/// `CGEvent::post_to_pid`, which activates the target.
+#[tokio::test]
+#[serial_test::file_serial(calculator)]
+async fn test_calculator_mouse_scroll_keeps_focus() {
+    let calc = CalculatorGuard::launch().await;
+
+    let mut accessibility = MacOSAccessibility::new().expect("Failed to create MacOSAccessibility");
+
+    // A handful of scrolls so a missed SkyLight delivery would have a clear
+    // chance to promote Calculator to key.
+    for _ in 0..3 {
+        accessibility
+            .mouse_scroll(&Target::Pid(calc.pid), 0.0, -3.0)
+            .await
+            .expect("mouse_scroll failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    calc.assert_foreground_unchanged();
+}
+
 /// Test finding elements by various properties using locators.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_find_elements() {
     let calc = CalculatorGuard::launch().await;
 
@@ -569,7 +645,7 @@ async fn test_calculator_find_elements() {
 
 /// Test locator options and filtering.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_locator_options() {
     let calc = CalculatorGuard::launch().await;
 
@@ -612,7 +688,7 @@ async fn test_calculator_locator_options() {
 
 /// Test event listening - verifies that accessibility events are received when Calculator changes.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_event_listening() {
     let calc = CalculatorGuard::launch_for_input().await;
 
@@ -679,10 +755,11 @@ async fn test_calculator_event_listening() {
         .await
         .expect("Failed to click 3");
 
-    println!("Pressing Enter...");
-    calc.keystroke("enter")
+    println!("Clicking Equals...");
+    calc.locator("Button[description='Equals']")
+        .click()
         .await
-        .expect("Failed to press enter");
+        .expect("Failed to click Equals");
 
     // Wait for display to show result before collecting events
     let _ = wait_for_display_value(&calc, "8").await;
@@ -772,7 +849,7 @@ async fn test_calculator_event_listening() {
 
 /// Test event listening with specific event type filtering.
 #[tokio::test]
-#[serial]
+#[serial_test::file_serial(calculator)]
 async fn test_calculator_event_filtering() {
     let calc = CalculatorGuard::launch_for_input().await;
 

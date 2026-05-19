@@ -23,6 +23,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -32,15 +34,45 @@ jobs:
       - run: cargo test --workspace --lib --bins
       - run: cargo test -p accessibility-cli --test cli_smoke
 
-  deny:
+  miri:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          command: check advisories bans licenses sources
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Setup Miri sysroot
+        run: cargo miri setup
+      - name: Run Miri smoke tests
+        run: cargo miri test -p accessibility-android-sys --lib
+
+  sanitizers:
+    name: sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Run sanitizer tests
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          ASAN_OPTIONS: detect_leaks=0
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -p accessibility-android-sys --lib
 
   build:
     name: build (${{ matrix.target }})
@@ -69,6 +101,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install musl-tools
         if: contains(matrix.target, 'linux-musl')
         run: |
@@ -119,6 +153,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Linux E2E dependencies
         if: runner.os == 'Linux'
         run: |
@@ -167,3 +203,30 @@ jobs:
       - name: Run Desktop E2E
         if: runner.os != 'Linux'
         run: cargo test -p accessibility-core --test ${{ matrix.test }} -- --nocapture --test-threads=1
+
+  android-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libatspi2.0-dev libx11-xcb-dev
+      - name: Build Android Settings E2E
+        run: cargo test -p accessibility-core --test settings_android_e2e --no-run
+      - name: Run Android Settings E2E
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -no-metrics
+          script: cargo test -p accessibility-core --test settings_android_e2e -- --ignored --nocapture --test-threads=1

@@ -17,6 +17,7 @@
 //! ```text
 //! accessibility-cli --platform mac --pid 123 --llm           # Query specific macOS app
 //! accessibility-cli --platform mac --pid 123 --mouse-click 300,240  # Targeted macOS click
+//! accessibility-cli --platform mac --pid 123 --key "cmd+c" "[title=Username]"  # Targeted macOS key
 //! accessibility-cli --platform win --pid 123 --llm           # Query specific Windows app
 //! accessibility-cli --platform ios --udid ABC --annotate     # Annotated iOS screenshot
 //! accessibility-cli --platform ios --hid-tap 100,200         # HID tap on iOS Simulator
@@ -26,15 +27,18 @@
 //! accessibility-cli --platform android --adb-swipe 100,200,100,800  # Swipe on Android
 //! ```
 
+#[cfg(target_os = "macos")]
+use accessibility_core::accessibility::IosSimulatorTarget;
 use accessibility_core::accessibility::{
-    AccessibilityEvent, AccessibilityEventType, ListenerConfig, TargetedAccessibility, TreeFilter,
+    AccessibilityEvent, AccessibilityEventType, AndroidTarget, Element, ElementKey, ElementTree,
+    ListenerConfig, Rect, TargetedAccessibility, TreeFilter,
 };
 use accessibility_core::api::{
-    JsonPrinter, LlmPrinter, LlmQueryPrinter, Printer, TreePrinter, annotate_elements,
-    decode_screenshot, draw_grid_overlay, format_role_short, print_element_summary,
-    print_formatted, print_statistics, truncate,
+    OutputFormat, OutputPrinter, annotate_elements, decode_screenshot, draw_grid_overlay,
+    format_role_short, print_formatted, print_statistics, truncate,
 };
 use clap::{Args, Parser, ValueEnum};
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -138,7 +142,27 @@ async fn handle_screenshot_screen(adapter: &TargetedAccessibility, args: &Common
     }
 }
 
-/// Handle annotate command.
+/// Check whether an element has a positive-area overlap with the captured bounds.
+fn element_overlaps_bounds(element: &Element, screen_bounds: &Rect) -> bool {
+    let Some(bounds) = &element.bounds else {
+        return false;
+    };
+
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return false;
+    }
+
+    let bounds_right = bounds.origin.x + bounds.size.width;
+    let bounds_bottom = bounds.origin.y + bounds.size.height;
+    let screen_right = screen_bounds.origin.x + screen_bounds.size.width;
+    let screen_bottom = screen_bounds.origin.y + screen_bounds.size.height;
+
+    bounds.origin.x < screen_right
+        && bounds_right > screen_bounds.origin.x
+        && bounds.origin.y < screen_bottom
+        && bounds_bottom > screen_bounds.origin.y
+}
+
 async fn handle_annotate(
     adapter: &TargetedAccessibility,
     tree: &accessibility_core::accessibility::ElementTree,
@@ -165,12 +189,6 @@ async fn handle_annotate(
         return;
     }
 
-    println!(
-        "Found {} {} elements with bounds",
-        elements.len(),
-        description
-    );
-
     // Capture screenshot
     let screenshot = match adapter.capture_screen() {
         Ok(s) => s,
@@ -188,9 +206,33 @@ async fn handle_annotate(
         }
     };
 
+    let candidate_count = elements.len();
+    let elements: Vec<_> = elements
+        .into_iter()
+        .filter(|element| element_overlaps_bounds(element, &screen_bounds))
+        .collect();
+
+    if elements.is_empty() {
+        println!("No elements to annotate in captured bounds.");
+        return;
+    }
+
+    println!(
+        "Found {} {} elements with drawable bounds",
+        elements.len(),
+        description
+    );
+    let skipped = candidate_count.saturating_sub(elements.len());
+    if skipped > 0 {
+        println!(
+            "Skipped {} elements outside the capture or with empty bounds",
+            skipped
+        );
+    }
+
     // Decode and annotate
     let mut img = decode_screenshot(&screenshot);
-    annotate_elements(&mut img, &elements, &screen_bounds, &screenshot, args.label);
+    let marked = annotate_elements(&mut img, &elements, &screen_bounds, &screenshot, args.label);
 
     if args.overlay {
         draw_grid_overlay(
@@ -214,7 +256,7 @@ async fn handle_annotate(
     println!(
         "Saved annotated screenshot to {} ({} elements marked)",
         filename.display(),
-        elements.len()
+        marked
     );
 
     if args.label {
@@ -226,7 +268,15 @@ async fn handle_annotate(
             if let Some(bounds) = &elem.bounds {
                 let px = ((bounds.origin.x - screen_bounds.origin.x) * scale_x) as i32;
                 let py = ((bounds.origin.y - screen_bounds.origin.y) * scale_y) as i32;
-                if px >= 0 && py >= 0 && px < img.width() as i32 && py < img.height() as i32 {
+                let pw = (bounds.size.width * scale_x) as i32;
+                let ph = (bounds.size.height * scale_y) as i32;
+                if pw > 0
+                    && ph > 0
+                    && px < img.width() as i32
+                    && py < img.height() as i32
+                    && px.saturating_add(pw) > 0
+                    && py.saturating_add(ph) > 0
+                {
                     let role_str = format_role_short(elem.role);
                     println!(
                         "  {}: [{}] {} \"{}\"",
@@ -252,6 +302,231 @@ fn query_has_matches(
     match adapter.find_elements(tree, Some(query), false) {
         Ok(elements) => Ok(!elements.is_empty()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+fn filter_tree_to_matches(tree: &ElementTree, matches: &[&Element]) -> ElementTree {
+    let match_ids = unique_query_match_ids(matches);
+    let root = prune_tree_to_matches(&tree.root, &match_ids).unwrap_or_else(|| tree.root.clone());
+    let element_count = count_tree_elements(&root);
+
+    ElementTree {
+        version: tree.version,
+        pid: tree.pid,
+        app_name: tree.app_name.clone(),
+        root,
+        element_count,
+    }
+}
+
+fn unique_query_match_ids(matches: &[&Element]) -> HashSet<ElementKey> {
+    let mut seen = HashSet::new();
+    let mut ids = HashSet::new();
+
+    for element in matches {
+        let Some(key) = query_match_dedupe_key(element) else {
+            ids.insert(element.id);
+            continue;
+        };
+
+        if seen.insert(key) {
+            ids.insert(element.id);
+        }
+    }
+
+    ids
+}
+
+fn query_match_dedupe_key(element: &Element) -> Option<String> {
+    let bounds = element.bounds?;
+    let bounds = (
+        bounds.origin.x.round() as i64,
+        bounds.origin.y.round() as i64,
+        bounds.size.width.round() as i64,
+        bounds.size.height.round() as i64,
+    );
+
+    Some(format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+        element.role,
+        element.title,
+        element.description,
+        element.value,
+        element.url,
+        element.help,
+        element.identifier,
+        element.role_description,
+        element.enabled,
+        element.focused,
+        element.actions.join("\x1f"),
+        element.children.is_empty(),
+        bounds
+    ))
+}
+
+fn prune_tree_to_matches(root: &Element, match_ids: &HashSet<ElementKey>) -> Option<Element> {
+    enum Frame<'a> {
+        Enter(&'a Element),
+        Exit(&'a Element, usize),
+    }
+
+    let mut frames = vec![Frame::Enter(root)];
+    let mut kept: Vec<Option<Element>> = Vec::new();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::Enter(element) => {
+                frames.push(Frame::Exit(element, element.children.len()));
+                for child in element.children.iter().rev() {
+                    frames.push(Frame::Enter(child));
+                }
+            }
+            Frame::Exit(element, child_count) => {
+                let mut children = Vec::new();
+                for _ in 0..child_count {
+                    if let Some(child) = kept.pop().flatten() {
+                        children.push(child);
+                    }
+                }
+                children.reverse();
+
+                if element.id == root.id || match_ids.contains(&element.id) || !children.is_empty()
+                {
+                    let mut element = element.clone();
+                    element.children = children;
+                    kept.push(Some(element));
+                } else {
+                    kept.push(None);
+                }
+            }
+        }
+    }
+
+    kept.pop().flatten()
+}
+
+fn count_tree_elements(root: &Element) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root];
+    while let Some(element) = stack.pop() {
+        count += 1;
+        for child in element.children.iter().rev() {
+            stack.push(child);
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessibility_core::accessibility::roles::parse_role_name;
+    use accessibility_core::accessibility::{Point, Size};
+
+    macro_rules! role {
+        ($name:expr) => {
+            parse_role_name($name).expect("test role should parse")
+        };
+    }
+
+    fn bounds(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect::new(Point::new(x, y), Size::new(width, height))
+    }
+
+    fn find_element_by_id(element: &Element, id: ElementKey) -> Option<&Element> {
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            if current.id == id {
+                return Some(current);
+            }
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        None
+    }
+
+    fn count_elements_matching(element: &Element, matches: impl Fn(&Element) -> bool) -> usize {
+        let mut count = 0;
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            if matches(current) {
+                count += 1;
+            }
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        count
+    }
+
+    fn duplicate_message_branch(container_id: u64, message_id: u64, reply_id: u64) -> Element {
+        let mut container = Element::new(ElementKey::from_ffi(container_id), role!("Group"));
+        let mut message = Element::new(ElementKey::from_ffi(message_id), role!("Group"));
+        message.title = Some("eveeifyeve replying to Evan Almloff , Same message".to_string());
+        message.bounds = Some(bounds(265.0, 244.0, 966.0, 70.0));
+        message.actions = vec!["AXShowMenu".to_string()];
+
+        let mut reply = Element::new(ElementKey::from_ffi(reply_id), role!("Group"));
+        reply.description = Some("eveeifyeve replying to Evan Almloff".to_string());
+        reply.bounds = Some(bounds(337.0, 246.0, 870.0, 18.0));
+        reply.actions = vec!["AXShowMenu".to_string()];
+
+        message.children.push(reply);
+        container.children.push(message);
+        container
+    }
+
+    #[test]
+    fn query_tree_filter_dedupes_visual_duplicate_matches() {
+        let mut root = Element::new(ElementKey::from_ffi(1), role!("Application"));
+        let mut window = Element::new(ElementKey::from_ffi(2), role!("Window"));
+        let mut web_view = Element::new(ElementKey::from_ffi(3), role!("WebView"));
+
+        web_view.children.push(duplicate_message_branch(4, 5, 6));
+        web_view.children.push(duplicate_message_branch(7, 8, 9));
+        window.children.push(web_view);
+        root.children.push(window);
+
+        let tree = ElementTree {
+            version: 1,
+            pid: None,
+            app_name: None,
+            root,
+            element_count: 9,
+        };
+        let matches = [6, 9]
+            .iter()
+            .map(|id| {
+                find_element_by_id(&tree.root, ElementKey::from_ffi(*id))
+                    .expect("test element should exist")
+            })
+            .collect::<Vec<_>>();
+
+        let filtered = filter_tree_to_matches(&tree, &matches);
+
+        assert_eq!(
+            count_elements_matching(&filtered.root, |element| {
+                element.description.as_deref() == Some("eveeifyeve replying to Evan Almloff")
+            }),
+            1
+        );
+        assert!(find_element_by_id(&filtered.root, ElementKey::from_ffi(6)).is_some());
+        assert!(find_element_by_id(&filtered.root, ElementKey::from_ffi(9)).is_none());
+    }
+
+    #[test]
+    fn query_match_dedupe_keeps_unbounded_matches_distinct() {
+        let mut first = Element::new(ElementKey::from_ffi(1), role!("Group"));
+        first.description = Some("same text".to_string());
+        let mut second = Element::new(ElementKey::from_ffi(2), role!("Group"));
+        second.description = Some("same text".to_string());
+
+        let ids = unique_query_match_ids(&[&first, &second]);
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&ElementKey::from_ffi(1)));
+        assert!(ids.contains(&ElementKey::from_ffi(2)));
     }
 }
 
@@ -363,6 +638,11 @@ async fn handle_common_operations(
     // Handle click
     if let Some(ref target) = args.click {
         return perform_element_action(adapter, tree, target, "click").await;
+    }
+
+    // Handle press (alias for click)
+    if let Some(ref target) = args.press {
+        return perform_element_action(adapter, tree, target, "press").await;
     }
 
     // Handle focus
@@ -481,14 +761,9 @@ async fn handle_common_operations(
                         query
                     ));
                 }
-                println!(
-                    "Found {} match{}:",
-                    elements.len(),
-                    if elements.len() == 1 { "" } else { "es" }
-                );
-                for elem in elements {
-                    print_element_summary(elem);
-                }
+                let filtered_tree = filter_tree_to_matches(tree, &elements);
+                let printer = OutputPrinter::new(args.output_format(), args.structure);
+                print_formatted(&filtered_tree, &printer);
                 return OperationResult::Success;
             }
             Err(e) => {
@@ -497,18 +772,9 @@ async fn handle_common_operations(
         }
     }
 
-    // Create the appropriate printer based on args
-    let printer: Box<dyn Printer> = if args.json {
-        Box::new(JsonPrinter)
-    } else if args.llm_query {
-        Box::new(LlmQueryPrinter::new(args.structure))
-    } else if args.llm {
-        Box::new(LlmPrinter::new(args.structure))
-    } else {
-        Box::new(TreePrinter)
-    };
-
-    let is_tree_mode = !args.json && !args.llm && !args.llm_query;
+    let output_format = args.output_format();
+    let printer = OutputPrinter::new(output_format, args.structure);
+    let is_tree_mode = output_format == OutputFormat::Tree;
 
     // For Tree mode, print additional context
     if is_tree_mode {
@@ -521,7 +787,7 @@ async fn handle_common_operations(
     }
 
     // Print the tree using the selected printer
-    print_formatted(tree, printer.as_ref());
+    print_formatted(tree, &printer);
 
     // For Tree mode, print additional statistics and interactive elements
     if is_tree_mode {
@@ -570,12 +836,6 @@ async fn handle_screenshot_elements(
             std::process::exit(1);
         }
     };
-    println!(
-        "Found {} {} elements with bounds",
-        elements.len(),
-        description
-    );
-
     let screenshot = match adapter.capture_screen() {
         Ok(s) => s,
         Err(e) => {
@@ -591,6 +851,25 @@ async fn handle_screenshot_elements(
             std::process::exit(1);
         }
     };
+
+    let candidate_count = elements.len();
+    let elements: Vec<_> = elements
+        .into_iter()
+        .filter(|element| element_overlaps_bounds(element, &screen_bounds))
+        .collect();
+
+    println!(
+        "Found {} {} elements with drawable bounds",
+        elements.len(),
+        description
+    );
+    let skipped = candidate_count.saturating_sub(elements.len());
+    if skipped > 0 {
+        println!(
+            "Skipped {} elements outside the capture or with empty bounds",
+            skipped
+        );
+    }
 
     for (i, elem) in elements.iter().enumerate() {
         if let Some(bounds) = &elem.bounds {
@@ -900,11 +1179,56 @@ async fn handle_event_listening(adapter: &mut TargetedAccessibility, args: &Comm
     println!("\nEvent listener stopped. Total events received: {}", total);
 }
 
+/// Print a passive list of visible windows/applications for PID discovery.
+async fn handle_list_windows(adapter: &TargetedAccessibility, args: &CommonArgs) {
+    let windows = adapter.list_windows().await;
+
+    if args.output_format() == OutputFormat::Json {
+        let rows = windows
+            .iter()
+            .map(|(pid, app_name, window_title, focused)| {
+                serde_json::json!({
+                    "pid": pid,
+                    "app_name": app_name,
+                    "window_title": window_title,
+                    "focused": focused,
+                })
+            })
+            .collect::<Vec<_>>();
+        match serde_json::to_string_pretty(&rows) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Failed to serialize window list: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if windows.is_empty() {
+        println!("No windows found.");
+        return;
+    }
+
+    println!("{:<8} {:<8} {:<28} Window", "PID", "Focused", "App");
+    for (pid, app_name, window_title, focused) in windows {
+        let focused = if focused { "*" } else { "" };
+        println!(
+            "{:<8} {:<8} {:<28} {}",
+            pid,
+            focused,
+            truncate(&app_name, 28),
+            window_title
+        );
+    }
+}
+
 /// Check if this operation type supports timeout polling.
 /// Only element-targeting operations (query, click, focus, blur, type, key) support polling.
 fn operation_supports_timeout(args: &CommonArgs) -> bool {
     args.query.is_some()
         || args.click.is_some()
+        || args.press.is_some()
         || args.focus.is_some()
         || args.blur.is_some()
         || args.type_value.is_some()
@@ -919,6 +1243,11 @@ async fn run_platform(
     filter: &TreeFilter,
     hit_test_coords: Option<(f64, f64)>,
 ) {
+    if args.list_windows {
+        handle_list_windows(adapter, args).await;
+        return;
+    }
+
     // Handle event listening mode
     if args.listen {
         handle_event_listening(adapter, args).await;
@@ -936,6 +1265,11 @@ async fn run_platform(
         return;
     }
 
+    if let Some((x, y)) = hit_test_coords {
+        handle_hit_test(adapter, x, y).await;
+        return;
+    }
+
     // Determine if we should use timeout polling
     let use_polling = args.timeout > 0 && operation_supports_timeout(args);
 
@@ -946,13 +1280,24 @@ async fn run_platform(
         let start = std::time::Instant::now();
 
         loop {
-            // Clear cache and get fresh tree
+            // Clear cache and get fresh tree. Transient tree-build failures
+            // are normal during animations / redraws — retry until timeout
+            // rather than exit, since the whole point of polling is to wait
+            // for the UI to stabilize.
             adapter.clear_cache();
             let tree = match adapter.get_tree(filter).await {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("Failed to get accessibility tree: {}", e);
-                    std::process::exit(1);
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    if elapsed >= timeout_ms {
+                        eprintln!(
+                            "Failed to get accessibility tree after {}ms: {}",
+                            elapsed, e
+                        );
+                        std::process::exit(1);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                    continue;
                 }
             };
 
@@ -990,12 +1335,6 @@ async fn run_platform(
                 std::process::exit(1);
             }
         };
-
-        // Handle hit test if coordinates provided
-        if let Some((x, y)) = hit_test_coords {
-            handle_hit_test(adapter, x, y).await;
-            return;
-        }
 
         // Handle annotate mode (with tree)
         if args.annotate || args.screenshot {
@@ -1038,9 +1377,9 @@ Usage:
 Examples:
     accessibility-cli --platform mac --pid 123 --llm                    # Query specific macOS app
     accessibility-cli --platform mac --pid 123 --mouse-click 300,240    # Background pixel click on macOS
-    accessibility-cli --platform mac --key "cmd+c" "[title=Username]"   # Send Cmd+C to username field
+    accessibility-cli --platform mac --pid 123 --key "cmd+c" "[title=Username]"   # Send Cmd+C to username field
     accessibility-cli --platform win --pid 123 --llm                    # Query specific Windows app
-    accessibility-cli --platform win --key "ctrl+c" "[title=Username]"  # Send Ctrl+C to username field
+    accessibility-cli --platform win --pid 123 --key "ctrl+c" "[title=Username]"  # Send Ctrl+C to username field
     accessibility-cli --platform ios --udid ABC --annotate              # Annotated iOS screenshot
     accessibility-cli --platform linux --pid 123 --llm                  # Query specific Linux app
     accessibility-cli --platform android --serial ABC --llm             # Query Android device
@@ -1054,8 +1393,10 @@ pub struct Cli {
     #[arg(long, short = 'p', value_enum, default_value_t = PlatformType::default())]
     pub platform: PlatformType,
 
-    /// Target application by process ID (default: focused app)
-    /// Used for mac, win, linux platforms
+    /// Target application by process ID
+    /// Required for mac, win, and linux app tree/control/listen operations.
+    /// Use --list-windows to discover PIDs.
+    /// Used for mac, win, linux platforms.
     #[arg(long)]
     pub pid: Option<u32>,
 
@@ -1077,10 +1418,6 @@ pub struct Cli {
     /// Test framework loading only (iOS only)
     #[arg(long)]
     pub test_load: bool,
-
-    /// Press element by ID (iOS accessibility)
-    #[arg(long)]
-    pub press: Option<u64>,
 
     /// Tap at coordinates via accessibility (x,y) (iOS only)
     #[arg(long, value_parser = parse_coords)]
@@ -1118,6 +1455,29 @@ pub enum PlatformType {
     /// Android device/emulator (uses ADB)
     #[value(name = "android")]
     Android,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormatArg {
+    /// Human-readable tree output.
+    Tree,
+    /// JSON output.
+    Json,
+    /// Compact LLM-friendly output.
+    Llm,
+    /// Queryable LLM-friendly selector output.
+    LlmQuery,
+}
+
+impl From<OutputFormatArg> for OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Tree => OutputFormat::Tree,
+            OutputFormatArg::Json => OutputFormat::Json,
+            OutputFormatArg::Llm => OutputFormat::Llm,
+            OutputFormatArg::LlmQuery => OutputFormat::LlmQuery,
+        }
+    }
 }
 
 impl Default for PlatformType {
@@ -1239,16 +1599,24 @@ pub struct CommonArgs {
     #[arg(long)]
     visible: bool,
 
-    /// Output as JSON
+    /// List windows/applications and their PIDs without activating them
     #[arg(long)]
+    list_windows: bool,
+
+    /// Output format for tree and query output
+    #[arg(long, value_enum, conflicts_with_all = ["json", "llm", "llm_query"])]
+    format: Option<OutputFormatArg>,
+
+    /// Output as JSON
+    #[arg(long, conflicts_with = "format")]
     json: bool,
 
-    /// Compact LLM-friendly output (concise format)
-    #[arg(long)]
+    /// Compact LLM-friendly output (concise format, alias for --format llm)
+    #[arg(long, conflicts_with = "format")]
     llm: bool,
 
-    /// Verbose LLM output with CSS-like selectors (detailed format)
-    #[arg(long)]
+    /// Verbose LLM output with CSS-like selectors (alias for --format llm-query)
+    #[arg(long, conflicts_with = "format")]
     llm_query: bool,
 
     /// Structure-only output (with --llm or --llm-query)
@@ -1287,6 +1655,11 @@ pub struct CommonArgs {
     /// Examples: --click "Button", --click "[title=Submit]", --click "Link[title=Login]"
     #[arg(long)]
     click: Option<String>,
+
+    /// Press element by query (alias for --click)
+    /// Examples: --press "Button", --press "[title=Submit]"
+    #[arg(long)]
+    press: Option<String>,
 
     /// Focus element by query
     /// Examples: --focus "TextField", --focus "[title=Search]"
@@ -1337,6 +1710,24 @@ pub struct CommonArgs {
     /// Poll interval in milliseconds when using --timeout (default: 100)
     #[arg(long, default_value = "100", value_name = "MS")]
     poll_interval: u64,
+}
+
+impl CommonArgs {
+    fn output_format(&self) -> OutputFormat {
+        if let Some(format) = self.format {
+            return format.into();
+        }
+
+        if self.json {
+            OutputFormat::Json
+        } else if self.llm_query {
+            OutputFormat::LlmQuery
+        } else if self.llm {
+            OutputFormat::Llm
+        } else {
+            OutputFormat::Tree
+        }
+    }
 }
 
 /// Parameters for a swipe gesture.
@@ -1407,7 +1798,13 @@ fn parse_swipe_coords(s: &str) -> Result<SwipeParams, String> {
     let y1 = parts[1].trim().parse().map_err(|_| "Invalid y1")?;
     let x2 = parts[2].trim().parse().map_err(|_| "Invalid x2")?;
     let y2 = parts[3].trim().parse().map_err(|_| "Invalid y2")?;
-    let duration_ms = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let duration_ms: u64 = match parts.get(4) {
+        Some(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid duration_ms".to_string())?,
+        None => 300,
+    };
     Ok(SwipeParams {
         start: (x1, y1),
         end: (x2, y2),
@@ -1435,7 +1832,13 @@ fn parse_long_press(s: &str) -> Result<(f64, f64, u64), String> {
         .trim()
         .parse()
         .map_err(|_| "Invalid y coordinate")?;
-    let duration_ms: u64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let duration_ms: u64 = match parts.get(2) {
+        Some(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid duration_ms".to_string())?,
+        None => 1000,
+    };
     Ok((x, y, duration_ms))
 }
 
@@ -1456,7 +1859,7 @@ pub fn run() {
 fn build_filter(common: &CommonArgs) -> TreeFilter {
     TreeFilter {
         max_depth: common.depth,
-        max_elements: Some(1000),
+        max_elements: None,
         interactive_only: common.interactive,
         visible_only: common.visible,
         within_bounds: None,
@@ -1464,7 +1867,90 @@ fn build_filter(common: &CommonArgs) -> TreeFilter {
     }
 }
 
+/// Reject platform-specific flags that don't match `--platform`.
+///
+/// Without this, e.g. `--platform mac --tap 100,100` silently dumps the tree
+/// instead of running the requested tap — the iOS/HID/ADB flags are only
+/// consumed inside their respective platform arms.
+fn validate_platform_flags(cli: &Cli) -> Result<(), String> {
+    let ios_only_set = cli.test_load || cli.tap.is_some();
+    #[cfg(target_os = "macos")]
+    let hid_set = cli.hid.hid_tap.is_some()
+        || cli.hid.hid_swipe.is_some()
+        || cli.hid.hid_home
+        || cli.hid.hid_lock
+        || cli.hid.hid_siri
+        || cli.hid.hid_side;
+    #[cfg(not(target_os = "macos"))]
+    let hid_set = false;
+
+    let adb = &cli.adb;
+    let adb_set = adb.adb_back
+        || adb.adb_home
+        || adb.adb_recent
+        || adb.adb_menu
+        || adb.adb_volume_up
+        || adb.adb_volume_down
+        || adb.adb_tap.is_some()
+        || adb.adb_swipe.is_some()
+        || adb.adb_long_press.is_some()
+        || adb.adb_launch.is_some()
+        || adb.adb_stop.is_some()
+        || adb.adb_notifications
+        || adb.adb_quick_settings
+        || adb.adb_wake
+        || adb.adb_sleep;
+
+    if (ios_only_set || hid_set) && cli.platform != PlatformType::IOS {
+        return Err("iOS-only flags (--tap, --test-load, --hid-*) require --platform ios".into());
+    }
+    if adb_set && cli.platform != PlatformType::Android {
+        return Err("--adb-* flags require --platform android".into());
+    }
+
+    if let Some(platform_name) = pid_target_platform_name(cli.platform)
+        && cli.pid.is_none()
+        && !pid_target_operation_allows_missing_pid(cli)
+    {
+        return Err(format!(
+            "{platform_name} app operations require --pid; use --list-windows to find a target PID"
+        ));
+    }
+
+    Ok(())
+}
+
+fn pid_target_platform_name(platform: PlatformType) -> Option<&'static str> {
+    match platform {
+        #[cfg(target_os = "macos")]
+        PlatformType::MacOS => Some("macOS"),
+        #[cfg(not(target_os = "macos"))]
+        PlatformType::MacOS => None,
+        #[cfg(target_os = "windows")]
+        PlatformType::Windows => Some("Windows"),
+        #[cfg(not(target_os = "windows"))]
+        PlatformType::Windows => None,
+        #[cfg(target_os = "linux")]
+        PlatformType::Linux => Some("Linux"),
+        #[cfg(not(target_os = "linux"))]
+        PlatformType::Linux => None,
+        PlatformType::IOS | PlatformType::Android => None,
+    }
+}
+
+fn pid_target_operation_allows_missing_pid(cli: &Cli) -> bool {
+    cli.common.list_windows
+        || cli.common.screenshot_screen
+        || (cli.common.overlay && !cli.common.annotate)
+        || cli.hit.is_some()
+}
+
 pub async fn run_cli(cli: &Cli) {
+    if let Err(msg) = validate_platform_flags(cli) {
+        eprintln!("error: {}", msg);
+        std::process::exit(2);
+    }
+
     // Handle iOS test-load early (doesn't need adapter)
     #[cfg(target_os = "macos")]
     if cli.platform == PlatformType::IOS && cli.test_load {
@@ -1499,7 +1985,11 @@ pub async fn run_cli(cli: &Cli) {
                 std::process::exit(1);
             }
 
-            let mut adapter = match TargetedAccessibility::new_macos(cli.pid) {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_macos(pid),
+                None => TargetedAccessibility::new_macos_system(),
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create macOS adapter: {}", e);
@@ -1513,7 +2003,7 @@ pub async fn run_cli(cli: &Cli) {
         PlatformType::IOS => {
             // For iOS-specific commands (HID, tap, press), use the raw adapter
             // Then create TargetedAccessibility for common operations
-            let ios_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
+            let mut ios_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create iOS Simulator adapter: {}", e);
@@ -1531,24 +2021,17 @@ pub async fn run_cli(cli: &Cli) {
                 println!("Connected to simulator: {}", ios_adapter.device_udid());
             }
 
-            // Handle iOS-specific commands (HID, tap, press) before common operations
-            // These require the raw IOSSimulatorAccessibility adapter
-            {
-                // Reborrow temporarily to check iOS-specific commands
-                let mut temp_adapter = match IOSSimulatorAccessibility::new(cli.udid.as_deref()) {
-                    Ok(a) => a,
-                    Err(_) => {
-                        // Should not happen since we already created one
-                        std::process::exit(1);
-                    }
-                };
-                if handle_ios_specific(&mut temp_adapter, cli) {
-                    return;
-                }
+            // Handle iOS-specific commands (HID, tap, press) before common operations.
+            if handle_ios_specific(&mut ios_adapter, cli) {
+                return;
             }
 
             // For common operations, use TargetedAccessibility
-            let mut adapter = match TargetedAccessibility::new_ios(cli.udid.as_deref()) {
+            let ios_target = match cli.udid.as_deref() {
+                Some(udid) => IosSimulatorTarget::Udid(udid.to_owned()),
+                None => IosSimulatorTarget::Booted,
+            };
+            let mut adapter = match TargetedAccessibility::new_ios(ios_target) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create iOS adapter: {}", e);
@@ -1560,7 +2043,11 @@ pub async fn run_cli(cli: &Cli) {
 
         #[cfg(target_os = "windows")]
         PlatformType::Windows => {
-            let mut adapter = match TargetedAccessibility::new_windows(cli.pid) {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_windows(pid),
+                None => TargetedAccessibility::new_windows_system(),
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Windows adapter: {}", e);
@@ -1572,7 +2059,11 @@ pub async fn run_cli(cli: &Cli) {
 
         #[cfg(target_os = "linux")]
         PlatformType::Linux => {
-            let mut adapter = match TargetedAccessibility::new_linux(cli.pid).await {
+            let adapter_result = match cli.pid {
+                Some(pid) => TargetedAccessibility::new_linux(pid).await,
+                None => TargetedAccessibility::new_linux_system().await,
+            };
+            let mut adapter = match adapter_result {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Linux adapter: {}", e);
@@ -1618,7 +2109,11 @@ pub async fn run_cli(cli: &Cli) {
             }
 
             // For common operations, use TargetedAccessibility
-            let mut adapter = match TargetedAccessibility::new_android(cli.serial.as_deref()) {
+            let android_target = match cli.serial.as_deref() {
+                Some(serial) => AndroidTarget::Serial(serial.to_owned()),
+                None => AndroidTarget::DefaultDevice,
+            };
+            let mut adapter = match TargetedAccessibility::new_android(android_target) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Android adapter: {}", e);
@@ -1720,25 +2215,16 @@ fn handle_ios_specific(adapter: &mut IOSSimulatorAccessibility, cli: &Cli) -> bo
 
     // Handle iOS-specific accessibility tap
     if let Some((x, y)) = cli.tap {
+        // tap() requires a dispatcher token that's only registered by get_tree().
+        if let Err(e) = adapter.get_tree(&TreeFilter::default()) {
+            eprintln!("Tap failed: could not register simulator token: {}", e);
+            std::process::exit(1);
+        }
         println!("Tapping at ({}, {})...", x, y);
         match adapter.tap(x, y) {
             Ok(()) => println!("Tap successful!"),
             Err(e) => {
                 eprintln!("Tap failed: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return true;
-    }
-
-    // Handle press by ID
-    if let Some(id) = cli.press {
-        println!("Pressing element {}...", id);
-        let key = accessibility_core::accessibility::ElementKey::from_ffi(id);
-        match adapter.press(key) {
-            Ok(()) => println!("Press successful!"),
-            Err(e) => {
-                eprintln!("Press failed: {}", e);
                 std::process::exit(1);
             }
         }

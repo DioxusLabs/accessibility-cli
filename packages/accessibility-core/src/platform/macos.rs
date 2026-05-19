@@ -3,33 +3,27 @@
 //! This module provides access to the macOS accessibility tree for reading
 //! UI element information and performing actions.
 
-// Rust 2024 requires unsafe blocks inside unsafe fns, but objc2 code uses many unsafe calls
-#![allow(unsafe_op_in_unsafe_fn, dead_code)]
+#![allow(dead_code)]
 
 use crate::accessibility::{
     AccessibilityEvent, AccessibilityEventType, AccessibilityReader, Element, ElementCache,
-    ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, StopReason,
-    TreeFilter,
+    ElementKey, ElementTree, ListenerConfig, ListenerHandle, Point, Rect, Screenshot, Size,
+    StopReason, Target, TreeFilter,
 };
 use crate::input::code_from_char;
+use accessibility_macos_sys::{
+    AX_SEARCH_KEY_BUTTON, AX_SEARCH_KEY_CHECKBOX, AX_SEARCH_KEY_CONTROL, AX_SEARCH_KEY_GRAPHIC,
+    AX_SEARCH_KEY_HEADING, AX_SEARCH_KEY_LINK, AX_SEARCH_KEY_LIST, AX_SEARCH_KEY_RADIO_GROUP,
+    AX_SEARCH_KEY_STATIC_TEXT, AX_SEARCH_KEY_TABLE, AX_SEARCH_KEY_TEXT_FIELD, AxElement,
+    AxObserver, AxSearchPredicate, ModifierFlags as MacModifierFlags,
+    MouseButton as MacMouseButton, MouseEventKind as MacMouseEventKind, RunLoop, RunLoopSource,
+    WindowId,
+};
 use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
 use keyboard_types::{Code, Modifiers};
-use objc2::{AnyThread, runtime::AnyObject};
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
-use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CGRect};
-use objc2_core_graphics::{
-    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGImage,
-    CGMainDisplayID, CGMouseButton, CGScrollEventUnit, CGWindowID, CGWindowImageOption,
-    CGWindowListOption,
-};
-use objc2_foundation::NSDictionary;
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_void};
-use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,6 +42,102 @@ const AX_FOCUSED_UI_ELEMENT: &str = "AXFocusedUIElement";
 const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_WINDOWS: &str = "AXWindows";
 const AX_MAIN_WINDOW: &str = "AXMainWindow";
+const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
+const AX_ENHANCED_USER_INTERFACE: &str = "AXEnhancedUserInterface";
+const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+const AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT: Duration = Duration::from_millis(200);
+const AX_ENHANCED_USER_INTERFACE_OBSERVER_SLICE_SECONDS: f64 = 0.016;
+const AX_VISIBLE_CHILDREN: &str = "AXVisibleChildren";
+const AX_CHILDREN_IN_NAVIGATION_ORDER: &str = "AXChildrenInNavigationOrder";
+const AX_CONTENTS: &str = "AXContents";
+const AX_ROWS: &str = "AXRows";
+const AX_COLUMNS: &str = "AXColumns";
+const AX_TABS: &str = "AXTabs";
+const AX_TOOLBAR: &str = "AXToolbar";
+const AX_SPLITTERS: &str = "AXSplitters";
+const AX_SELECTED_CHILDREN: &str = "AXSelectedChildren";
+const AX_SELECTED_ROWS: &str = "AXSelectedRows";
+const AX_SELECTED_COLUMNS: &str = "AXSelectedColumns";
+const AX_WEB_SEARCH_RESULTS_LIMIT: i32 = 2000;
+const AX_CREATED_NOTIFICATION: &str = "AXCreated";
+const AX_LOAD_COMPLETE_NOTIFICATION: &str = "AXLoadComplete";
+const AX_LAYOUT_COMPLETE_NOTIFICATION: &str = "AXLayoutComplete";
+const AX_CHILDREN_CHANGED_NOTIFICATION: &str = "AXChildrenChanged";
+const AX_VALUE_CHANGED_NOTIFICATION: &str = "AXValueChanged";
+const AX_TITLE_CHANGED_NOTIFICATION: &str = "AXTitleChanged";
+const AX_WINDOW_CREATED_NOTIFICATION: &str = "AXWindowCreated";
+const AX_MAIN_WINDOW_CHANGED_NOTIFICATION: &str = "AXMainWindowChanged";
+const AX_FOCUSED_WINDOW_CHANGED_NOTIFICATION: &str = "AXFocusedWindowChanged";
+const AX_FOCUSED_UI_ELEMENT_CHANGED_NOTIFICATION: &str = "AXFocusedUIElementChanged";
+const AX_ROW_COUNT_CHANGED_NOTIFICATION: &str = "AXRowCountChanged";
+const AX_SELECTED_CHILDREN_CHANGED_NOTIFICATION: &str = "AXSelectedChildrenChanged";
+const AX_LIVE_REGION_CREATED_NOTIFICATION: &str = "AXLiveRegionCreated";
+const AX_LIVE_REGION_CHANGED_NOTIFICATION: &str = "AXLiveRegionChanged";
+
+const AX_ELEMENT_ATTRIBUTE_BATCH: &[&str] = &[
+    AX_ROLE,
+    AX_TITLE,
+    AX_DESCRIPTION,
+    AX_VALUE,
+    AX_POSITION,
+    AX_SIZE,
+    AX_ENABLED,
+    AX_FOCUSED,
+];
+const AX_BATCH_ROLE: usize = 0;
+const AX_BATCH_TITLE: usize = 1;
+const AX_BATCH_DESCRIPTION: usize = 2;
+const AX_BATCH_VALUE: usize = 3;
+const AX_BATCH_POSITION: usize = 4;
+const AX_BATCH_SIZE: usize = 5;
+const AX_BATCH_ENABLED: usize = 6;
+const AX_BATCH_FOCUSED: usize = 7;
+
+const AX_CHILD_ATTRIBUTES: &[&str] = &[
+    AX_CHILDREN,
+    AX_VISIBLE_CHILDREN,
+    AX_CHILDREN_IN_NAVIGATION_ORDER,
+    AX_CONTENTS,
+    AX_ROWS,
+    AX_COLUMNS,
+    AX_TABS,
+    AX_TOOLBAR,
+    AX_SPLITTERS,
+    AX_SELECTED_CHILDREN,
+    AX_SELECTED_ROWS,
+    AX_SELECTED_COLUMNS,
+];
+
+const AX_WEB_SEARCH_KEYS: &[&str] = &[
+    AX_SEARCH_KEY_CONTROL,
+    AX_SEARCH_KEY_BUTTON,
+    AX_SEARCH_KEY_LINK,
+    AX_SEARCH_KEY_TEXT_FIELD,
+    AX_SEARCH_KEY_CHECKBOX,
+    AX_SEARCH_KEY_RADIO_GROUP,
+    AX_SEARCH_KEY_STATIC_TEXT,
+    AX_SEARCH_KEY_HEADING,
+    AX_SEARCH_KEY_LIST,
+    AX_SEARCH_KEY_TABLE,
+    AX_SEARCH_KEY_GRAPHIC,
+];
+
+const AX_MATERIALIZATION_NOTIFICATIONS: &[&str] = &[
+    AX_CREATED_NOTIFICATION,
+    AX_LOAD_COMPLETE_NOTIFICATION,
+    AX_LAYOUT_COMPLETE_NOTIFICATION,
+    AX_CHILDREN_CHANGED_NOTIFICATION,
+    AX_VALUE_CHANGED_NOTIFICATION,
+    AX_TITLE_CHANGED_NOTIFICATION,
+    AX_WINDOW_CREATED_NOTIFICATION,
+    AX_MAIN_WINDOW_CHANGED_NOTIFICATION,
+    AX_FOCUSED_WINDOW_CHANGED_NOTIFICATION,
+    AX_FOCUSED_UI_ELEMENT_CHANGED_NOTIFICATION,
+    AX_ROW_COUNT_CHANGED_NOTIFICATION,
+    AX_SELECTED_CHILDREN_CHANGED_NOTIFICATION,
+    AX_LIVE_REGION_CREATED_NOTIFICATION,
+    AX_LIVE_REGION_CHANGED_NOTIFICATION,
+];
 
 // AX Action constants
 const AX_PRESS: &str = "AXPress";
@@ -93,71 +183,122 @@ const ROLE_ROW: &str = "AXRow";
 const ROLE_COLUMN: &str = "AXColumn";
 const ROLE_CELL: &str = "AXCell";
 
-type SLEventPostToPidFn = unsafe extern "C-unwind" fn(libc::pid_t, Option<&CGEvent>);
-type AXUIElementGetWindowFn = unsafe extern "C-unwind" fn(&AXUIElement, *mut CGWindowID) -> AXError;
+#[derive(Clone, Debug)]
+struct BuildSeed {
+    ax_element: AxElement,
+    children: Option<Vec<BuildSeed>>,
+}
 
-fn dlerror_message() -> String {
-    unsafe {
-        let error = libc::dlerror();
-        if error.is_null() {
-            "unknown dynamic loader error".to_string()
-        } else {
-            CStr::from_ptr(error).to_string_lossy().into_owned()
+impl BuildSeed {
+    fn descend(ax_element: AxElement) -> Self {
+        Self {
+            ax_element,
+            children: None,
+        }
+    }
+
+    fn with_children(ax_element: AxElement, children: Vec<BuildSeed>) -> Self {
+        Self {
+            ax_element,
+            children: Some(children),
         }
     }
 }
 
-fn skylight_handle() -> Option<*mut c_void> {
-    static HANDLE: OnceLock<Option<usize>> = OnceLock::new();
+#[derive(Clone, Copy, Debug)]
+struct ChildDiscovery;
 
-    HANDLE
-        .get_or_init(|| unsafe {
-            let path = b"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight\0";
-            let handle = libc::dlopen(
-                path.as_ptr() as *const c_char,
-                libc::RTLD_NOW | libc::RTLD_GLOBAL,
-            );
-            if handle.is_null() {
-                let _ = dlerror_message();
-                None
-            } else {
-                Some(handle as usize)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaterializationState {
+    NativeReady,
+    WebReady,
+    WebNeedsWait,
+}
+
+struct MaterializationContext<'a> {
+    pid: u32,
+    app: &'a AxElement,
+    app_name: Option<String>,
+    filter: &'a TreeFilter,
+    observer: Option<MaterializationObserver>,
+    root_requested: bool,
+}
+
+impl ChildDiscovery {
+    const STRUCTURAL_ONLY: Self = Self;
+    const ENRICHED: Self = Self;
+
+    fn discover(self, element: &AxElement) -> Vec<AxElement> {
+        self.structural_children(element)
+    }
+
+    fn structural_children(self, element: &AxElement) -> Vec<AxElement> {
+        if let Some(attribute_children) = element.attribute_element_values(AX_CHILD_ATTRIBUTES) {
+            for children_for_attribute in attribute_children {
+                if !children_for_attribute.is_empty() {
+                    return children_for_attribute;
+                }
             }
+
+            return Vec::new();
+        }
+
+        let attribute_names = element.attribute_names();
+
+        for attribute in AX_CHILD_ATTRIBUTES {
+            if !attribute_names.is_empty() && !attribute_names.iter().any(|name| name == attribute)
+            {
+                continue;
+            }
+
+            let children = element.attribute_elements(attribute);
+            if !children.is_empty() {
+                return children;
+            }
+        }
+
+        Vec::new()
+    }
+}
+
+struct MaterializationObserver {
+    _observer: AxObserver,
+    run_loop: RunLoop,
+    source: RunLoopSource,
+    notified: Box<AtomicBool>,
+}
+
+impl MaterializationObserver {
+    fn start(pid: u32, app: &AxElement) -> Option<Self> {
+        let observer = AxObserver::new(pid).ok()?;
+        let run_loop = RunLoop::current()?;
+        let notified = Box::new(AtomicBool::new(false));
+
+        observer.add_notifications(app, AX_MATERIALIZATION_NOTIFICATIONS, &notified);
+        for window in MacOSAccessibility::get_application_windows(app) {
+            observer.add_notifications(&window, AX_MATERIALIZATION_NOTIFICATIONS, &notified);
+        }
+
+        let source = observer.run_loop_source();
+        run_loop.add_default_source(&source);
+
+        Some(Self {
+            _observer: observer,
+            run_loop,
+            source,
+            notified,
         })
-        .map(|handle| handle as *mut c_void)
+    }
+
+    fn take_notified(&self) -> bool {
+        self.notified.swap(false, Ordering::SeqCst)
+    }
 }
 
-fn skylight_event_post_to_pid() -> Option<SLEventPostToPidFn> {
-    static SYMBOL: OnceLock<Option<SLEventPostToPidFn>> = OnceLock::new();
-
-    *SYMBOL.get_or_init(|| unsafe {
-        let handle = skylight_handle()?;
-        let symbol = libc::dlsym(handle, c"SLEventPostToPid".as_ptr());
-        if symbol.is_null() {
-            let _ = dlerror_message();
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, SLEventPostToPidFn>(
-                symbol,
-            ))
-        }
-    })
-}
-
-fn ax_ui_element_get_window() -> Option<AXUIElementGetWindowFn> {
-    static SYMBOL: OnceLock<Option<AXUIElementGetWindowFn>> = OnceLock::new();
-
-    *SYMBOL.get_or_init(|| unsafe {
-        let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetWindow".as_ptr());
-        if symbol.is_null() {
-            let _ = dlerror_message();
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, AXUIElementGetWindowFn>(
-                symbol,
-            ))
-        }
-    })
+impl Drop for MaterializationObserver {
+    fn drop(&mut self) {
+        self.run_loop.remove_default_source(&self.source);
+    }
 }
 
 /// macOS accessibility reader using AXUIElement API.
@@ -165,14 +306,33 @@ pub struct MacOSAccessibility {
     /// Cache of elements with their platform handles.
     cache: ElementCache,
 
-    /// Map from ElementKey to AXUIElement handle for performing actions.
-    handles: HashMap<ElementKey, CFRetained<AXUIElement>>,
+    /// Map from ElementKey to AX element handle for performing actions.
+    handles: HashMap<ElementKey, AxElement>,
 
     /// PID from the most recent tree build, used to keep cached actions targeted.
     last_tree_pid: Option<u32>,
 
     /// System-wide accessibility element (for hit testing and focus queries).
-    system_wide: CFRetained<AXUIElement>,
+    system_wide: AxElement,
+}
+
+fn sys_point(point: accessibility_macos_sys::Point) -> Point {
+    Point::new(point.x, point.y)
+}
+
+fn sys_rect(rect: accessibility_macos_sys::Rect) -> Rect {
+    Rect::new(
+        sys_point(rect.origin),
+        Size::new(rect.size.width, rect.size.height),
+    )
+}
+
+fn sys_screenshot(image: accessibility_macos_sys::PngImage) -> Screenshot {
+    Screenshot {
+        data: image.data,
+        width: image.width,
+        height: image.height,
+    }
 }
 
 impl MacOSAccessibility {
@@ -188,75 +348,91 @@ impl MacOSAccessibility {
             );
         }
 
-        // Safety: AXUIElement::new_system_wide creates a valid system-wide element
-        let system_wide = unsafe { AXUIElement::new_system_wide() };
-
         Ok(Self {
             cache: ElementCache::new(),
             handles: HashMap::new(),
             last_tree_pid: None,
-            system_wide,
+            system_wide: AxElement::system_wide(),
         })
+    }
+
+    fn empty_replacement() -> Self {
+        Self {
+            cache: ElementCache::new(),
+            handles: HashMap::new(),
+            last_tree_pid: None,
+            system_wide: AxElement::system_wide(),
+        }
+    }
+
+    async fn run_with_blocking_state<T, F>(&mut self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Self) -> Result<T> + Send + 'static,
+    {
+        let mut reader = std::mem::replace(self, Self::empty_replacement());
+
+        let (reader, result) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle
+                .spawn_blocking(move || {
+                    let result = f(&mut reader);
+                    (reader, result)
+                })
+                .await
+                .map_err(|error| anyhow!("macOS accessibility blocking task failed: {error}"))?
+        } else {
+            let result = f(&mut reader);
+            (reader, result)
+        };
+
+        *self = reader;
+        result
+    }
+
+    async fn run_blocking_task<T, F>(f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle
+                .spawn_blocking(f)
+                .await
+                .map_err(|error| anyhow!("macOS accessibility blocking task failed: {error}"))?
+        } else {
+            f()
+        }
     }
 
     /// Check if the process has accessibility permissions.
     pub fn is_process_trusted() -> bool {
-        // Safety: AXIsProcessTrusted is a safe C function
-        unsafe { AXIsProcessTrusted() }
+        accessibility_macos_sys::is_process_trusted()
+    }
+
+    /// Snapshot the accessibility tree synchronously for a target application.
+    ///
+    /// The async trait method delegates here; the sys wrapper bounds individual
+    /// remote AX messages with AXUIElementSetMessagingTimeout so a bad target
+    /// cannot wedge the caller indefinitely.
+    fn get_tree_blocking_for_pid(
+        &mut self,
+        actual_pid: u32,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        let app_element = AxElement::application(actual_pid);
+        let app_name = Self::get_string_attribute(&app_element, AX_TITLE);
+
+        self.prepare_and_build_tree(actual_pid, &app_element, app_name, filter)
     }
 
     /// Return the main display's bounds in global screen coordinates.
     fn main_display_bounds() -> Rect {
-        let bounds = CGDisplayBounds(CGMainDisplayID());
-        Rect::new(
-            Point::new(bounds.origin.x, bounds.origin.y),
-            crate::accessibility::Size::new(bounds.size.width, bounds.size.height),
-        )
+        sys_rect(accessibility_macos_sys::main_display_bounds())
     }
 
     /// Capture the main display and encode it as PNG.
     fn capture_main_display() -> Result<Screenshot> {
-        #[allow(deprecated)]
-        let image = objc2_core_graphics::CGDisplayCreateImage(CGMainDisplayID())
-            .ok_or_else(|| anyhow!("Failed to capture main display"))?;
-
-        Self::encode_cg_image_as_png(&image)
-    }
-
-    /// Convert a CoreGraphics image into the Screenshot format used by the public API.
-    fn encode_cg_image_as_png(image: &CGImage) -> Result<Screenshot> {
-        let width = CGImage::width(Some(image)) as u32;
-        let height = CGImage::height(Some(image)) as u32;
-        if width == 0 || height == 0 {
-            bail!("Captured image has empty dimensions: {}x{}", width, height);
-        }
-
-        let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), image);
-        let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
-        let data = unsafe {
-            bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
-        }
-        .ok_or_else(|| anyhow!("Failed to encode screenshot as PNG"))?;
-
-        let len = data.length();
-        if len == 0 {
-            bail!("Encoded screenshot is empty");
-        }
-
-        let mut bytes = vec![0; len];
-        unsafe {
-            data.getBytes_length(
-                NonNull::new(bytes.as_mut_ptr().cast::<c_void>())
-                    .expect("Vec pointer should be non-null"),
-                len,
-            );
-        }
-
-        Ok(Screenshot {
-            data: bytes,
-            width,
-            height,
-        })
+        accessibility_macos_sys::capture_main_display().map(sys_screenshot)
     }
 
     /// Current timestamp in milliseconds since the Unix epoch.
@@ -376,177 +552,71 @@ impl MacOSAccessibility {
         }
     }
 
-    fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {
-        let mut flags = CGEventFlags::empty();
-        if modifiers.contains(Modifiers::SHIFT) {
-            flags |= CGEventFlags::MaskShift;
-        }
-        if modifiers.contains(Modifiers::CONTROL) {
-            flags |= CGEventFlags::MaskControl;
-        }
-        if modifiers.contains(Modifiers::ALT) {
-            flags |= CGEventFlags::MaskAlternate;
-        }
-        if modifiers.contains(Modifiers::META) {
-            flags |= CGEventFlags::MaskCommand;
-        }
-        flags
-    }
-
-    fn set_event_target_pid(event: &CGEvent, pid: u32) {
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::EventTargetUnixProcessID,
-            pid as i64,
-        );
-    }
-
-    fn post_event(pid: Option<u32>, event: &CGEvent) {
-        if let Some(pid) = pid {
-            Self::set_event_target_pid(event, pid);
-            CGEvent::post_to_pid(pid as libc::pid_t, Some(event));
-        } else {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+    fn modifier_flags(modifiers: Modifiers) -> MacModifierFlags {
+        MacModifierFlags {
+            shift: modifiers.contains(Modifiers::SHIFT),
+            control: modifiers.contains(Modifiers::CONTROL),
+            alt: modifiers.contains(Modifiers::ALT),
+            meta: modifiers.contains(Modifiers::META),
         }
     }
 
-    fn post_event_to_pid_via_skylight(pid: u32, event: &CGEvent) -> bool {
-        let Some(post_to_pid) = skylight_event_post_to_pid() else {
-            return false;
-        };
-
-        Self::set_event_target_pid(event, pid);
-        unsafe {
-            post_to_pid(pid as libc::pid_t, Some(event));
-        }
-        true
-    }
-
-    fn post_key_event(
-        pid: Option<u32>,
-        code: Code,
-        modifiers: Modifiers,
-        key_down: bool,
-    ) -> Result<()> {
+    fn post_key_event(pid: u32, code: Code, modifiers: Modifiers, key_down: bool) -> Result<()> {
         let key_code = Self::key_code(code)
             .ok_or_else(|| anyhow!("Key {:?} is not supported on macOS", code))?;
-        let event = CGEvent::new_keyboard_event(None, key_code, key_down)
-            .ok_or_else(|| anyhow!("Failed to create keyboard event"))?;
-        CGEvent::set_flags(Some(&event), Self::modifier_flags(modifiers));
-        Self::post_event(pid, &event);
-        Ok(())
+        // Even with SkyLight per-PID delivery, AppKit-based apps drop key
+        // events that arrive while they are not frontmost — that's an
+        // OS-level policy we can't override. Callers driving a backgrounded
+        // app should invoke the equivalent action (e.g. click the Equals
+        // button) rather than send a key like Return.
+        accessibility_macos_sys::post_keyboard_event(
+            pid,
+            key_code,
+            Self::modifier_flags(modifiers),
+            key_down,
+        )
     }
 
-    fn post_keystroke(pid: Option<u32>, code: Code, modifiers: Modifiers) -> Result<()> {
+    fn post_keystroke(pid: u32, code: Code, modifiers: Modifiers) -> Result<()> {
         Self::post_key_event(pid, code, modifiers, true)?;
         std::thread::sleep(Duration::from_millis(10));
         Self::post_key_event(pid, code, modifiers, false)
     }
 
-    fn cg_mouse_button(button: crate::input::MouseButton) -> CGMouseButton {
+    fn mac_mouse_button(button: crate::input::MouseButton) -> MacMouseButton {
         match button {
-            crate::input::MouseButton::Left => CGMouseButton::Left,
-            crate::input::MouseButton::Right => CGMouseButton::Right,
-            crate::input::MouseButton::Middle => CGMouseButton::Center,
+            crate::input::MouseButton::Left => MacMouseButton::Left,
+            crate::input::MouseButton::Right => MacMouseButton::Right,
+            crate::input::MouseButton::Middle => MacMouseButton::Middle,
         }
     }
 
-    fn mouse_event_types(button: crate::input::MouseButton) -> (CGEventType, CGEventType) {
-        match button {
-            crate::input::MouseButton::Left => {
-                (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp)
-            }
-            crate::input::MouseButton::Right => {
-                (CGEventType::RightMouseDown, CGEventType::RightMouseUp)
-            }
-            crate::input::MouseButton::Middle => {
-                (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp)
-            }
-        }
-    }
-
-    fn mouse_button_number(button: crate::input::MouseButton) -> i64 {
-        match button {
-            crate::input::MouseButton::Left => 0,
-            crate::input::MouseButton::Right => 1,
-            crate::input::MouseButton::Middle => 2,
-        }
-    }
-
-    fn configure_mouse_event(
-        event: &CGEvent,
-        pid: Option<u32>,
+    fn post_mouse_event(
+        pid: u32,
+        point: Point,
+        kind: MacMouseEventKind,
         button: crate::input::MouseButton,
         click_state: i64,
         pressure: f64,
-    ) {
-        if let Some(pid) = pid {
-            Self::set_event_target_pid(event, pid);
-            if let Some(window_id) = unsafe { Self::get_window_id_for_pid(pid) } {
-                CGEvent::set_integer_value_field(
-                    Some(event),
-                    CGEventField::MouseEventWindowUnderMousePointer,
-                    window_id as i64,
-                );
-                CGEvent::set_integer_value_field(
-                    Some(event),
-                    CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
-                    window_id as i64,
-                );
-            }
-        }
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::MouseEventButtonNumber,
-            Self::mouse_button_number(button),
-        );
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::MouseEventClickState,
-            click_state,
-        );
-        CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventSubtype, 0);
-        CGEvent::set_double_value_field(Some(event), CGEventField::MouseEventPressure, pressure);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn post_mouse_event(
-        pid: Option<u32>,
-        x: f64,
-        y: f64,
-        event_type: CGEventType,
-        button: CGMouseButton,
-        input_button: crate::input::MouseButton,
-        click_state: i64,
-        pressure: f64,
     ) -> Result<()> {
-        let point = objc2_core_foundation::CGPoint { x, y };
-        let event = CGEvent::new_mouse_event(None, event_type, point, button)
-            .ok_or_else(|| anyhow!("Failed to create mouse event"))?;
-        Self::configure_mouse_event(&event, pid, input_button, click_state, pressure);
-
-        if let Some(pid) = pid {
-            if Self::post_event_to_pid_via_skylight(pid, &event) {
-                return Ok(());
-            }
-            CGEvent::post_to_pid(pid as libc::pid_t, Some(&event));
-        } else {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-        }
-        Ok(())
+        let window_id = Self::get_window_id_for_pid(pid);
+        accessibility_macos_sys::post_mouse_event(
+            pid,
+            window_id,
+            point.x,
+            point.y,
+            kind,
+            Self::mac_mouse_button(button),
+            click_state,
+            pressure,
+        )
     }
 
-    fn post_chromium_activation_primer(pid: Option<u32>) -> Result<()> {
-        if pid.is_none() {
-            return Ok(());
-        }
-
+    fn post_chromium_activation_primer(pid: u32) -> Result<()> {
         Self::post_mouse_event(
             pid,
-            -1.0,
-            -1.0,
-            CGEventType::LeftMouseDown,
-            CGMouseButton::Left,
+            Point::new(-1.0, -1.0),
+            MacMouseEventKind::Down,
             crate::input::MouseButton::Left,
             1,
             1.0,
@@ -554,10 +624,8 @@ impl MacOSAccessibility {
         std::thread::sleep(Duration::from_millis(2));
         Self::post_mouse_event(
             pid,
-            -1.0,
-            -1.0,
-            CGEventType::LeftMouseUp,
-            CGMouseButton::Left,
+            Point::new(-1.0, -1.0),
+            MacMouseEventKind::Up,
             crate::input::MouseButton::Left,
             1,
             0.0,
@@ -567,44 +635,51 @@ impl MacOSAccessibility {
     }
 
     fn post_mouse_click_sequence(
-        pid: Option<u32>,
+        pid: u32,
         x: f64,
         y: f64,
         button: crate::input::MouseButton,
         click_state: i64,
     ) -> Result<()> {
-        if pid.is_some() && button == crate::input::MouseButton::Left && click_state == 1 {
+        if button == crate::input::MouseButton::Left && click_state == 1 {
             Self::post_chromium_activation_primer(pid)?;
         }
 
-        let cg_button = Self::cg_mouse_button(button);
-        let (down_type, up_type) = Self::mouse_event_types(button);
-        Self::post_mouse_event(pid, x, y, down_type, cg_button, button, click_state, 1.0)?;
+        let point = Point::new(x, y);
+        // Hover the target before clicking. Chromium's pointer-event pipeline
+        // tracks hit-test state across moves; React's synthetic onClick won't
+        // fire on a button if the renderer never observed a MouseMoved landing
+        // on it. The chromium primer wakes the renderer but lands at (-1, -1),
+        // so without this move the pointer state stays off-screen.
+        Self::post_mouse_event(pid, point, MacMouseEventKind::Move, button, 0, 0.0)?;
         std::thread::sleep(Duration::from_millis(10));
-        Self::post_mouse_event(pid, x, y, up_type, cg_button, button, click_state, 0.0)
+        Self::post_mouse_event(
+            pid,
+            point,
+            MacMouseEventKind::Down,
+            button,
+            click_state,
+            1.0,
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+        Self::post_mouse_event(pid, point, MacMouseEventKind::Up, button, click_state, 0.0)
     }
 
-    fn current_mouse_location() -> Result<objc2_core_foundation::CGPoint> {
-        let event =
-            CGEvent::new(None).ok_or_else(|| anyhow!("Failed to read current mouse location"))?;
-        Ok(CGEvent::location(Some(&event)))
+    fn current_mouse_location() -> Result<accessibility_macos_sys::Point> {
+        accessibility_macos_sys::current_mouse_location()
     }
 
-    unsafe fn get_pid_for_element(element: &AXUIElement) -> Option<u32> {
-        let mut pid: libc::pid_t = 0;
-        let pid_ptr = NonNull::new(&mut pid as *mut libc::pid_t).unwrap();
-        let result = element.pid(pid_ptr);
-        if result == AXError::Success && pid > 0 {
-            Some(pid as u32)
-        } else {
-            None
-        }
+    fn get_pid_for_element(element: &AxElement) -> Option<u32> {
+        element.pid()
     }
 
     fn flatten_elements(element: &Element, elements: &mut Vec<Element>) {
-        elements.push(element.clone());
-        for child in &element.children {
-            Self::flatten_elements(child, elements);
+        let mut stack = vec![element];
+        while let Some(current) = stack.pop() {
+            elements.push(current.clone());
+            for child in current.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -645,138 +720,501 @@ impl MacOSAccessibility {
         (values, focused)
     }
 
-    /// Get an attribute value from an AXUIElement.
-    unsafe fn get_attribute(element: &AXUIElement, attribute: &str) -> Result<CFRetained<CFType>> {
-        let attr = CFString::from_str(attribute);
-        let mut value: *const CFType = std::ptr::null();
-        let value_ptr: *mut *const CFType = &mut value;
+    fn has_attribute_name(element: &AxElement, attribute: &str) -> bool {
+        element.has_attribute(attribute)
+    }
 
-        let result =
-            unsafe { element.copy_attribute_value(&attr, NonNull::new(value_ptr).unwrap()) };
+    /// Ask the target application to expose its full accessibility interface.
+    ///
+    /// Chromium uses AXEnhancedUserInterface as the macOS assistive-technology
+    /// signal. Electron apps additionally honor AXManualAccessibility. These are
+    /// one-way enable requests from our side; toggling them back to false can
+    /// make Chromium debounce and delay rebuilding the web accessibility cache.
+    fn enable_full_accessibility(element: &AxElement) -> bool {
+        let _ = element.attribute_string(AX_ROLE);
+        let manual = element.set_bool_attribute(AX_MANUAL_ACCESSIBILITY, true);
+        let enhanced = element.set_bool_attribute(AX_ENHANCED_USER_INTERFACE, true);
+        manual || enhanced
+    }
 
-        if result == AXError::Success && !value.is_null() {
-            // Safety: copy_attribute_value returns a +1 retained value
-            let retained =
-                unsafe { CFRetained::from_raw(NonNull::new(value as *mut CFType).unwrap()) };
-            Ok(retained)
-        } else {
-            Err(anyhow!(
-                "Failed to get attribute {}: {:?}",
-                attribute,
-                result
-            ))
+    fn enable_accessibility_roots(app: &AxElement) -> bool {
+        let mut requested = Self::enable_full_accessibility(app);
+        for window in Self::get_application_windows(app) {
+            requested |= Self::enable_full_accessibility(&window);
         }
+
+        requested
+    }
+
+    fn enable_full_accessibility_for_cached_web_content(&self) -> bool {
+        let mut requested = false;
+        for (id, element) in self.cache.iter() {
+            if element.role != Role::WebView {
+                continue;
+            }
+            let Some(handle) = self.handles.get(&id) else {
+                continue;
+            };
+            requested |= Self::enable_full_accessibility(handle);
+            requested |= !Self::search_predicate_children(handle).is_empty();
+        }
+        requested
+    }
+
+    fn prime_accessibility_roots(app: &AxElement) {
+        let _ = app.attribute_string(AX_FOCUSED_UI_ELEMENT);
+        let _ = Self::discover_children(app, ChildDiscovery::STRUCTURAL_ONLY);
+
+        for window in Self::get_application_windows(app) {
+            let _ = Self::discover_children(&window, ChildDiscovery::STRUCTURAL_ONLY);
+            let _ = window.attribute_string(AX_FOCUSED_UI_ELEMENT);
+        }
+    }
+
+    fn observe_materialization_notifications(
+        observer: &AxObserver,
+        element: &AxElement,
+        notified: &AtomicBool,
+    ) {
+        observer.add_notifications(element, AX_MATERIALIZATION_NOTIFICATIONS, notified);
+    }
+
+    fn has_full_accessibility_request(app: &AxElement) -> bool {
+        Self::has_attribute_name(app, AX_ENHANCED_USER_INTERFACE)
+            || Self::get_application_windows(app)
+                .iter()
+                .any(|window| Self::has_attribute_name(window, AX_ENHANCED_USER_INTERFACE))
+    }
+
+    fn classify_materialization(tree: &ElementTree, pid: u32) -> MaterializationState {
+        if Self::tree_has_webview_content(tree) {
+            return MaterializationState::WebReady;
+        }
+
+        if Self::tree_has_webview_candidate(tree)
+            || accessibility_macos_sys::is_chromium_based_app(pid)
+        {
+            return MaterializationState::WebNeedsWait;
+        }
+
+        MaterializationState::NativeReady
+    }
+
+    fn prepare_and_build_tree(
+        &mut self,
+        pid: u32,
+        app: &AxElement,
+        app_name: Option<String>,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        let observer = MaterializationObserver::start(pid, app);
+        let requested = Self::enable_accessibility_roots(app);
+        Self::prime_accessibility_roots(app);
+
+        let tree = self.build_tree_snapshot(pid, app, app_name.clone(), filter)?;
+        match Self::classify_materialization(&tree, pid) {
+            MaterializationState::NativeReady | MaterializationState::WebReady => Ok(tree),
+            MaterializationState::WebNeedsWait => self.materialize_web_content(
+                MaterializationContext {
+                    pid,
+                    app,
+                    app_name,
+                    filter,
+                    observer,
+                    root_requested: requested,
+                },
+                tree,
+            ),
+        }
+    }
+
+    fn materialize_web_content(
+        &mut self,
+        context: MaterializationContext<'_>,
+        initial_tree: ElementTree,
+    ) -> Result<ElementTree> {
+        let mut tree = initial_tree;
+        let targeted = self.enable_full_accessibility_for_cached_web_content();
+        if targeted {
+            tree = self.build_tree_snapshot(
+                context.pid,
+                context.app,
+                context.app_name.clone(),
+                context.filter,
+            )?;
+            if Self::classify_materialization(&tree, context.pid) == MaterializationState::WebReady
+            {
+                return Ok(tree);
+            }
+        }
+
+        if !context.root_requested
+            && !targeted
+            && !Self::has_full_accessibility_request(context.app)
+        {
+            return Ok(tree);
+        }
+
+        let deadline = std::time::Instant::now() + AX_ENHANCED_USER_INTERFACE_OBSERVER_WAIT;
+        while std::time::Instant::now() < deadline {
+            accessibility_macos_sys::run_default_loop_slice(
+                AX_ENHANCED_USER_INTERFACE_OBSERVER_SLICE_SECONDS,
+                true,
+            );
+            if context
+                .observer
+                .as_ref()
+                .is_some_and(|observer| observer.take_notified())
+            {
+                Self::prime_accessibility_roots(context.app);
+                tree = self.build_tree_snapshot(
+                    context.pid,
+                    context.app,
+                    context.app_name.clone(),
+                    context.filter,
+                )?;
+                if Self::classify_materialization(&tree, context.pid)
+                    == MaterializationState::WebReady
+                {
+                    return Ok(tree);
+                }
+            }
+        }
+
+        self.build_tree_snapshot(context.pid, context.app, context.app_name, context.filter)
+    }
+
+    fn build_tree_snapshot(
+        &mut self,
+        pid: u32,
+        app: &AxElement,
+        app_name: Option<String>,
+        filter: &TreeFilter,
+    ) -> Result<ElementTree> {
+        self.clear_cache();
+        self.last_tree_pid = Some(pid);
+        let version = self.cache.version();
+        let mut element_count = 0;
+        let root = self
+            .build_element(app, filter, 0, &mut element_count)
+            .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?;
+
+        Ok(ElementTree {
+            version,
+            pid: Some(pid),
+            app_name,
+            root,
+            element_count,
+        })
+    }
+
+    fn tree_has_webview_content(tree: &ElementTree) -> bool {
+        fn has_accessible_text(element: &Element) -> bool {
+            [
+                element.title.as_ref(),
+                element.description.as_ref(),
+                element.value.as_ref(),
+            ]
+            .iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
+        }
+
+        let mut stack = vec![(&tree.root, 0usize, false)];
+        while let Some((element, depth, inside_webview)) = stack.pop() {
+            if depth > 24 {
+                continue;
+            }
+
+            if inside_webview && has_accessible_text(element) {
+                return true;
+            }
+
+            let child_inside_webview =
+                inside_webview || (element.role == Role::WebView && !element.children.is_empty());
+            for child in element.children.iter().rev() {
+                stack.push((child, depth + 1, child_inside_webview));
+            }
+        }
+
+        false
+    }
+
+    fn tree_has_webview_candidate(tree: &ElementTree) -> bool {
+        let mut stack = vec![&tree.root];
+        while let Some(element) = stack.pop() {
+            if element.role == Role::WebView {
+                return true;
+            }
+            for child in element.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        false
+    }
+
+    fn format_element_signature(
+        pid: Option<u32>,
+        role: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        value: Option<&str>,
+        bounds: Option<&Rect>,
+    ) -> String {
+        fn normalized_attribute(value: Option<&str>) -> Option<&str> {
+            value.filter(|value| !value.is_empty())
+        }
+
+        let bounds = bounds.map(|bounds| {
+            (
+                bounds.origin.x.round() as i64,
+                bounds.origin.y.round() as i64,
+                bounds.size.width.round() as i64,
+                bounds.size.height.round() as i64,
+            )
+        });
+        let role = normalized_attribute(role);
+        let title = normalized_attribute(title);
+        let description = normalized_attribute(description);
+        let value = normalized_attribute(value);
+
+        format!("{pid:?}|{role:?}|{title:?}|{description:?}|{value:?}|{bounds:?}")
+    }
+
+    fn element_signature(element: &AxElement) -> String {
+        let pid = Self::get_pid_for_element(element);
+        let attributes = element.attribute_values(AX_ELEMENT_ATTRIBUTE_BATCH);
+        let (role, title, description, value, bounds) =
+            if let Some(attributes) = attributes.as_ref() {
+                let bounds = attributes
+                    .point(AX_BATCH_POSITION)
+                    .zip(attributes.size(AX_BATCH_SIZE))
+                    .map(|(position, size)| {
+                        Rect::new(sys_point(position), Size::new(size.width, size.height))
+                    });
+
+                (
+                    attributes.string(AX_BATCH_ROLE),
+                    attributes.string(AX_BATCH_TITLE),
+                    attributes.string(AX_BATCH_DESCRIPTION),
+                    attributes.string(AX_BATCH_VALUE),
+                    bounds,
+                )
+            } else {
+                (
+                    Self::get_string_attribute(element, AX_ROLE),
+                    Self::get_string_attribute(element, AX_TITLE),
+                    Self::get_string_attribute(element, AX_DESCRIPTION),
+                    Self::get_string_attribute(element, AX_VALUE),
+                    Self::get_bounds(element),
+                )
+            };
+
+        Self::format_element_signature(
+            pid,
+            role.as_deref(),
+            title.as_deref(),
+            description.as_deref(),
+            value.as_deref(),
+            bounds.as_ref(),
+        )
+    }
+
+    fn handle_for_id(&mut self, id: ElementKey) -> Result<AxElement> {
+        self.handles
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))
     }
 
     /// Get a string attribute value.
-    unsafe fn get_string_attribute(element: &AXUIElement, attribute: &str) -> Option<String> {
-        Self::get_attribute(element, attribute)
-            .ok()
-            .and_then(|value| {
-                // Try to cast to CFString
-                let cf_string = value.downcast::<CFString>().ok()?;
-                Some(cf_string.to_string())
-            })
+    fn get_string_attribute(element: &AxElement, attribute: &str) -> Option<String> {
+        element.attribute_string(attribute)
     }
 
     /// Get a boolean attribute value.
-    ///
-    /// Note: This is simplified - proper implementation would use CFBoolean.
-    /// For now we just check if the attribute exists.
-    unsafe fn get_bool_attribute(element: &AXUIElement, attribute: &str) -> Option<bool> {
-        // If we can get the attribute, assume it's true
-        // A proper implementation would check CFBooleanGetValue
-        Self::get_attribute(element, attribute).ok().map(|_| true)
+    fn get_bool_attribute(element: &AxElement, attribute: &str) -> Option<bool> {
+        element.attribute_bool(attribute)
     }
 
     /// Get the position of an element as a Point.
-    unsafe fn get_position(element: &AXUIElement) -> Option<Point> {
-        let value = Self::get_attribute(element, AX_POSITION).ok()?;
-        let ax_value = value.downcast_ref::<AXValue>()?;
-
-        let mut point = objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 };
-        let success = ax_value.value(
-            AXValueType::CGPoint,
-            NonNull::new(&mut point as *mut _ as *mut _).unwrap(),
-        );
-
-        if success {
-            Some(Point::new(point.x, point.y))
-        } else {
-            None
-        }
+    fn get_position(element: &AxElement) -> Option<Point> {
+        element.attribute_point(AX_POSITION).map(sys_point)
     }
 
     /// Get the size of an element.
-    unsafe fn get_size(element: &AXUIElement) -> Option<(f64, f64)> {
-        let value = Self::get_attribute(element, AX_SIZE).ok()?;
-        let ax_value = value.downcast_ref::<AXValue>()?;
-
-        let mut size = objc2_core_foundation::CGSize {
-            width: 0.0,
-            height: 0.0,
-        };
-        let success = ax_value.value(
-            AXValueType::CGSize,
-            NonNull::new(&mut size as *mut _ as *mut _).unwrap(),
-        );
-
-        if success {
-            Some((size.width, size.height))
-        } else {
-            None
-        }
+    fn get_size(element: &AxElement) -> Option<(f64, f64)> {
+        element
+            .attribute_size(AX_SIZE)
+            .map(|size| (size.width, size.height))
     }
 
     /// Get the bounds (position + size) of an element.
-    unsafe fn get_bounds(element: &AXUIElement) -> Option<Rect> {
+    fn get_bounds(element: &AxElement) -> Option<Rect> {
         let position = Self::get_position(element)?;
         let (width, height) = Self::get_size(element)?;
 
-        use crate::accessibility::Size;
         Some(Rect::new(position, Size::new(width, height)))
     }
 
-    /// Get the children of an element.
-    unsafe fn get_children(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
-        let value = match unsafe { Self::get_attribute(element, AX_CHILDREN) } {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
+    /// Discover children for the requested traversal purpose.
+    fn discover_children(element: &AxElement, discovery: ChildDiscovery) -> Vec<AxElement> {
+        discovery.discover(element)
+    }
 
-        // The returned value is a CFArray of AXUIElements
-        // Use cast_unchecked to convert CFType to CFArray<AXUIElement>
-        let array: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(value) };
+    /// Get tree-building children for an element.
+    fn get_children(element: &AxElement) -> Vec<AxElement> {
+        Self::discover_children(element, ChildDiscovery::ENRICHED)
+    }
 
-        let mut children = Vec::new();
-        for i in 0..array.len() {
-            if let Some(child) = array.get(i) {
-                children.push(child);
+    fn search_predicate_children(element: &AxElement) -> Vec<AxElement> {
+        element.ui_elements_for_search_predicate(AxSearchPredicate::new(
+            AX_WEB_SEARCH_KEYS,
+            AX_WEB_SEARCH_RESULTS_LIMIT,
+        ))
+    }
+
+    fn web_search_child_seeds(
+        web_element: &AxElement,
+        search_children: Vec<AxElement>,
+    ) -> Vec<BuildSeed> {
+        struct SearchNode {
+            element: AxElement,
+            parent: Option<AxElement>,
+            children: Vec<usize>,
+        }
+
+        fn build_seed(nodes: &[SearchNode], index: usize) -> BuildSeed {
+            let children = nodes[index]
+                .children
+                .iter()
+                .copied()
+                .map(|child| build_seed(nodes, child))
+                .collect();
+            BuildSeed::with_children(nodes[index].element.clone(), children)
+        }
+
+        fn nearest_search_parent_index(
+            web_element: &AxElement,
+            nodes: &[SearchNode],
+            parent: Option<&AxElement>,
+        ) -> Option<usize> {
+            let mut current = parent?.clone();
+            let mut seen = Vec::new();
+
+            loop {
+                if web_element.is_same_element(&current) {
+                    return None;
+                }
+
+                if seen
+                    .iter()
+                    .any(|element: &AxElement| element.is_same_element(&current))
+                {
+                    return None;
+                }
+                seen.push(current.clone());
+
+                if let Some(index) = nodes
+                    .iter()
+                    .position(|candidate| candidate.element.is_same_element(&current))
+                {
+                    return Some(index);
+                }
+
+                current = current.attribute_elements(AX_PARENT).into_iter().next()?;
             }
         }
-        children
+
+        let mut nodes: Vec<SearchNode> = search_children
+            .into_iter()
+            .map(|element| {
+                let parent = element.attribute_elements(AX_PARENT).into_iter().next();
+                SearchNode {
+                    element,
+                    parent,
+                    children: Vec::new(),
+                }
+            })
+            .collect();
+
+        let parents: Vec<Option<usize>> = nodes
+            .iter()
+            .map(|node| nearest_search_parent_index(web_element, &nodes, node.parent.as_ref()))
+            .collect();
+
+        let mut roots = Vec::new();
+        for (index, parent_index) in parents.into_iter().enumerate() {
+            if let Some(parent_index) = parent_index
+                && parent_index != index
+            {
+                nodes[parent_index].children.push(index);
+                continue;
+            }
+
+            roots.push(index);
+        }
+
+        roots
+            .into_iter()
+            .map(|index| build_seed(&nodes, index))
+            .collect()
+    }
+
+    fn get_child_seeds(element: &AxElement, role: Role) -> Vec<BuildSeed> {
+        if role == Role::WebView {
+            let search_children = Self::search_predicate_children(element);
+            if !search_children.is_empty() {
+                return Self::web_search_child_seeds(element, search_children);
+            }
+        }
+
+        Self::get_children(element)
+            .into_iter()
+            .map(BuildSeed::descend)
+            .collect()
+    }
+
+    /// Get the windows of an application element.
+    ///
+    /// For a non-frontmost application, `AXChildren` typically omits the visible
+    /// windows. Empirically on macOS, `AXWindows` is *also* often empty for
+    /// backgrounded apps, but `AXMainWindow` or `AXFocusedWindow` may still
+    /// return the visible window; we use all three so single-window apps still
+    /// walk correctly when backgrounded.
+    /// The returned list is deduped by window title — macOS hands out fresh
+    /// AX element wrappers per call so raw-pointer dedup doesn't work.
+    fn get_application_windows(element: &AxElement) -> Vec<AxElement> {
+        let mut windows: Vec<AxElement> = Vec::new();
+        let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let push = |w: AxElement,
+                    windows: &mut Vec<AxElement>,
+                    seen: &mut std::collections::HashSet<String>| {
+            let title = Self::get_string_attribute(&w, AX_TITLE).unwrap_or_default();
+            if title.is_empty() || seen.insert(title) {
+                windows.push(w);
+            }
+        };
+
+        for window in element.attribute_elements(AX_WINDOWS) {
+            push(window, &mut windows, &mut seen_titles);
+        }
+
+        for window in element.attribute_elements(AX_MAIN_WINDOW) {
+            push(window, &mut windows, &mut seen_titles);
+        }
+
+        for window in element.attribute_elements(AX_FOCUSED_WINDOW) {
+            push(window, &mut windows, &mut seen_titles);
+        }
+
+        windows
     }
 
     /// Get available actions for an element.
-    unsafe fn get_actions(element: &AXUIElement) -> Vec<String> {
-        let mut names: *const CFArray = std::ptr::null();
-        let result = element.copy_action_names(NonNull::new(&mut names).unwrap());
-
-        if result != AXError::Success || names.is_null() {
-            return Vec::new();
-        }
-
-        let names = NonNull::new(names as *mut CFArray as *mut CFArray<CFString>).unwrap();
-        let array: CFRetained<CFArray<CFString>> = CFRetained::from_raw(names);
-        let mut actions = Vec::new();
-
-        for i in 0..array.len() {
-            if let Some(name) = array.get(i) {
-                actions.push(name.to_string());
-            }
-        }
-
-        actions
+    fn get_actions(element: &AxElement) -> Vec<String> {
+        element.action_names()
     }
 
     /// Map an AX role string to an accesskit Role.
@@ -830,141 +1268,205 @@ impl MacOSAccessibility {
         }
     }
 
-    /// Build an Element from an AXUIElement.
-    unsafe fn build_element(
+    /// Build an Element from an AX element.
+    fn build_element(
         &mut self,
-        ax_element: &AXUIElement,
+        ax_element: &AxElement,
         filter: &TreeFilter,
         depth: usize,
         element_count: &mut usize,
     ) -> Option<Element> {
-        // Check element count limit
-        if let Some(max) = filter.max_elements
-            && *element_count >= max
-        {
-            return None;
+        struct BuildFrame {
+            seed: BuildSeed,
+            depth: usize,
+            element: Option<Element>,
+            self_matches: bool,
+            children: Vec<BuildSeed>,
+            next_child: usize,
+            retained_children: Vec<Element>,
         }
 
-        // Get role
-        let ax_role = Self::get_string_attribute(ax_element, AX_ROLE)?;
-        let role = Self::map_role(&ax_role);
-
-        // Allocate ID before storing the platform handle; this preserves the existing
-        // handle/cache ordering for macOS while the cache API transition settles.
-        #[allow(deprecated)]
-        let id = self.cache.next_id();
-
-        // Build element
-        let mut element = Element::new(id, role);
-        element.title = Self::get_string_attribute(ax_element, AX_TITLE);
-        element.description = Self::get_string_attribute(ax_element, AX_DESCRIPTION);
-        element.value = Self::get_string_attribute(ax_element, AX_VALUE);
-        element.bounds = Self::get_bounds(ax_element);
-        element.enabled = Self::get_bool_attribute(ax_element, AX_ENABLED).unwrap_or(true);
-        element.focused = Self::get_bool_attribute(ax_element, AX_FOCUSED).unwrap_or(false);
-        element.actions = Self::get_actions(ax_element);
-
-        // Check filter
-        if !filter.should_include(&element, depth) {
-            return None;
-        }
-
-        // Store handle for actions - convert reference to NonNull for retain
-        self.handles
-            .insert(id, unsafe { CFRetained::retain(ax_element.into()) });
-
-        // Store in cache
-        #[allow(deprecated)]
-        self.cache.store_with_id(id, element.clone());
-        *element_count += 1;
-
-        // Process children (if not at max depth)
-        let should_recurse = filter.max_depth.is_none_or(|max| depth < max);
-        if should_recurse {
-            let children = Self::get_children(ax_element);
-            for child in children {
-                if let Some(child_element) =
-                    self.build_element(&child, filter, depth + 1, element_count)
-                {
-                    element.children.push(child_element);
+        impl BuildFrame {
+            fn new(seed: BuildSeed, depth: usize) -> Self {
+                Self {
+                    seed,
+                    depth,
+                    element: None,
+                    self_matches: false,
+                    children: Vec::new(),
+                    next_child: 0,
+                    retained_children: Vec::new(),
                 }
             }
         }
 
-        Some(element)
+        let root_depth = depth;
+        let mut root = None;
+        let mut stack = vec![BuildFrame::new(
+            BuildSeed::descend(ax_element.clone()),
+            depth,
+        )];
+
+        while !stack.is_empty() {
+            let index = stack.len() - 1;
+
+            if stack[index].element.is_none() {
+                if let Some(max) = filter.max_elements
+                    && *element_count >= max
+                    && stack[index].depth != root_depth
+                {
+                    stack.pop();
+                    continue;
+                }
+
+                let current_ax = stack[index].seed.ax_element.clone();
+                let current_depth = stack[index].depth;
+                let attributes = current_ax.attribute_values(AX_ELEMENT_ATTRIBUTE_BATCH);
+                let ax_role = match if let Some(attributes) = attributes.as_ref() {
+                    attributes.string(AX_BATCH_ROLE)
+                } else {
+                    Self::get_string_attribute(&current_ax, AX_ROLE)
+                } {
+                    Some(role) => role,
+                    None => {
+                        stack.pop();
+                        continue;
+                    }
+                };
+                let role = Self::map_role(&ax_role);
+
+                #[allow(deprecated)]
+                let id = self.cache.next_id();
+
+                let mut element = Element::new(id, role);
+                if let Some(attributes) = attributes.as_ref() {
+                    element.title = attributes.string(AX_BATCH_TITLE);
+                    element.description = attributes.string(AX_BATCH_DESCRIPTION);
+                    element.value = attributes.string(AX_BATCH_VALUE);
+                    element.bounds = attributes
+                        .point(AX_BATCH_POSITION)
+                        .zip(attributes.size(AX_BATCH_SIZE))
+                        .map(|(position, size)| {
+                            Rect::new(sys_point(position), Size::new(size.width, size.height))
+                        });
+                    element.enabled = attributes.bool(AX_BATCH_ENABLED).unwrap_or(true);
+                    element.focused = attributes.bool(AX_BATCH_FOCUSED).unwrap_or(false);
+                } else {
+                    element.title = Self::get_string_attribute(&current_ax, AX_TITLE);
+                    element.description = Self::get_string_attribute(&current_ax, AX_DESCRIPTION);
+                    element.value = Self::get_string_attribute(&current_ax, AX_VALUE);
+                    element.bounds = Self::get_bounds(&current_ax);
+                    element.enabled =
+                        Self::get_bool_attribute(&current_ax, AX_ENABLED).unwrap_or(true);
+                    element.focused =
+                        Self::get_bool_attribute(&current_ax, AX_FOCUSED).unwrap_or(false);
+                }
+                element.actions = Self::get_actions(&current_ax);
+
+                let self_matches = filter.should_include(&element, current_depth);
+                let mut children = if filter.max_depth.is_none_or(|max| current_depth < max) {
+                    stack[index]
+                        .seed
+                        .children
+                        .clone()
+                        .unwrap_or_else(|| Self::get_child_seeds(&current_ax, role))
+                } else {
+                    Vec::new()
+                };
+
+                // For backgrounded apps, AXChildren of the Application typically omits
+                // visible windows; AXWindows still returns them. Fall back to AXWindows
+                // only when AXChildren produced no Window-role child.
+                if role == Role::Application {
+                    let has_window_child = children.iter().any(|child| {
+                        Self::get_string_attribute(&child.ax_element, AX_ROLE)
+                            .map(|role| role == ROLE_WINDOW)
+                            .unwrap_or(false)
+                    });
+                    if !has_window_child {
+                        children.extend(
+                            Self::get_application_windows(&current_ax)
+                                .into_iter()
+                                .map(BuildSeed::descend),
+                        );
+                    }
+                }
+
+                stack[index].element = Some(element);
+                stack[index].self_matches = self_matches;
+                stack[index].children = children;
+                continue;
+            }
+
+            if stack[index].next_child < stack[index].children.len() {
+                let child = stack[index].children[stack[index].next_child].clone();
+                let child_depth = stack[index].depth + 1;
+                stack[index].next_child += 1;
+                stack.push(BuildFrame::new(child, child_depth));
+                continue;
+            }
+
+            let mut frame = stack.pop().expect("stack is not empty");
+            let Some(mut element) = frame.element.take() else {
+                continue;
+            };
+            element.children = frame.retained_children;
+
+            let keep =
+                frame.self_matches || !element.children.is_empty() || frame.depth == root_depth;
+            if !keep {
+                continue;
+            }
+
+            let id = element.id;
+            self.handles.insert(id, frame.seed.ax_element);
+
+            #[allow(deprecated)]
+            self.cache.store_with_id(id, element.clone());
+            *element_count += 1;
+
+            if let Some(parent) = stack.last_mut() {
+                parent.retained_children.push(element);
+            } else {
+                root = Some(element);
+            }
+        }
+
+        root
     }
 
     /// Get the focused application's PID using NSWorkspace (most reliable method).
     fn get_frontmost_app_pid() -> Option<u32> {
-        use objc2::rc::Retained;
-        use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-
-        let workspace = NSWorkspace::sharedWorkspace();
-        let frontmost: Option<Retained<NSRunningApplication>> = workspace.frontmostApplication();
-
-        if let Some(app) = frontmost {
-            let pid = app.processIdentifier();
-            if pid > 0 {
-                return Some(pid as u32);
-            }
-        }
-
-        None
+        accessibility_macos_sys::frontmost_application_pid()
     }
 
     /// List all visible application windows with their PIDs, app names, window titles, and focus state.
     pub fn list_windows() -> Vec<(u32, String, String, bool)> {
-        use objc2_app_kit::NSWorkspace;
-
         let mut windows = Vec::new();
-        let workspace = NSWorkspace::sharedWorkspace();
+        let frontmost_pid = accessibility_macos_sys::frontmost_application_pid();
 
-        // Get frontmost app to determine focus
-        let frontmost_pid = workspace
-            .frontmostApplication()
-            .map(|app| app.processIdentifier() as u32);
-
-        // Get all running applications
-        let running_apps = workspace.runningApplications();
-
-        for app in running_apps.iter() {
-            let pid = app.processIdentifier();
-            if pid <= 0 {
-                continue;
-            }
-            let pid = pid as u32;
-
-            // Skip apps without activation policy (background processes)
-            // activationPolicy: 0 = regular, 1 = accessory, 2 = prohibited
-            let policy = app.activationPolicy();
-            if policy.0 != 0 {
+        for app in accessibility_macos_sys::running_applications() {
+            if app.activation_policy != 0 {
                 continue;
             }
 
-            // Get app name
-            let app_name: String = app
-                .localizedName()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            // Try to get window title from accessibility
+            let app_name = app.localized_name.unwrap_or_else(|| "Unknown".to_string());
             let window_title =
-                unsafe { Self::get_window_title_for_pid(pid) }.unwrap_or_else(|| app_name.clone());
+                Self::get_window_title_for_pid(app.pid).unwrap_or_else(|| app_name.clone());
+            let is_focused = frontmost_pid == Some(app.pid);
 
-            let is_focused = frontmost_pid == Some(pid);
-
-            windows.push((pid, app_name, window_title, is_focused));
+            windows.push((app.pid, app_name, window_title, is_focused));
         }
 
         windows
     }
 
     /// Get the main window for a given PID using accessibility APIs.
-    unsafe fn get_window_for_pid(pid: u32) -> Option<CFRetained<AXUIElement>> {
-        let app = AXUIElement::new_application(pid as i32);
+    fn get_window_for_pid(pid: u32) -> Option<AxElement> {
+        let app = AxElement::application(pid);
+        Self::enable_accessibility_roots(&app);
 
-        if let Ok(main_window) = Self::get_attribute(&app, AX_MAIN_WINDOW) {
-            let window: CFRetained<AXUIElement> = CFRetained::cast_unchecked(main_window);
+        for window in app.attribute_elements(AX_MAIN_WINDOW) {
             if let Some(bounds) = Self::get_bounds(&window)
                 && bounds.size.width > 0.0
                 && bounds.size.height > 0.0
@@ -973,17 +1475,12 @@ impl MacOSAccessibility {
             }
         }
 
-        if let Ok(windows_attr) = Self::get_attribute(&app, AX_WINDOWS) {
-            let windows: CFRetained<CFArray<AXUIElement>> =
-                CFRetained::cast_unchecked(windows_attr);
-            for i in 0..windows.len() {
-                if let Some(window) = windows.get(i)
-                    && let Some(bounds) = Self::get_bounds(&window)
-                    && bounds.size.width > 0.0
-                    && bounds.size.height > 0.0
-                {
-                    return Some(window);
-                }
+        for window in app.attribute_elements(AX_WINDOWS) {
+            if let Some(bounds) = Self::get_bounds(&window)
+                && bounds.size.width > 0.0
+                && bounds.size.height > 0.0
+            {
+                return Some(window);
             }
         }
 
@@ -991,235 +1488,196 @@ impl MacOSAccessibility {
     }
 
     /// Get the window title for a given PID using accessibility APIs.
-    unsafe fn get_window_title_for_pid(pid: u32) -> Option<String> {
+    fn get_window_title_for_pid(pid: u32) -> Option<String> {
         let window = Self::get_window_for_pid(pid)?;
         Self::get_string_attribute(&window, AX_TITLE).filter(|title| !title.is_empty())
     }
 
     /// Get the main window bounds for a given PID using accessibility APIs.
-    unsafe fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
+    fn get_window_bounds_for_pid(pid: u32) -> Option<Rect> {
         let window = Self::get_window_for_pid(pid)?;
         Self::get_bounds(&window)
             .filter(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
     }
 
     /// Resolve an AX window to its WindowServer ID using private AX SPI.
-    unsafe fn get_window_id(window: &AXUIElement) -> Option<CGWindowID> {
-        let get_window = ax_ui_element_get_window()?;
-        let mut window_id: CGWindowID = 0;
-        let result = get_window(window, &mut window_id);
-        if result == AXError::Success && window_id != 0 {
-            Some(window_id)
-        } else {
-            None
-        }
+    fn get_window_id(window: &AxElement) -> Option<WindowId> {
+        window.window_id()
     }
 
-    unsafe fn get_window_id_for_pid(pid: u32) -> Option<CGWindowID> {
+    fn get_window_id_for_pid(pid: u32) -> Option<WindowId> {
         let window = Self::get_window_for_pid(pid)?;
         Self::get_window_id(&window)
     }
 
+    /// Set a target window's WindowServer alpha without hiding or minimizing it.
+    ///
+    /// This is intentionally narrow and used by macOS integration tests that
+    /// need a real, materialized window for AX while keeping it off the user's
+    /// screen. Hiding/minimizing Chrome prevents its web accessibility tree from
+    /// materializing.
+    #[doc(hidden)]
+    pub fn set_window_alpha_for_pid(pid: u32, alpha: f32) -> bool {
+        Self::get_window_id_for_pid(pid)
+            .is_some_and(|window_id| accessibility_macos_sys::set_window_alpha(window_id, alpha))
+    }
+
+    /// Move and resize a target window without activating its owning app.
+    ///
+    /// Used by macOS integration tests to keep Chrome's renderer-backed window
+    /// materialized for AX while placing it outside the user's visible display.
+    #[doc(hidden)]
+    pub fn move_window_for_pid(pid: u32, x: f64, y: f64, width: f64, height: f64) -> bool {
+        let Some(window) = Self::get_window_for_pid(pid) else {
+            return false;
+        };
+
+        let positioned =
+            window.set_point_attribute(AX_POSITION, accessibility_macos_sys::Point::new(x, y));
+        let sized =
+            window.set_size_attribute(AX_SIZE, accessibility_macos_sys::Size::new(width, height));
+
+        positioned.is_ok() && sized.is_ok()
+    }
+
     /// Capture a target window through WindowServer so occluding windows are not included.
     fn capture_window_for_pid(pid: u32) -> Result<Option<Screenshot>> {
-        let window = unsafe { Self::get_window_for_pid(pid) };
-        let Some(window_id) = window
-            .as_deref()
-            .and_then(|window| unsafe { Self::get_window_id(window) })
+        let Some(window_id) = Self::get_window_for_pid(pid)
+            .as_ref()
+            .and_then(Self::get_window_id)
         else {
             return Ok(None);
         };
 
-        #[allow(deprecated)]
-        let image = objc2_core_graphics::CGWindowListCreateImage(
-            CGRect::ZERO,
-            CGWindowListOption::OptionIncludingWindow,
-            window_id,
-            CGWindowImageOption::BoundsIgnoreFraming | CGWindowImageOption::BestResolution,
-        );
-
-        image
-            .as_deref()
-            .map(Self::encode_cg_image_as_png)
-            .transpose()
+        accessibility_macos_sys::capture_window(window_id).map(|image| image.map(sys_screenshot))
     }
 
     /// Get the focused application's PID (fallback using AX APIs).
-    unsafe fn get_focused_app_pid_ax(&self) -> Option<u32> {
-        // Try AXFocusedApplication first (returns the frontmost app element)
-        if let Ok(focused_app) = Self::get_attribute(&self.system_wide, AX_FOCUSED_APPLICATION) {
-            let ax_element: CFRetained<AXUIElement> = CFRetained::cast_unchecked(focused_app);
-
-            let mut pid: libc::pid_t = 0;
-            let pid_ptr = NonNull::new(&mut pid as *mut libc::pid_t).unwrap();
-            let result = ax_element.pid(pid_ptr);
-
-            if result == AXError::Success && pid > 0 {
-                return Some(pid as u32);
-            }
-        }
-
-        // Fallback: try AXFocusedUIElement
-        if let Ok(focused) = Self::get_attribute(&self.system_wide, AX_FOCUSED_UI_ELEMENT) {
-            let ax_element: CFRetained<AXUIElement> = CFRetained::cast_unchecked(focused);
-
-            let mut pid: libc::pid_t = 0;
-            let pid_ptr = NonNull::new(&mut pid as *mut libc::pid_t).unwrap();
-            let result = ax_element.pid(pid_ptr);
-
-            if result == AXError::Success && pid > 0 {
-                return Some(pid as u32);
-            }
-        }
-
-        None
+    fn get_focused_app_pid_ax(&self) -> Option<u32> {
+        self.system_wide
+            .attribute_elements(AX_FOCUSED_APPLICATION)
+            .into_iter()
+            .find_map(|element| element.pid())
+            .or_else(|| {
+                self.system_wide
+                    .attribute_elements(AX_FOCUSED_UI_ELEMENT)
+                    .into_iter()
+                    .find_map(|element| element.pid())
+            })
     }
 }
 
 impl AccessibilityReader for MacOSAccessibility {
-    fn get_tree(
-        &mut self,
-        pid: Option<u32>,
-        filter: &TreeFilter,
-    ) -> impl std::future::Future<Output = Result<ElementTree>> {
-        // Clear previous cache
-        self.clear_cache();
+    fn platform_name(&self) -> &'static str {
+        "macOS"
+    }
 
-        let version = self.cache.version();
-
-        let result: Result<ElementTree> = (|| {
-            // Get the target application element
-            let (app_element, actual_pid) = unsafe {
-                if let Some(pid) = pid {
-                    (AXUIElement::new_application(pid as libc::pid_t), pid)
-                } else {
-                    // Get focused application - try NSWorkspace first, then AX APIs
-                    let focused_pid = Self::get_frontmost_app_pid()
-                        .or_else(|| self.get_focused_app_pid_ax())
-                        .ok_or_else(|| anyhow!("No focused application found"))?;
-                    (
-                        AXUIElement::new_application(focused_pid as libc::pid_t),
-                        focused_pid,
-                    )
-                }
-            };
-            self.last_tree_pid = Some(actual_pid);
-
-            // Build the tree
-            let mut element_count = 0;
-            let root = unsafe {
-                self.build_element(&app_element, filter, 0, &mut element_count)
-                    .ok_or_else(|| anyhow!("Failed to build accessibility tree"))?
-            };
-
-            // Try to get app name
-            let app_name = unsafe { Self::get_string_attribute(&app_element, AX_TITLE) };
-
-            Ok(ElementTree {
-                version,
-                pid: Some(actual_pid),
-                app_name,
-                root,
-                element_count,
-            })
-        })();
-
-        std::future::ready(result)
+    async fn get_tree(&mut self, target: &Target, filter: &TreeFilter) -> Result<ElementTree> {
+        let pid = target.require_pid("macOS", "accessibility tree queries")?;
+        let filter = filter.clone();
+        self.run_with_blocking_state(move |reader| reader.get_tree_blocking_for_pid(pid, &filter))
+            .await
     }
 
     fn get_element(&self, id: ElementKey) -> Option<&Element> {
         self.cache.get(id)
     }
 
-    fn perform_action(
-        &mut self,
-        id: ElementKey,
-        action: Action,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result: Result<()> = (|| {
-            let handle = self
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+    async fn perform_action(&mut self, id: ElementKey, action: Action) -> Result<()> {
+        self.run_with_blocking_state(move |reader| {
+            let handle = reader.handle_for_id(id)?;
 
-            // Safety: We're calling AXUIElement methods with valid handles
-            unsafe {
-                // Map action to AX action string
-                let action_name = Self::map_action(action)
-                    .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
-
-                let action_str = CFString::from_str(action_name);
-                let result = handle.perform_action(&action_str);
-
-                if result != AXError::Success {
-                    bail!("Failed to perform action {}: {:?}", action_name, result);
+            // Focus/Blur aren't AX actions on macOS — they're attribute writes.
+            if matches!(action, Action::Focus | Action::Blur) {
+                let want_focus = matches!(action, Action::Focus);
+                let result = handle.set_bool_attribute_result(AX_FOCUSED, want_focus);
+                if !result.is_success() {
+                    // -25201 (IllegalArgument) and -25205 (AttributeUnsupported) both mean
+                    // "this element won't accept the focus write" — usually because the
+                    // platform routes blur through a different mechanism (e.g. AppKit
+                    // collapses focus when another window becomes key).
+                    let verb = if want_focus { "focus" } else { "blur" };
+                    bail!(
+                        "this element does not support programmatic {} on macOS ({:?})",
+                        verb,
+                        result
+                    );
                 }
+                return Ok(());
+            }
+
+            // Route certain clicks through a synthetic mouse event via SkyLight
+            // instead of AXPress, when the element has bounds and a target pid:
+            //
+            // 1. Menu/MenuItem/MenuBar — AXPress on these goes through AppKit's
+            //    menu-tracking path which promotes the owning app to key.
+            //    Synthetic clicks keep focus put.
+            // 2. Chromium-based apps (Electron: Discord/Slack/VS Code; Chrome
+            //    itself; Edge/Brave/etc.) — Chromium's AX-to-DOM bridge
+            //    silently drops AXPress for many web elements. The AX call
+            //    returns success but the renderer never dispatches a DOM
+            //    click. Synthetic mouse events hit Chromium's input pipeline
+            //    directly and the web element's onClick fires.
+            //
+            // AXPress remains the path for native AppKit controls (Calculator,
+            // Finder, etc.) where it's bulletproof and unaffected by window
+            // occlusion — and for elements without bounds.
+            if matches!(action, Action::Click)
+                && let Some(element) = reader.cache.get(id)
+                && let Some(bounds) = element.bounds
+                && let Some(pid) = Self::get_pid_for_element(&handle)
+                && (matches!(element.role, Role::Menu | Role::MenuItem | Role::MenuBar)
+                    || accessibility_macos_sys::is_chromium_based_app(pid))
+            {
+                let x = bounds.origin.x + bounds.size.width / 2.0;
+                let y = bounds.origin.y + bounds.size.height / 2.0;
+                return Self::post_mouse_click_sequence(
+                    pid,
+                    x,
+                    y,
+                    crate::input::MouseButton::Left,
+                    1,
+                );
+            }
+
+            let action_name = Self::map_action(action)
+                .ok_or_else(|| anyhow!("Action {:?} not supported on macOS", action))?;
+
+            if let Err(result) = handle.perform_action(action_name) {
+                bail!("Failed to perform action {}: {:?}", action_name, result);
             }
 
             Ok(())
-        })();
-
-        std::future::ready(result)
+        })
+        .await
     }
 
-    fn set_value(
-        &mut self,
-        id: ElementKey,
-        value: &str,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result: Result<()> = (|| {
-            let handle = self
-                .handles
-                .get(&id)
-                .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+    async fn set_value(&mut self, id: ElementKey, value: &str) -> Result<()> {
+        let value = value.to_string();
+        self.run_with_blocking_state(move |reader| {
+            let handle = reader.handle_for_id(id)?;
 
-            unsafe {
-                let attr = CFString::from_str(AX_VALUE);
-                let cf_value = CFString::from_str(value);
-                let result = handle.set_attribute_value(&attr, &cf_value);
-
-                if result != AXError::Success {
-                    bail!("Failed to set value: {:?}", result);
-                }
+            if let Err(result) = handle.set_string_attribute(AX_VALUE, &value) {
+                bail!("Failed to set value: {:?}", result);
             }
 
             Ok(())
-        })();
-
-        std::future::ready(result)
+        })
+        .await
     }
 
-    fn hit_test(
-        &mut self,
-        x: f64,
-        y: f64,
-    ) -> impl std::future::Future<Output = Result<Option<ElementKey>>> {
-        let result = unsafe {
-            let mut element: *const AXUIElement = std::ptr::null();
-            let element_ptr: *mut *const AXUIElement = &mut element;
-            let result = self.system_wide.copy_element_at_position(
-                x as f32,
-                y as f32,
-                NonNull::new(element_ptr).unwrap(),
-            );
-
-            if result != AXError::Success || element.is_null() {
-                Ok(None)
-            } else {
-                // Convert raw pointer to CFRetained
-                let ptr = NonNull::new(element as *mut AXUIElement).unwrap();
-                let ax_element: CFRetained<AXUIElement> = CFRetained::from_raw(ptr);
-
-                // Build element and add to cache
-                let mut count = self.cache.len();
+    async fn hit_test(&mut self, x: f64, y: f64) -> Result<Option<ElementKey>> {
+        self.run_with_blocking_state(move |reader| {
+            if let Some(ax_element) = reader.system_wide.element_at_position(x, y) {
+                let mut count = reader.cache.len();
                 let element =
-                    self.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
-
+                    reader.build_element(&ax_element, &TreeFilter::default(), 0, &mut count);
                 Ok(element.map(|e| e.id))
+            } else {
+                Ok(None)
             }
-        };
-
-        std::future::ready(result)
+        })
+        .await
     }
 
     fn clear_cache(&mut self) {
@@ -1232,22 +1690,15 @@ impl AccessibilityReader for MacOSAccessibility {
         self.cache.version()
     }
 
-    fn keystroke(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-        modifiers: Modifiers,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_keystroke(pid, key, modifiers);
-        std::future::ready(result)
+    async fn keystroke(&mut self, target: &Target, key: Code, modifiers: Modifiers) -> Result<()> {
+        let pid = target.require_pid("macOS", "keystroke")?;
+        Self::post_keystroke(pid, key, modifiers)
     }
 
-    fn type_raw(
-        &mut self,
-        pid: Option<u32>,
-        text: &str,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
+    async fn type_raw(&mut self, target: &Target, text: &str) -> Result<()> {
+        let pid = target.require_pid("macOS", "type_raw")?;
+        let text = text.to_string();
+        Self::run_blocking_task(move || {
             for ch in text.chars() {
                 let (code, needs_shift) = code_from_char(ch)
                     .ok_or_else(|| anyhow!("Character {:?} is not supported on macOS", ch))?;
@@ -1260,112 +1711,74 @@ impl AccessibilityReader for MacOSAccessibility {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Ok(())
-        })();
-
-        std::future::ready(result)
+        })
+        .await
     }
 
-    fn mouse_click_at(
+    async fn mouse_click_at(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         x: f64,
         y: f64,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_mouse_click_sequence(pid, x, y, button, 1);
-
-        std::future::ready(result)
+    ) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_click_at")?;
+        Self::post_mouse_click_sequence(pid, x, y, button, 1)
     }
 
-    fn press_key(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_key_event(pid, key, Modifiers::empty(), true);
-
-        std::future::ready(result)
+    async fn press_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("macOS", "press_key")?;
+        Self::post_key_event(pid, key, Modifiers::empty(), true)
     }
 
-    fn release_key(
-        &mut self,
-        pid: Option<u32>,
-        key: Code,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_key_event(pid, key, Modifiers::empty(), false);
-
-        std::future::ready(result)
+    async fn release_key(&mut self, target: &Target, key: Code) -> Result<()> {
+        let pid = target.require_pid("macOS", "release_key")?;
+        Self::post_key_event(pid, key, Modifiers::empty(), false)
     }
 
-    fn mouse_move(
-        &mut self,
-        pid: Option<u32>,
-        x: f64,
-        y: f64,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = Self::post_mouse_event(
+    async fn mouse_move(&mut self, target: &Target, x: f64, y: f64) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_move")?;
+        Self::post_mouse_event(
             pid,
-            x,
-            y,
-            CGEventType::MouseMoved,
-            CGMouseButton::Left,
+            Point::new(x, y),
+            MacMouseEventKind::Move,
             crate::input::MouseButton::Left,
             0,
             0.0,
-        );
-
-        std::future::ready(result)
+        )
     }
 
-    fn mouse_click(
+    async fn mouse_click(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
+    ) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_click")?;
+        Self::run_blocking_task(move || {
             let point = Self::current_mouse_location()?;
             Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)
-        })();
-
-        std::future::ready(result)
+        })
+        .await
     }
 
-    fn mouse_double_click(
+    async fn mouse_double_click(
         &mut self,
-        pid: Option<u32>,
+        target: &Target,
         button: crate::input::MouseButton,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
+    ) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_double_click")?;
+        Self::run_blocking_task(move || {
             let point = Self::current_mouse_location()?;
             Self::post_mouse_click_sequence(pid, point.x, point.y, button, 1)?;
             std::thread::sleep(Duration::from_millis(40));
             Self::post_mouse_click_sequence(pid, point.x, point.y, button, 2)
-        })();
-
-        std::future::ready(result)
+        })
+        .await
     }
 
-    fn mouse_scroll(
-        &mut self,
-        pid: Option<u32>,
-        delta_x: f64,
-        delta_y: f64,
-    ) -> impl std::future::Future<Output = Result<()>> {
-        let result = (|| {
-            let event = CGEvent::new_scroll_wheel_event2(
-                None,
-                CGScrollEventUnit::Pixel,
-                2,
-                delta_y.round() as i32,
-                delta_x.round() as i32,
-                0,
-            )
-            .ok_or_else(|| anyhow!("Failed to create scroll event"))?;
-            Self::post_event(pid, &event);
-            Ok(())
-        })();
-
-        std::future::ready(result)
+    async fn mouse_scroll(&mut self, target: &Target, delta_x: f64, delta_y: f64) -> Result<()> {
+        let pid = target.require_pid("macOS", "mouse_scroll")?;
+        accessibility_macos_sys::post_scroll_event(pid, delta_x, delta_y)
     }
 
     fn supports_keystroke(&self) -> bool {
@@ -1380,7 +1793,13 @@ impl AccessibilityReader for MacOSAccessibility {
         true
     }
 
-    fn capture_screen(&self, pid: Option<u32>) -> Result<Screenshot> {
+    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("macOS screenshot requires Target::Pid or Target::System"),
+        };
+
         if let Some(pid) = pid
             && let Ok(Some(screenshot)) = Self::capture_window_for_pid(pid)
         {
@@ -1390,7 +1809,7 @@ impl AccessibilityReader for MacOSAccessibility {
         let screenshot = Self::capture_main_display()?;
 
         if let Some(pid) = pid
-            && let Some(window_bounds) = unsafe { Self::get_window_bounds_for_pid(pid) }
+            && let Some(window_bounds) = Self::get_window_bounds_for_pid(pid)
         {
             let screen_bounds = Self::main_display_bounds();
             if let Ok(cropped) = screenshot.crop(&window_bounds, &screen_bounds) {
@@ -1401,15 +1820,18 @@ impl AccessibilityReader for MacOSAccessibility {
         Ok(screenshot)
     }
 
-    fn get_screen_bounds(
-        &self,
-        pid: Option<u32>,
-    ) -> impl std::future::Future<Output = Result<Rect>> {
-        let bounds = pid
-            .and_then(|pid| unsafe { Self::get_window_bounds_for_pid(pid) })
-            .unwrap_or_else(Self::main_display_bounds);
-
-        std::future::ready(Ok(bounds))
+    async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {
+        let pid = match target {
+            Target::Pid(pid) => Some(*pid),
+            Target::System => None,
+            _ => bail!("macOS screen bounds require Target::Pid or Target::System"),
+        };
+        Self::run_blocking_task(move || {
+            Ok(pid
+                .and_then(Self::get_window_bounds_for_pid)
+                .unwrap_or_else(Self::main_display_bounds))
+        })
+        .await
     }
 
     fn start_listening(
@@ -1417,11 +1839,12 @@ impl AccessibilityReader for MacOSAccessibility {
         config: ListenerConfig,
         callback: Box<dyn FnMut(AccessibilityEvent) + Send + 'static>,
     ) -> Result<ListenerHandle> {
-        let pid = config.pid;
+        let Some(pid) = config.pid else {
+            bail!("macOS event listening requires a target pid");
+        };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let task_stop_flag = stop_flag.clone();
 
-        let runtime_handle = tokio::runtime::Handle::current();
         let task_handle = tokio::task::spawn_blocking(move || {
             let mut callback = callback;
             let mut reader = match MacOSAccessibility::new() {
@@ -1437,12 +1860,64 @@ impl AccessibilityReader for MacOSAccessibility {
 
             let mut previous_values: HashMap<String, Element> = HashMap::new();
             let mut previous_focus: Option<String> = None;
+            let mut observed_elements: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut first_snapshot = true;
+            let materialization_notified = AtomicBool::new(false);
+            let mut observer_source = None;
+            let mut observer = None;
+            let run_loop = RunLoop::current();
+
+            if let Some(run_loop) = run_loop.as_ref()
+                && let Ok(ax_observer) = AxObserver::new(pid)
+            {
+                let app = AxElement::application(pid);
+                Self::observe_materialization_notifications(
+                    &ax_observer,
+                    &app,
+                    &materialization_notified,
+                );
+                for window in Self::get_application_windows(&app) {
+                    Self::observe_materialization_notifications(
+                        &ax_observer,
+                        &window,
+                        &materialization_notified,
+                    );
+                }
+
+                let source = ax_observer.run_loop_source();
+                run_loop.add_default_source(&source);
+                Self::enable_accessibility_roots(&app);
+                Self::prime_accessibility_roots(&app);
+                observer_source = Some(source);
+                observer = Some(ax_observer);
+            }
 
             while !task_stop_flag.load(Ordering::SeqCst) {
-                match runtime_handle.block_on(reader.get_tree(pid, &TreeFilter::default())) {
+                if run_loop.is_some() {
+                    accessibility_macos_sys::run_default_loop_slice(0.05, true);
+                }
+                if materialization_notified.swap(false, Ordering::SeqCst) {
+                    let app = AxElement::application(pid);
+                    Self::enable_accessibility_roots(&app);
+                    Self::prime_accessibility_roots(&app);
+                }
+
+                match reader.get_tree_blocking_for_pid(pid, &TreeFilter::default()) {
                     Ok(tree) => {
                         let (values, focused) = MacOSAccessibility::listener_snapshots(&tree);
+                        if let Some(ax_observer) = observer.as_ref() {
+                            for handle in reader.handles.values() {
+                                let signature = MacOSAccessibility::element_signature(handle);
+                                if observed_elements.insert(signature) {
+                                    Self::observe_materialization_notifications(
+                                        ax_observer,
+                                        handle,
+                                        &materialization_notified,
+                                    );
+                                }
+                            }
+                        }
 
                         if config.should_capture(AccessibilityEventType::FocusChanged)
                             && let Some((focus_key, element)) = focused
@@ -1485,6 +1960,11 @@ impl AccessibilityReader for MacOSAccessibility {
 
                 std::thread::sleep(Duration::from_millis(100));
             }
+
+            if let (Some(run_loop), Some(source)) = (run_loop.as_ref(), observer_source.as_ref()) {
+                run_loop.remove_default_source(source);
+            }
+            drop(observer);
 
             callback(AccessibilityEvent::Stopped {
                 reason: StopReason::UserRequested,
