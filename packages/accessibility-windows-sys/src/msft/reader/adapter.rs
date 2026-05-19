@@ -123,7 +123,14 @@ impl WindowsAccessibility {
             }
         }
 
-        Ok(None)
+        let mut element_count = 0;
+        let Some(element) =
+            self.build_element(&element, 0, &TreeFilter::default(), &mut element_count)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(element.id))
     }
 
     pub fn clear_cache(&mut self) {

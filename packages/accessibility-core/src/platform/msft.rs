@@ -168,7 +168,16 @@ impl AccessibilityReader for WindowsAccessibility {
             return Ok(None);
         };
 
-        Ok(self.core_ids.get(&sys_id.to_ffi()).copied())
+        if let Some(id) = self.core_ids.get(&sys_id.to_ffi()).copied() {
+            return Ok(Some(id));
+        }
+
+        let Some(sys_element) = self.inner.get_element(sys_id).cloned() else {
+            return Ok(None);
+        };
+
+        let element = self.map_element(&sys_element);
+        Ok(Some(element.id))
     }
 
     fn clear_cache(&mut self) {

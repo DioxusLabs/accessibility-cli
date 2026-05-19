@@ -22,6 +22,7 @@ use accessibility_core::platform::msft::{
     WindowBlockerSpec, WindowsAccessibility, hide_top_level_windows_matching,
     hide_windows_matching_at_point,
 };
+use accesskit::Role;
 use serial_test::serial;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -173,6 +174,23 @@ impl std::ops::Deref for CalculatorGuard {
 
     fn deref(&self) -> &Self::Target {
         &self.app
+    }
+}
+
+fn hide_ci_blockers_at_point(x: f64, y: f64) {
+    let blockers = WindowBlockerSpec {
+        titles: &["Microsoft account"],
+        classes: &["Shell_OOBEProxy", "UserOOBEWindowClass"],
+    };
+    let pre_hidden = hide_top_level_windows_matching(&blockers);
+    let point_hidden = hide_windows_matching_at_point(x, y, &blockers);
+    if pre_hidden + point_hidden > 0 {
+        println!(
+            "Hid {} blocker popup(s) before hit/click ({} via enum, {} at point)",
+            pre_hidden + point_hidden,
+            pre_hidden,
+            point_hidden
+        );
     }
 }
 
@@ -465,20 +483,7 @@ async fn test_calculator_mouse_click() {
         // point-driven pass that hides whatever's actually under the click
         // pixel. ShowWindow(SW_HIDE) keeps the host alive so the OS doesn't
         // respawn a fresh popup.
-        let blockers = WindowBlockerSpec {
-            titles: &["Microsoft account"],
-            classes: &["Shell_OOBEProxy", "UserOOBEWindowClass"],
-        };
-        let pre_hidden = hide_top_level_windows_matching(&blockers);
-        let point_hidden = hide_windows_matching_at_point(center.x, center.y, &blockers);
-        if pre_hidden + point_hidden > 0 {
-            println!(
-                "Hid {} blocker popup(s) before click ({} via enum, {} at click point)",
-                pre_hidden + point_hidden,
-                pre_hidden,
-                point_hidden
-            );
-        }
+        hide_ci_blockers_at_point(center.x, center.y);
 
         input
             .mouse_click_at(
@@ -504,6 +509,46 @@ async fn test_calculator_mouse_click() {
     } else {
         panic!("Button '9' has no bounds");
     }
+}
+
+/// Hit testing should populate caches even without a preceding tree snapshot.
+#[tokio::test]
+#[serial]
+async fn test_hit_test_populates_empty_windows_cache() {
+    let calc = CalculatorGuard::launch_for_input().await;
+
+    let btn_9 = calc
+        .locator("Button[title='Nine']")
+        .first()
+        .wait()
+        .await
+        .expect("Button '9' not found");
+    let bounds = btn_9.bounds.expect("Button '9' should have bounds");
+    let center = bounds.center();
+
+    let mut accessibility =
+        WindowsAccessibility::new().expect("Failed to create WindowsAccessibility");
+    accessibility
+        .focus_window(calc.pid)
+        .expect("Failed to focus Calculator");
+    hide_ci_blockers_at_point(center.x, center.y);
+
+    let id = accessibility
+        .hit_test(center.x, center.y)
+        .await
+        .expect("Hit test failed")
+        .expect("Hit test should find Calculator button");
+    let element = accessibility
+        .get_element(id)
+        .expect("Hit test should populate the element cache");
+
+    assert_eq!(element.role, Role::Button);
+    assert!(
+        element.title.as_deref() == Some("Nine") || element.display_label().contains("Nine"),
+        "Expected hit element to be the Nine button, got {:?} '{}'",
+        element.role,
+        element.display_label()
+    );
 }
 
 /// Test finding elements by various properties using locators.
