@@ -64,45 +64,6 @@ pub enum Command {
     Screenshot(ScreenshotCommand),
     /// Test iOS Simulator framework loading.
     TestLoad(TestLoadCommand),
-    /// Launch a macOS app off-screen-but-on-screen so its accessibility tree
-    /// can be queried without interrupting the user. The window is shrunk to
-    /// 1×1 in a corner and raised to a floating window level that most tiling
-    /// window managers exclude from tiling rules.
-    StealthLaunch(StealthLaunchCommand),
-}
-
-#[derive(Args, Clone, Debug)]
-pub struct StealthLaunchCommand {
-    /// App name (e.g. "Google Chrome") or path to .app bundle.
-    pub app: String,
-    /// Extra arguments to pass to the app. A leading URL is treated as the
-    /// app's initial document.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
-    /// Top-left X coordinate of the parked window.
-    #[arg(long, default_value_t = 0)]
-    pub x: i32,
-    /// Top-left Y coordinate of the parked window.
-    #[arg(long, default_value_t = 1)]
-    pub y: i32,
-    /// Window width. Default 1.
-    #[arg(long, default_value_t = 1)]
-    pub width: u32,
-    /// Window height. Default 1.
-    #[arg(long, default_value_t = 1)]
-    pub height: u32,
-    /// CGS window level. 3 = floating; tiling WMs exclude levels != 0.
-    #[arg(long, default_value_t = 3)]
-    pub level: i32,
-    /// How long to wait for the app's first window after launch.
-    #[arg(long, default_value_t = 5000, value_name = "MS")]
-    pub window_timeout: u64,
-    /// For Chromium-family apps, launch in `--app=URL` mode (frameless,
-    /// no tab strip). The window has a non-standard subrole, which many
-    /// tiling WMs (Amethyst, yabai, AeroSpace) exclude from tiling rules.
-    /// If set, the first positional arg in `args` is taken as the URL.
-    #[arg(long)]
-    pub app_mode: bool,
 }
 
 #[derive(Args, Clone, Debug)]

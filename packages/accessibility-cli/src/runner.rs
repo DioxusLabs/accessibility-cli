@@ -73,7 +73,6 @@ pub async fn run_cli(cli: crate::Cli) -> CliResult<()> {
         }
         Command::Screenshot(command) => run_screenshot(command.command).await,
         Command::TestLoad(command) => operations::device::test_load(&command.target),
-        Command::StealthLaunch(command) => operations::launch::stealth_launch(&command).await,
     }
 }
 
