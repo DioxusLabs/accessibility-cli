@@ -57,25 +57,25 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for full per-platform setup details.
 
 ```sh
 # Print the accessibility tree of a running macOS app.
-accessibility-cli --platform mac --pid 12345 --llm
+accessibility-cli tree --platform mac --pid 12345 --format llm
 
 # Click at a pixel inside a Windows app without moving the shared cursor.
-accessibility-cli --platform win --pid 12345 --mouse-click 300,240
+accessibility-cli mouse-click 300,240 --platform win --pid 12345
 
 # Annotated screenshot of an iOS Simulator app.
-accessibility-cli --platform ios --udid ABC123 --annotate
+accessibility-cli screenshot annotate --platform ios --udid ABC123
 
 # HID tap on iOS Simulator.
-accessibility-cli --platform ios --hid-tap 100,200
+accessibility-cli tap 100,200 --platform ios --method hid
 
 # Query a Linux app via AT-SPI.
-accessibility-cli --platform linux --pid 12345 --llm
+accessibility-cli tree --platform linux --pid 12345 --format llm
 
 # Press Android back button.
-accessibility-cli --platform android --adb-back
+accessibility-cli button back --platform android
 
 # Swipe on Android.
-accessibility-cli --platform android --adb-swipe 100,200,100,800
+accessibility-cli swipe 100,200,100,800 --platform android
 ```
 
 ## Library usage

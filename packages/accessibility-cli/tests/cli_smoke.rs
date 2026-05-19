@@ -2,100 +2,99 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
 
+fn no_adb_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-no-adb")
+}
+
 #[test]
-fn help_mentions_primary_command() {
+fn help_mentions_primary_commands() {
     let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
     cmd.arg("--help")
         .assert()
         .success()
         .stdout(predicate::str::contains("accessibility-cli"))
+        .stdout(predicate::str::contains("tree"))
+        .stdout(predicate::str::contains("query"));
+
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["tree", "--help"])
+        .assert()
+        .success()
         .stdout(predicate::str::contains("--platform"));
 }
 
 #[test]
 fn invalid_platform_fails_before_touching_accessibility_backend() {
     let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "not-a-platform"])
+    cmd.args(["tree", "--platform", "not-a-platform"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid value"));
 }
 
 #[test]
-fn operational_flags_parse_before_backend_startup() {
-    let no_adb_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-no-adb");
-
+fn old_flat_operational_flags_are_rejected() {
     let cases: &[&[&str]] = &[
-        &["--platform", "android", "--json", "--timeout", "0"],
+        &["--platform", "android", "--query", "Button"],
+        &["--platform", "android", "--click", "Button"],
+        &["--platform", "android", "--adb-back"],
+        &["--platform", "ios", "--hid-tap", "100,200"],
+        &["tree", "--platform", "android", "--llm"],
+        &["tree", "--platform", "android", "--json"],
+    ];
+
+    for args in cases {
+        let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+        cmd.args(*args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
+    }
+}
+
+#[test]
+fn operational_subcommands_parse_before_backend_startup() {
+    let cases: &[&[&str]] = &[
+        &["tree", "--platform", "android", "--format", "json"],
+        &["tree", "--platform", "android", "--format", "llm"],
+        &["query", "Button", "--platform", "android", "--timeout", "0"],
         &[
-            "--platform",
-            "android",
-            "--format",
-            "llm-query",
-            "--timeout",
-            "0",
-        ],
-        &["--platform", "android", "--llm", "--timeout", "0"],
-        &[
-            "--platform",
-            "android",
-            "--llm-query",
-            "--query",
+            "query",
             "Button",
-            "--timeout",
-            "0",
-        ],
-        &[
             "--platform",
             "android",
-            "--query",
-            "Button",
-            "--timeout",
-            "0",
-        ],
-        &[
-            "--platform",
-            "android",
-            "--click",
-            "Button",
-            "--timeout",
-            "0",
-        ],
-        &[
-            "--platform",
-            "android",
-            "--type",
-            "EditText",
-            "hello",
-            "--timeout",
-            "0",
-        ],
-        &[
-            "--platform",
-            "android",
-            "--key",
-            "enter",
-            "EditText",
-            "--timeout",
-            "0",
-        ],
-        &[
-            "--platform",
-            "android",
-            "--query",
-            "Button",
             "--timeout",
             "25",
             "--poll-interval",
             "5",
         ],
+        &["click", "Button", "--platform", "android", "--timeout", "0"],
+        &["press", "Button", "--platform", "android", "--timeout", "0"],
+        &[
+            "type",
+            "EditText",
+            "hello",
+            "--platform",
+            "android",
+            "--timeout",
+            "0",
+        ],
+        &[
+            "key",
+            "enter",
+            "EditText",
+            "--platform",
+            "android",
+            "--timeout",
+            "0",
+        ],
     ];
 
     for args in cases {
         let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-        cmd.env("PATH", &no_adb_path)
+        cmd.env("PATH", no_adb_path())
             .args(*args)
             .assert()
             .failure()
@@ -104,24 +103,33 @@ fn operational_flags_parse_before_backend_startup() {
 }
 
 #[test]
-fn ios_only_flag_rejected_on_other_platform() {
-    // Regression for the silent-ignore bug: --tap is iOS-only, must error on mac.
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "mac", "--tap", "100,100"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("iOS-only flags"));
-}
+fn target_flags_are_rejected_on_wrong_platform() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["tree", "--platform", "android", "--pid", "123"],
+            "--pid is valid only for mac, win, or linux",
+        ),
+        (
+            &["tree", "--platform", "mac", "--serial", "ABC"],
+            "--serial requires --platform android",
+        ),
+        (
+            &["tree", "--platform", "ios", "--pid", "123"],
+            "--pid is valid only for mac, win, or linux",
+        ),
+        (
+            &["tree", "--platform", "android", "--udid", "ABC"],
+            "--udid requires --platform ios",
+        ),
+    ];
 
-#[test]
-fn adb_flag_rejected_on_non_android_platform() {
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "mac", "--adb-back"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--adb-* flags require --platform android",
-        ));
+    for (args, message) in cases {
+        let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+        cmd.args(*args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(*message));
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -136,85 +144,95 @@ fn pid_target_app_operations_require_pid_before_backend_startup() {
     };
 
     let cases: Vec<Vec<&str>> = vec![
-        vec!["--platform", platform, "--llm"],
+        vec!["tree", "--platform", platform, "--format", "llm"],
+        vec!["click", "Button", "--platform", platform, "--timeout", "0"],
         vec![
-            "--platform",
-            platform,
-            "--click",
-            "Button",
-            "--timeout",
-            "0",
-        ],
-        vec![
-            "--platform",
-            platform,
-            "--key",
+            "key",
             "enter",
             "TextField",
+            "--platform",
+            platform,
             "--timeout",
             "0",
         ],
-        vec!["--platform", platform, "--mouse-click", "10,10"],
+        vec!["listen", "--platform", platform],
     ];
 
     for args in cases {
         let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
         cmd.args(args).assert().failure().stderr(
             predicate::str::contains("app operations require --pid")
-                .and(predicate::str::contains("--list-windows")),
+                .and(predicate::str::contains("list-windows")),
         );
     }
 }
 
 #[test]
-fn adb_swipe_invalid_duration_rejected() {
-    // Regression for silently-defaulted duration: 'abc' must error, not run at 300ms.
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "android", "--adb-swipe", "1,2,3,4,abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Invalid duration_ms"));
+fn platform_specific_actions_fail_before_backend_startup() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["tap", "100,100", "--platform", "mac"],
+            "tap is supported only",
+        ),
+        (
+            &["button", "back", "--platform", "mac"],
+            "button is supported only",
+        ),
+        (
+            &["launch", "com.example.app", "--platform", "ios"],
+            "launch is supported only on Android",
+        ),
+        (
+            &["listen", "--platform", "android"],
+            "listen is supported only",
+        ),
+    ];
+
+    for (args, message) in cases {
+        let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+        cmd.args(*args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(*message));
+    }
 }
 
 #[test]
-fn adb_long_press_invalid_duration_rejected() {
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "android", "--adb-long-press", "1,2,xyz"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Invalid duration_ms"));
-}
-
-#[test]
-fn press_accepts_query_on_non_ios_platforms() {
-    // Regression: --press used to be iOS-only and take a numeric ID. After the
-    // refactor it accepts a query and is valid on every platform — selecting
-    // an absurd query just causes a not-found, not an iOS-only rejection.
-    let no_adb_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-no-adb");
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.env("PATH", &no_adb_path)
-        .args([
+fn invalid_values_are_rejected_by_clap() {
+    let cases: &[&[&str]] = &[
+        &["tree", "--platform", "android", "--format", "llm-query"],
+        &["swipe", "1,2,3", "--platform", "android"],
+        &[
+            "swipe",
+            "1,2,3,4",
             "--platform",
             "android",
-            "--press",
-            "Button[title=\"definitely-not-here\"]",
-            "--timeout",
-            "0",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("iOS-only flags").not());
-}
+            "--duration",
+            "abc",
+        ],
+        &[
+            "long-press",
+            "1,2",
+            "--platform",
+            "android",
+            "--duration",
+            "xyz",
+        ],
+        &[
+            "mouse-click",
+            "1,2",
+            "--button",
+            "not-a-button",
+            "--platform",
+            "mac",
+        ],
+    ];
 
-#[test]
-fn ios_only_error_message_no_longer_lists_press() {
-    // Regression: --press was iOS-only and used to be named in the rejection
-    // message. After the move into CommonArgs the message must drop --press.
-    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
-    cmd.args(["--platform", "mac", "--tap", "100,100"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--press").not());
+    for args in cases {
+        let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+        cmd.args(*args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid"));
+    }
 }

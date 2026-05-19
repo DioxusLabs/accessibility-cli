@@ -14,6 +14,9 @@ ctrlc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-macos-sys.workspace = true
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

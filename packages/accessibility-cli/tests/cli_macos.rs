@@ -85,12 +85,12 @@ fn launch_calculator_backgrounded() -> u32 {
 fn calculator_has_buttons(pid: u32) -> bool {
     let out = Command::new(env!("CARGO_BIN_EXE_accessibility-cli"))
         .args([
+            "query",
+            "Button",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--query",
-            "Button",
             "--timeout",
             "0",
         ])
@@ -108,12 +108,12 @@ fn calculator_has_buttons(pid: u32) -> bool {
 fn calculator_appears_windowless(pid: u32) -> bool {
     let out = Command::new(env!("CARGO_BIN_EXE_accessibility-cli"))
         .args([
+            "query",
+            "Window",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--query",
-            "Window",
             "--timeout",
             "0",
         ])
@@ -468,12 +468,12 @@ fn backgrounded_calculator_computes_real_math() {
         TestCommand::cargo_bin("accessibility-cli")
             .unwrap()
             .args([
+                "click",
+                &format!("Button[description=\"{desc}\"]"),
                 "--platform",
                 "mac",
                 "--pid",
                 &pid.to_string(),
-                "--click",
-                &format!("Button[description=\"{desc}\"]"),
                 "--timeout",
                 "5000",
             ])
@@ -485,12 +485,12 @@ fn backgrounded_calculator_computes_real_math() {
     let assert = TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "query",
+            "Text",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--query",
-            "Text",
             "--timeout",
             "5000",
         ])
@@ -513,11 +513,13 @@ fn backgrounded_app_tree_includes_window_buttons() {
     let assert = TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "tree",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--llm",
+            "--format",
+            "llm",
             // Don't poll forever if something regresses; query mode is what we
             // want to actually surface buttons in concise output.
         ])
@@ -526,8 +528,8 @@ fn backgrounded_app_tree_includes_window_buttons() {
 
     let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
     assert!(
-        out.contains("Button \"5\""),
-        "expected Calculator's '5' button in --llm output; got:\n{out}"
+        out.contains("Button[description=\"5\"]"),
+        "expected Calculator's '5' button in --format llm output; got:\n{out}"
     );
 }
 
@@ -541,12 +543,14 @@ fn interactive_filter_returns_tree_not_error() {
     TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "tree",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
             "--interactive",
-            "--llm",
+            "--format",
+            "llm",
         ])
         .assert()
         .success()
@@ -563,12 +567,14 @@ fn visible_filter_returns_tree_not_error() {
     TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "tree",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
             "--visible",
-            "--llm",
+            "--format",
+            "llm",
         ])
         .assert()
         .success()
@@ -584,7 +590,15 @@ fn tree_header_says_macos() {
 
     TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
-        .args(["--platform", "mac", "--pid", &pid.to_string()])
+        .args([
+            "tree",
+            "--platform",
+            "mac",
+            "--pid",
+            &pid.to_string(),
+            "--format",
+            "tree",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("=== macOS Accessibility Tree ==="))
@@ -611,7 +625,7 @@ fn listen_pid_filter_scopes_event_stream() {
     // filter means zero event rows. A broken filter (the old behavior) would
     // pick up FOCUS_CHANGED / VALUE_CHANGED events from any active app.
     let mut child = Command::new(env!("CARGO_BIN_EXE_accessibility-cli"))
-        .args(["--platform", "mac", "--pid", "1", "--listen"])
+        .args(["listen", "--platform", "mac", "--pid", "1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -644,12 +658,12 @@ fn listen_pid_filter_scopes_event_stream() {
         TestCommand::cargo_bin("accessibility-cli")
             .unwrap()
             .args([
+                "click",
+                &format!("Button[description=\"{desc}\"]"),
                 "--platform",
                 "mac",
                 "--pid",
                 &calc_pid.to_string(),
-                "--click",
-                &format!("Button[description=\"{desc}\"]"),
                 "--timeout",
                 "5000",
             ])
@@ -663,12 +677,12 @@ fn listen_pid_filter_scopes_event_stream() {
     let result_assert = TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "query",
+            "Text",
             "--platform",
             "mac",
             "--pid",
             &calc_pid.to_string(),
-            "--query",
-            "Text",
             "--timeout",
             "5000",
         ])
@@ -716,12 +730,12 @@ fn reset_calculator_display(pid: u32) {
         let ok = TestCommand::cargo_bin("accessibility-cli")
             .unwrap()
             .args([
+                "click",
+                &format!("Button[description=\"{desc}\"]"),
                 "--platform",
                 "mac",
                 "--pid",
                 &pid.to_string(),
-                "--click",
-                &format!("Button[description=\"{desc}\"]"),
                 "--timeout",
                 "2000",
             ])
@@ -746,12 +760,12 @@ fn press_with_query_clicks_calculator_button() {
         TestCommand::cargo_bin("accessibility-cli")
             .unwrap()
             .args([
+                "press",
+                &format!("Button[description=\"{desc}\"]"),
                 "--platform",
                 "mac",
                 "--pid",
                 &pid.to_string(),
-                "--press",
-                &format!("Button[description=\"{desc}\"]"),
                 "--timeout",
                 "5000",
             ])
@@ -762,12 +776,12 @@ fn press_with_query_clicks_calculator_button() {
     let assert = TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "query",
+            "Text",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--query",
-            "Text",
             "--timeout",
             "5000",
         ])
@@ -790,12 +804,12 @@ fn focus_button_does_not_error() {
     let assert = TestCommand::cargo_bin("accessibility-cli")
         .unwrap()
         .args([
+            "focus",
+            "Button[description=\"5\"]",
             "--platform",
             "mac",
             "--pid",
             &pid.to_string(),
-            "--focus",
-            "Button[description=\"5\"]",
         ])
         .assert()
         .success();
