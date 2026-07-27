@@ -56,11 +56,25 @@ use slotmap::SecondaryMap;
 
 mod common;
 mod dispatcher;
+mod dynamic;
+mod encoder;
+mod framebuffer;
 mod hid;
+mod pixel_buffer;
 mod reader;
+mod recorder;
+mod stream;
+mod void_block;
 
 pub use common::{
     ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point, Rect, ScreenSpace,
     Screenshot, Size, TreeFilter, load_frameworks,
 };
+pub use encoder::{
+    ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat, Tuning,
+};
+pub use framebuffer::{CapturedFrame, FrameSink, FramebufferStats, SimFramebuffer};
+pub use hid::{Orientation, SimulatorHID, TouchEdge, TouchPhase};
 pub use reader::IOSSimulatorAccessibility;
+pub use recorder::{Recorder, Recording, RecordingConfig};
+pub use stream::{ScreenGeometry, SimVideoStream};

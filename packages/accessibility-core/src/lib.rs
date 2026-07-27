@@ -4,3 +4,4 @@ pub mod accessibility;
 pub mod api;
 pub mod input;
 pub mod platform;
+pub mod video;

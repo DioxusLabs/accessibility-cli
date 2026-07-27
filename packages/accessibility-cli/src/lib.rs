@@ -1389,6 +1389,10 @@ Examples:
 )]
 #[command(version)]
 pub struct Cli {
+    /// Subcommand to run. Omit to use the flag-driven query interface above.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Target platform (defaults to current OS)
     #[arg(long, short = 'p', value_enum, default_value_t = PlatformType::default())]
     pub platform: PlatformType,
@@ -1842,6 +1846,72 @@ fn parse_long_press(s: &str) -> Result<(f64, f64, u64), String> {
     Ok((x, y, duration_ms))
 }
 
+/// Subcommands that do something other than query an accessibility tree.
+#[derive(clap::Subcommand)]
+pub enum Command {
+    /// Serve the iOS Simulator in a browser: live video, input, and element
+    /// inspection.
+    ServeSim(ServeSimArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ServeSimArgs {
+    /// Simulator to serve. Defaults to the first booted device.
+    #[arg(long)]
+    pub udid: Option<String>,
+
+    /// Port to listen on.
+    #[arg(long, default_value_t = 3200)]
+    pub port: u16,
+
+    /// Address to bind. Defaults to loopback; use 0.0.0.0 to expose on the LAN.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: std::net::IpAddr,
+
+    /// Transport the browser should prefer: webrtc or h264.
+    #[arg(long, default_value = "webrtc")]
+    pub transport: String,
+
+    /// Encoder frame rate ceiling. The simulator only paints on change, so
+    /// this is an upper bound rather than a target.
+    #[arg(long, default_value_t = 60)]
+    pub fps: u32,
+
+    /// What the encoder should optimize for.
+    ///
+    /// `interactive` keeps latency low and spends a fixed bitrate.
+    /// `recording` drops the low-latency constraint so a quality target is
+    /// honoured, at the cost of latency — wrong for anyone watching live.
+    #[arg(long, default_value = "interactive")]
+    pub tuning: String,
+
+    /// Target bitrate in bits per second, for interactive tuning. Defaults to
+    /// a value derived from the encode resolution.
+    #[arg(long, conflicts_with = "quality")]
+    pub bitrate: Option<u32>,
+
+    /// Target quality from 0 to 1, for recording tuning.
+    #[arg(long, default_value_t = 0.75)]
+    pub quality: f64,
+
+    /// Longest edge to encode at. The device framebuffer is scaled down to
+    /// fit, which is where most of the quality-per-bit comes from.
+    #[arg(long, default_value_t = 1280)]
+    pub max_dimension: u32,
+
+    /// Encode at the device's native resolution instead of downscaling.
+    #[arg(long)]
+    pub native_resolution: bool,
+
+    /// Seconds between scheduled keyframes.
+    #[arg(long, default_value_t = 2)]
+    pub keyframe_interval: u32,
+
+    /// ICE server URL, repeatable. Only needed to traverse a NAT.
+    #[arg(long = "ice-server")]
+    pub ice_servers: Vec<String>,
+}
+
 /// Run the CLI using process arguments.
 pub fn run() {
     let cli = Cli::parse();
@@ -1852,7 +1922,63 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+
+    if let Some(command) = &cli.command {
+        runtime.block_on(run_command(command));
+        return;
+    }
+
     runtime.block_on(run_cli(&cli));
+}
+
+async fn run_command(command: &Command) {
+    let result = match command {
+        Command::ServeSim(args) => run_serve_sim(args).await,
+    };
+    if let Err(error) = result {
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn run_serve_sim(args: &ServeSimArgs) -> anyhow::Result<()> {
+    use accessibility_core::video::VideoConfig;
+    use accessibility_serve::{ServeConfig, Transport, serve};
+
+    let transport: Transport = args.transport.parse()?;
+    serve(ServeConfig {
+        udid: args.udid.clone(),
+        address: std::net::SocketAddr::new(args.bind, args.port),
+        transport,
+        video: VideoConfig {
+            fps: args.fps,
+            tuning: match args.tuning.as_str() {
+                "interactive" => accessibility_core::video::Tuning::Interactive {
+                    bitrate: args.bitrate,
+                },
+                "recording" => accessibility_core::video::Tuning::Recording {
+                    quality: args.quality,
+                },
+                other => anyhow::bail!(
+                    "unknown tuning '{other}' (expected interactive or recording)"
+                ),
+            },
+            max_dimension: (!args.native_resolution).then_some(args.max_dimension),
+            keyframe_interval_secs: args.keyframe_interval,
+            // WebRTC needs Annex-B; the raw H.264 transport converts on the
+            // way out so a single encoder feeds both.
+            nal_format: accessibility_core::video::NalFormat::AnnexB,
+            ..Default::default()
+        },
+        ice_servers: args.ice_servers.clone(),
+    })
+    .await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn run_serve_sim(_args: &ServeSimArgs) -> anyhow::Result<()> {
+    anyhow::bail!("serve-sim requires macOS with Xcode and a booted iOS Simulator")
 }
 
 /// Build a TreeFilter from CommonArgs

@@ -106,6 +106,23 @@ pub trait AccessibilityReader {
         async { anyhow::bail!("Screen bounds not supported on this platform") }
     }
 
+    /// Start a live video capture session, pushing encoded frames to `sink`.
+    ///
+    /// This is the streaming counterpart to [`Self::capture_screen`]. Only the
+    /// iOS Simulator implements it today.
+    fn start_video_capture(
+        &self,
+        _config: &crate::video::VideoConfig,
+        _sink: crate::video::FrameSink,
+    ) -> Result<Box<dyn crate::video::VideoCapture>> {
+        crate::video::unsupported(self.platform_name())
+    }
+
+    /// Whether [`Self::start_video_capture`] is expected to succeed.
+    fn supports_video_capture(&self) -> bool {
+        false
+    }
+
     /// Get the platform name (e.g., "macOS", "Windows", "Linux", "iOS").
     fn platform_name(&self) -> &'static str {
         "Unknown"

@@ -11,12 +11,24 @@ use super::*;
 /// Function pointer types for Indigo message creation (loaded from SimulatorKit via dlsym).
 type IndigoMessageForButtonFn =
     unsafe extern "C" fn(source: i32, action: i32, target: i32) -> *mut c_void;
+/// `IndigoHIDMessageForMouseNSEvent(CGPoint*, CGPoint*, IndigoHIDTarget,
+///  NSEventType, NSSize, IndigoHIDEdge)`
+///
+/// On arm64 the integer and floating-point arguments are numbered
+/// independently, so the pointers, target, event type and edge land in x0-x4
+/// while the `NSSize` occupies d0/d1. Declaring the size last therefore still
+/// produces the correct register assignment.
+///
+/// Apple's Simulator.app always passes `NSSize(1.0, 1.0)`, which makes the
+/// ratio computation inside the function reduce to the point itself.
 type IndigoMessageForTouchFn = unsafe extern "C" fn(
     point0: *const objc2_core_foundation::CGPoint,
     point1: *const objc2_core_foundation::CGPoint,
     target: i32,
     event_type: i32,
-    something: Bool,
+    edge: u32,
+    size_width: f64,
+    size_height: f64,
 ) -> *mut c_void;
 type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i32) -> *mut c_void;
 
@@ -25,8 +37,45 @@ type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i3
 /// Uses the Indigo protocol via SimulatorKit's SimDeviceLegacyHIDClient
 /// to inject touch events, button presses, and keyboard input directly
 /// into the simulator's HID subsystem.
-pub(super) struct SimulatorHID {
+/// Phase of an interactive touch stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Begin,
+    Move,
+    End,
+}
+
+/// Screen edge a touch is treated as originating from.
+///
+/// iOS only recognizes system gestures — most importantly swipe-up-to-home on
+/// Face ID devices — when the touch is flagged with the edge it started from.
+/// Without this a drag from the bottom is just an in-app drag.
+///
+/// These are edges of the *raw framebuffer*, which never rotates, so callers
+/// working in display space have to map through the current orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TouchEdge {
+    None = 0,
+    Left = 1,
+    Top = 2,
+    Bottom = 3,
+    Right = 4,
+}
+
+/// Device orientation, using the GSEvent numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Orientation {
+    Portrait = 1,
+    PortraitUpsideDown = 2,
+    LandscapeRight = 3,
+    LandscapeLeft = 4,
+}
+
+pub struct SimulatorHID {
     client: *mut AnyObject, // SimDeviceLegacyHIDClient
+    device: *mut AnyObject, // SimDevice, retained for GSEvent port lookup
     queue: *mut AnyObject,  // dispatch_queue_t
     screen_size: (f64, f64),
     screen_scale: f64,
@@ -122,6 +171,7 @@ impl SimulatorHID {
 
         Ok(Self {
             client,
+            device,
             queue,
             screen_size,
             screen_scale,
@@ -129,6 +179,17 @@ impl SimulatorHID {
             msg_for_touch,
             msg_for_keyboard,
         })
+    }
+
+    /// Create a HID client for a booted device, resolving it by UDID.
+    ///
+    /// `None` picks the first booted simulator. This exists so an input path
+    /// can be opened independently of the accessibility reader, which keeps
+    /// pointer events from queueing behind slow AX tree fetches.
+    pub fn for_device(udid: Option<&str>) -> Result<Self> {
+        crate::frameworks::load_coresimulator_framework()?;
+        let device = unsafe { super::common::find_booted_device(udid)? };
+        Self::new(device)
     }
 
     /// Get the screen size in points.
@@ -192,6 +253,115 @@ impl SimulatorHID {
         Ok(())
     }
 
+    /// Send a single interactive touch event in normalized screen space.
+    ///
+    /// Unlike [`Self::tap`] and [`Self::swipe`], this does not synthesize a
+    /// whole gesture: the caller drives the phases itself, which is what a live
+    /// pointer stream from a browser needs.
+    ///
+    /// `x` and `y` are 0..1 fractions of the screen, matching what the web UI
+    /// already computes, so no point/pixel/scale conversion is involved.
+    pub fn touch_normalized(&self, x: f64, y: f64, phase: TouchPhase) -> Result<()> {
+        self.touch_normalized_edge(x, y, phase, TouchEdge::None)
+    }
+
+    /// As [`Self::touch_normalized`], but flagged as a system edge gesture.
+    ///
+    /// The same edge must be supplied for every event in the gesture, or iOS
+    /// will not recognize it.
+    pub fn touch_normalized_edge(
+        &self,
+        x: f64,
+        y: f64,
+        phase: TouchPhase,
+        edge: TouchEdge,
+    ) -> Result<()> {
+        let x = x.clamp(0.0, 1.0);
+        let y = y.clamp(0.0, 1.0);
+        // Indigo has no distinct "move" phase; contact is maintained by
+        // repeating the down event at the new position, which is exactly what
+        // `swipe` does internally.
+        let direction = match phase {
+            TouchPhase::Begin | TouchPhase::Move => ButtonDirection::Down,
+            TouchPhase::End => ButtonDirection::Up,
+        };
+        self.send_touch_edge(x, y, direction, edge)
+    }
+
+    /// Rotate the device.
+    ///
+    /// Orientation does not travel over Indigo like touches do. It is a
+    /// GSEvent delivered by mach message to the simulator's
+    /// `PurpleWorkspacePort`, which is the same path Simulator.app itself uses
+    /// when you pick Device > Rotate.
+    pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+        // GSEvent constants, as used by Simulator.app and idb.
+        const GSEVENT_MACH_MESSAGE_ID: i32 = 0x7B;
+        const GSEVENT_TYPE_ORIENTATION_CHANGED: u32 = 50;
+        const GSEVENT_HOST_FLAG: u32 = 0x0002_0000;
+        const MACH_MSG_TYPE_COPY_SEND: u32 = 19;
+        /// `align4(4 + 0x6B)` — a GSEvent header plus a 4-byte payload.
+        const MESSAGE_SIZE: u32 = 108;
+
+        unsafe extern "C" {
+            fn mach_msg_send(message: *mut c_void) -> i32;
+        }
+
+        let port = self.purple_workspace_port()?;
+
+        // Oversized so the 108-byte message is comfortably in bounds.
+        let mut buffer = [0u8; 112];
+        let base = buffer.as_mut_ptr();
+        unsafe {
+            // mach_msg_header_t: bits, size, remote, local, voucher, id.
+            std::ptr::write_unaligned(base.add(0x00) as *mut u32, MACH_MSG_TYPE_COPY_SEND);
+            std::ptr::write_unaligned(base.add(0x04) as *mut u32, MESSAGE_SIZE);
+            std::ptr::write_unaligned(base.add(0x08) as *mut u32, port);
+            std::ptr::write_unaligned(base.add(0x0c) as *mut u32, 0);
+            std::ptr::write_unaligned(base.add(0x10) as *mut u32, 0);
+            std::ptr::write_unaligned(base.add(0x14) as *mut i32, GSEVENT_MACH_MESSAGE_ID);
+
+            std::ptr::write_unaligned(
+                base.add(0x18) as *mut u32,
+                GSEVENT_TYPE_ORIENTATION_CHANGED | GSEVENT_HOST_FLAG,
+            );
+            // record_info_size, then the orientation itself.
+            std::ptr::write_unaligned(base.add(0x48) as *mut u32, 4);
+            std::ptr::write_unaligned(base.add(0x4c) as *mut u32, orientation as u32);
+        }
+
+        let result = unsafe { mach_msg_send(base as *mut c_void) };
+        if result != 0 {
+            return Err(anyhow!("mach_msg_send for orientation failed: {result}"));
+        }
+        Ok(())
+    }
+
+    /// Look up the simulator's `PurpleWorkspacePort` mach port.
+    fn purple_workspace_port(&self) -> Result<u32> {
+        let name = NSString::from_str("PurpleWorkspacePort");
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let port: u32 = unsafe { msg_send![self.device, lookup: &*name, error: &mut error] };
+
+        if port == 0 {
+            let detail = unsafe {
+                (!error.is_null())
+                    .then(|| {
+                        let description: *mut AnyObject = msg_send![error, localizedDescription];
+                        nsstring_to_string_static(description)
+                    })
+                    .flatten()
+            };
+            // The port is published by Simulator.app, not by the runtime, so a
+            // headless `simctl boot` will not have one.
+            return Err(anyhow!(
+                "PurpleWorkspacePort unavailable ({}). Rotation needs Simulator.app running.",
+                detail.as_deref().unwrap_or("no error detail")
+            ));
+        }
+        Ok(port)
+    }
+
     /// Press a hardware button.
     ///
     /// # Arguments
@@ -218,19 +388,47 @@ impl SimulatorHID {
     /// # Arguments
     /// * `key_code` - The key code (from HIToolbox/Events.h)
     pub fn send_key(&self, key_code: u32) -> Result<()> {
-        // Key down
+        self.send_key_with_modifiers(key_code, &[])
+    }
+
+    /// Send a key press with modifier keys held down around it.
+    ///
+    /// Modifiers are ordinary key events, not a bitmask: they are pressed in
+    /// order, then the key is pressed and released, then they are released in
+    /// reverse. This is the only way to produce capitals and shifted symbols —
+    /// there is no shift flag on the Indigo message.
+    ///
+    /// `key_code` and `modifiers` are **USB HID usage codes** (page 0x07),
+    /// not HIToolbox virtual keycodes. The ranges overlap and the meanings
+    /// differ, so passing the wrong kind types different letters rather than
+    /// failing. Left Shift is 225.
+    pub fn send_key_with_modifiers(&self, key_code: u32, modifiers: &[u32]) -> Result<()> {
+        for modifier in modifiers {
+            self.send_keyboard(*modifier, ButtonDirection::Down)?;
+        }
+
         self.send_keyboard(key_code, ButtonDirection::Down)?;
-
-        std::thread::sleep(std::time::Duration::from_millis(30));
-
-        // Key up
+        std::thread::sleep(std::time::Duration::from_millis(12));
         self.send_keyboard(key_code, ButtonDirection::Up)?;
 
+        for modifier in modifiers.iter().rev() {
+            self.send_keyboard(*modifier, ButtonDirection::Up)?;
+        }
         Ok(())
     }
 
     /// Send a touch event at the given ratio coordinates.
     fn send_touch(&self, x_ratio: f64, y_ratio: f64, direction: ButtonDirection) -> Result<()> {
+        self.send_touch_edge(x_ratio, y_ratio, direction, TouchEdge::None)
+    }
+
+    fn send_touch_edge(
+        &self,
+        x_ratio: f64,
+        y_ratio: f64,
+        direction: ButtonDirection,
+        edge: TouchEdge,
+    ) -> Result<()> {
         // First get a template message from IndigoHIDMessageForMouseNSEvent
         let point = objc2_core_foundation::CGPoint {
             x: x_ratio,
@@ -242,8 +440,17 @@ impl SimulatorHID {
             ButtonDirection::Up => 2,
         };
 
-        let template_msg =
-            unsafe { (self.msg_for_touch)(&point, std::ptr::null(), 0x32, event_type, Bool::NO) };
+        let template_msg = unsafe {
+            (self.msg_for_touch)(
+                &point,
+                std::ptr::null(),
+                0x32,
+                event_type,
+                edge as u32,
+                1.0,
+                1.0,
+            )
+        };
 
         if template_msg.is_null() {
             return Err(anyhow!("Failed to create template touch message"));
