@@ -542,6 +542,3 @@ unsafe fn device_udid_string(device: *mut AnyObject) -> Result<String> {
     unsafe { super::common::nsstring_to_string_static(string) }
         .ok_or_else(|| anyhow!("Failed to read simulator UDID"))
 }
-
-// Silence an unused import warning on the c_void alias used by the pool module.
-const _: Option<*const c_void> = None;
