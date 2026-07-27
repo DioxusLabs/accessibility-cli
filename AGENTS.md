@@ -145,6 +145,20 @@ Two more things worth knowing before debugging the picker:
   from either end. Applies to Safari and to any embedded web view.
   See `docs/WEB_CONTENT_ACCESSIBILITY_PLAN.md`.
 
+## HID keycodes
+
+`IndigoHIDMessageForKeyboardArbitrary` takes **USB HID usage codes**, not
+HIToolbox virtual keycodes — measured, by sending values and reading back what
+appeared in a text field. `a`-`z` are `4`-`29`, Left Shift is `225`. idb's own
+comment claiming HIToolbox is wrong.
+
+Modifiers are ordinary key events held around the target key, so shifted
+characters are Shift-down, key-down, key-up, Shift-up.
+
+On Xcode 27 / CoreSimulator 1155.4+ an active `dtuhidd` silently disables
+legacy Indigo keyboard events; they are delivered correctly and produce no
+text. See `docs/IDB_LEARNINGS.md`.
+
 ## Device settings
 
 `simctl ui` only implements `appearance`, `increase_contrast` and

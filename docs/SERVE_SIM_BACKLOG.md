@@ -5,26 +5,59 @@ not by effort. Stream quality and performance are being worked separately.
 
 ## Broken
 
-### Text input cannot type real text
+### Text input types the wrong characters entirely
 
-`send_key` sends a bare down/up of a single keycode with no modifiers, and the
-browser's key map has no shifted characters. Replaying `Test@Example.com?`
-through the client mapping:
+Worse than first thought, and now measured. Two independent bugs.
 
-- dropped entirely: `@`, `?`
-- silently lowercased: `T`, `E`
+**1. The keycode space is wrong.** Our map uses HIToolbox virtual keycodes,
+but `IndigoHIDMessageForKeyboardArbitrary` takes **USB HID usage codes**.
+Sending `0, 11, 8` — our codes for `abc` — into Safari's address bar produced
+**`he`**, which is exactly what those values mean as USB HID usages (`0` is
+reserved and does nothing, `11` is `h`, `8` is `e`). So keyboard input has
+never worked; it silently types different letters.
 
-So it types `testexample.com`. No capitals, no `@`, no `?`, no `:` — you
-cannot enter an email address or a URL with a query string. For a tool meant
-to let an agent drive the simulator this is the most damaging gap.
+Note that idb's own comment in `FBSimulatorIndigoHID.swift:68` claims the
+keycodes are "'Hardware Independent' as described in `<HIToolbox/Events.h>`"
+and is wrong — their Python layer correctly uses USB HID usages.
 
-Two fixes, preferring the second:
+**2. No modifiers**, so no capitals and no shifted symbols. `@`, `?` and `:`
+are dropped, `T` and `E` silently lowercase.
 
-- Add modifier support to the Indigo keyboard message plus a text-to-keystroke
-  mapper (serve-sim does this in `text-to-keys.ts`).
-- **`simctl pbcopy` then Cmd+V.** Handles unicode and emoji, sidesteps
-  keyboard layout entirely. Keep per-key input for navigation and use paste
-  for text.
+The fix, following idb (`idb/common/hid.py:102-254`):
+
+- Switch to USB HID usage codes: `a`-`z` are `4`-`29`, `1`-`9` are `30`-`38`,
+  `0` is `39`, Return `40`, Escape `41`, Backspace `42`, Tab `43`, Space `44`.
+- Model modifiers as ordinary key events held around the target key: Left
+  Shift `225`, Control `224`, Option `226`, Command `227`. Order is modifiers
+  down, key down, key up, modifiers up in reverse.
+- Port their US-ASCII table wholesale and error on unmappable characters
+  rather than dropping them silently. idb has no Unicode or emoji support and
+  no layout awareness either; do not claim more than is delivered.
+
+For arbitrary Unicode a pasteboard + Cmd-V path is still attractive, but note
+that `SimDevicePasteboard` was removed after Xcode 26.2 and replaced by
+`SimPasteboardPlus` (Xcode 26.6+), which is push/pull against a host
+`NSPasteboard` rather than one-shot get/set. idb has headers for both and
+implements neither.
+
+### Xcode 27 will silently break keyboard input
+
+On Xcode 27 / CoreSimulator 1155.4+, an active `dtuhidd` disconnects the
+legacy `ExternalKeyboardService`. Indigo keyboard events are still delivered
+byte-correctly and still produce no text. idb detects this and throws rather
+than typing into the void (`FBSimulatorHIDSelection.swift:17-43`): gate on the
+loaded CoreSimulator version being >= 1155.4 and on a `dtuhidd` subprocess
+existing for the UDID.
+
+Their workaround is a whole second transport, `FBSimulatorDTUHIDTransport`,
+which speaks plain XPC to `com.apple.coredevice.feature.remote.hid.digitizer`,
+building the connection from the simulator's Mach port via private `_4sim`
+symbols resolved with `dlsym` and marking it sim-to-host with
+`xpc_connection_enable_sim2host_4sim`. They are adding capabilities to it one
+commit at a time, which is a fair signal of where this is all heading.
+
+Least we should do now: detect the condition and report it, instead of
+appearing to work.
 
 ## Misleading
 
