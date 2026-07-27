@@ -492,7 +492,11 @@ function pickCached(x, y) {
   for (const element of axElements) {
     const b = element.bounds;
     if (x < b.x || y < b.y || x > b.x + b.width || y > b.y + b.height) continue;
-    if (!best || area(element) < area(best)) best = element;
+    // `<=` rather than `<` so that among elements sharing bounds — a Button
+    // wrapping a Label wrapping its text, which is extremely common — the
+    // last one wins. The tree arrives in document order, so later means
+    // deeper and drawn on top, which is what the pointer is actually over.
+    if (!best || area(element) <= area(best)) best = element;
   }
   return best;
 }
@@ -515,7 +519,9 @@ async function confirmHit(x, y) {
     const response = await fetch(`/api/ax/hit?x=${x}&y=${y}`);
     if (!response.ok) return;
     const element = await response.json();
-    if (element) drawSelection(element);
+    // A null means the point is over a backdrop with nothing pointable on it.
+    // Clear rather than leaving a stale highlight sitting under the cursor.
+    if (element) drawSelection(element); else clearSelection();
   } catch { /* hover is best-effort */ }
 }
 
@@ -528,8 +534,10 @@ async function pick(event, sticky) {
 }
 
 function drawSelection(element) {
+  // Nothing sensible to outline; leave whatever was there rather than
+  // painting a zero-size or full-screen box.
+  if (!element.bounds || element.bounds.width <= 0 || element.bounds.height <= 0) return;
   selected = element;
-  // Already in upright display space; see the note above toRawPoint.
   const b = element.bounds;
   overlay.innerHTML = "";
 

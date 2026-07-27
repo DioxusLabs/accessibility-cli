@@ -47,7 +47,21 @@ pub struct NormalizedRect {
     pub height: f64,
 }
 
+/// Fraction of the screen above which an element is treated as a backdrop
+/// rather than something you can point at.
+///
+/// Every app has an Application node and usually one or more full-bleed
+/// container groups. Hit testing an empty region resolves to one of them, and
+/// highlighting it paints a box over the entire device, which reads as "the
+/// picker is broken" rather than "there is nothing here".
+const BACKDROP_AREA: f64 = 0.9;
+
 impl NormalizedRect {
+    /// Whether this covers essentially the whole screen.
+    pub fn is_backdrop(&self) -> bool {
+        self.width * self.height >= BACKDROP_AREA
+    }
+
     fn from_screen(rect: &Rect, app_bounds: &Rect) -> Option<Self> {
         if app_bounds.size.width <= 0.0 || app_bounds.size.height <= 0.0 {
             return None;
@@ -182,6 +196,15 @@ fn snapshot(
     let mut elements = Vec::with_capacity(tree.element_count);
     flatten(&tree.root, &app_bounds, 0, &mut elements);
 
+    // Drop backdrops and anything with no usable geometry. Both are real parts
+    // of the tree but neither can be pointed at, and leaving them in makes the
+    // client's containment search pick them constantly.
+    elements.retain(|element| {
+        element
+            .bounds
+            .is_some_and(|bounds| !bounds.is_backdrop() && bounds.width > 0.0 && bounds.height > 0.0)
+    });
+
     Ok(AxSnapshot {
         app_name: tree.app_name,
         pid: tree.pid,
@@ -205,12 +228,73 @@ fn hit_test(
     let screen_x = app_bounds.origin.x + x * app_bounds.size.width;
     let screen_y = app_bounds.origin.y + y * app_bounds.size.height;
 
-    Ok(reader
-        .element_at_point(screen_x, screen_y)?
-        .map(|element| to_detail(&element, &app_bounds, 0)))
+    let Some(element) = reader.element_at_point(screen_x, screen_y)? else {
+        return Ok(None);
+    };
+    let detail = to_detail(&element, &app_bounds, 0);
+
+    // Nothing pointable here. Reporting the backdrop would highlight the whole
+    // device; reporting nothing lets the caller leave the previous selection
+    // or clear it.
+    if detail.bounds.is_none_or(|bounds| bounds.is_backdrop()) {
+        return Ok(None);
+    }
+    Ok(Some(detail))
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn spawn_ax_worker(_udid: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
     anyhow::bail!("Simulator accessibility requires macOS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessibility_core::accessibility::{Point, Size};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
+        Rect::new(Point::new(x, y), Size::new(w, h))
+    }
+
+    #[test]
+    fn normalizes_against_app_bounds_not_the_screen() {
+        // Landscape: the app reports itself 874x402, and accessibility frames
+        // are already in that logical space.
+        let app = rect(0.0, 0.0, 874.0, 402.0);
+        let button = rect(754.5, 82.0, 27.0, 44.0);
+        let normalized = NormalizedRect::from_screen(&button, &app).expect("normalizes");
+        assert!((normalized.x - 0.863).abs() < 0.001);
+        assert!((normalized.y - 0.204).abs() < 0.001);
+        assert!((normalized.width - 0.031).abs() < 0.001);
+    }
+
+    #[test]
+    fn offsets_by_the_app_origin() {
+        let app = rect(100.0, 50.0, 400.0, 800.0);
+        let element = rect(300.0, 450.0, 200.0, 400.0);
+        let normalized = NormalizedRect::from_screen(&element, &app).expect("normalizes");
+        assert!((normalized.x - 0.5).abs() < 1e-9);
+        assert!((normalized.y - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn degenerate_app_bounds_do_not_divide_by_zero() {
+        let app = rect(0.0, 0.0, 0.0, 0.0);
+        assert!(NormalizedRect::from_screen(&rect(1.0, 1.0, 2.0, 2.0), &app).is_none());
+    }
+
+    #[test]
+    fn full_screen_containers_are_backdrops() {
+        // Every app has these; highlighting one paints over the whole device.
+        assert!(NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.is_backdrop());
+        assert!(NormalizedRect { x: 0.0, y: 0.0, width: 0.98, height: 0.96 }.is_backdrop());
+    }
+
+    #[test]
+    fn ordinary_controls_are_not_backdrops() {
+        // A full-width settings row is large but perfectly pointable.
+        assert!(!NormalizedRect { x: 0.05, y: 0.45, width: 0.90, height: 0.06 }.is_backdrop());
+        // So is a tall sidebar.
+        assert!(!NormalizedRect { x: 0.0, y: 0.0, width: 0.25, height: 1.0 }.is_backdrop());
+    }
 }

@@ -229,6 +229,16 @@ impl IOSSimulatorAccessibility {
             return Ok(None);
         }
 
+        // The platform element carries its own translation, which is not
+        // necessarily the one we just tokenized. Without the token on *that*
+        // object every attribute read is routed through a delegate that
+        // cannot reach the device, so the element comes back with an empty
+        // label and a zero frame rather than failing outright.
+        let element_translation: *mut AnyObject = msg_send![element, translation];
+        if !element_translation.is_null() {
+            let _: () = msg_send![element_translation, setBridgeDelegateToken: &*token_ns];
+        }
+
         // Build element (as a leaf - no children)
         let filter = TreeFilter {
             max_depth: Some(0),

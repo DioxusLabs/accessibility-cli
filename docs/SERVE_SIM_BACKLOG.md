@@ -66,6 +66,23 @@ test and a clear error.
 Never refreshed, so after navigating, hover previews are stale until the
 debounced hit test corrects them.
 
+### The cached tree is app-scoped, the hit test is display-scoped
+
+`get_tree` walks the frontmost app, so it does not contain the status bar,
+which belongs to SpringBoard. `objectAtPoint:` hit tests the whole display and
+does find it. The hybrid picker papers over this — hover preview misses those
+elements, the confirming hit test catches them — but a tree-only consumer will
+not see them.
+
+### Safari web content is not in the accessibility tree
+
+Not a picker bug and not fixable from here. Web content lives in a separate
+WebContent process and `AXPTranslator` only returns Safari's own toolbar, so a
+web page shows six elements no matter how rich it is. See
+`docs/ios-safari-web-content-accessibility.md`; idb reaches it through
+SimulatorBridge over Distributed Objects, which is a separate mechanism from
+the one used here. Test the picker against native apps.
+
 ## Known limitations, probably fine
 
 - Landscape left vs right cannot be detected, only landscape vs portrait, so

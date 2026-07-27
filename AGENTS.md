@@ -123,6 +123,25 @@ and every gesture just becomes an ordinary drag. The same edge must be
 supplied for every event in the gesture, and the edge is in *raw* framebuffer
 space, so it rotates with the device.
 
+## Accessibility hit testing
+
+`objectAtPoint:` returns a platform element whose *own* translation must also
+be given the bridge delegate token — it is not necessarily the translation you
+tokenized on the way in. Miss that and attribute reads do not fail, they
+silently return an empty label and a zero frame, which downstream looks like
+"this element cannot be selected" rather than like an error. `get_tree` already
+does this; see the matching step in `get_element_at_point`.
+
+Two more things worth knowing before debugging the picker:
+
+- Every app has full-screen backdrops (the Application node plus one or more
+  container groups). Hit testing empty space resolves to one, and highlighting
+  it paints over the whole device. They are filtered out rather than drawn.
+- The tree is app-scoped and the hit test is display-scoped, so the status bar
+  appears in hit tests but never in `get_tree`.
+- Safari web content is in a separate process and simply is not in the tree.
+  See `docs/ios-safari-web-content-accessibility.md`.
+
 ## Device settings
 
 `simctl ui` only implements `appearance`, `increase_contrast` and
