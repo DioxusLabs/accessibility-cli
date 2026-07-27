@@ -17,6 +17,30 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 
+/// What the encoder should optimize for.
+///
+/// A single choice rather than two knobs, because the underlying settings are
+/// mutually exclusive: constant-quality rate control is ignored while
+/// low-latency rate control is enabled. Expressing it this way makes the
+/// combination that silently does nothing impossible to ask for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Tuning {
+    /// Live interactive streaming. Lowest latency; spends a fixed bitrate.
+    Interactive {
+        /// Target bitrate, or `None` to derive one from the encode resolution.
+        bitrate: Option<u32>,
+    },
+    /// Recording and offline capture. Targets a constant quality from 0 to 1,
+    /// letting the encoder buffer and letting the bitrate vary.
+    Recording { quality: f64 },
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning::Interactive { bitrate: None }
+    }
+}
+
 /// Compressed video codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoCodec {
@@ -80,12 +104,11 @@ pub struct VideoConfig {
     pub codec: VideoCodec,
     pub nal_format: NalFormat,
     pub fps: u32,
-    /// Target bitrate, or `None` to derive one from the encode resolution.
-    ///
-    /// Deriving is usually right: a fixed bitrate that suits a phone
-    /// framebuffer is wildly wrong for a watch, and too low a value does not
-    /// just soften the image, it makes the encoder drop frames.
-    pub bitrate: Option<u32>,
+    /// What to optimize for. Deriving the bitrate is usually right: a fixed
+    /// value that suits a phone framebuffer is wildly wrong for a watch, and
+    /// too low a value does not just soften the image, it makes the encoder
+    /// drop frames.
+    pub tuning: Tuning,
     /// Longest edge to encode at; the source is scaled down to fit.
     ///
     /// Device framebuffers are far larger than any browser preview of them,
@@ -103,7 +126,7 @@ impl Default for VideoConfig {
             codec: VideoCodec::default(),
             nal_format: NalFormat::default(),
             fps: 60,
-            bitrate: None,
+            tuning: Tuning::default(),
             max_dimension: Some(1280),
             keyframe_interval_secs: 2,
         }

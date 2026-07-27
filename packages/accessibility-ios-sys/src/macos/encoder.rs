@@ -78,17 +78,42 @@ const TARGET_BITS_PER_PIXEL: f64 = 0.15;
 /// fraction of the bits.
 const DEFAULT_MAX_DIMENSION: u32 = 1280;
 
+/// What the encoder should optimize for.
+///
+/// These are not independent knobs. Constant-quality rate control is *ignored*
+/// when `EnableLowLatencyRateControl` is set — measured at 0.0221 bits per
+/// pixel for quality 1.0 against 0.0223 for quality 0.4, i.e. no effect at
+/// all. Pairing the two as one choice makes that combination unrepresentable
+/// instead of silently doing nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Tuning {
+    /// Live interactive streaming. Low-latency rate control and no frame
+    /// delay, which costs perhaps 300ms of decoder buffering if omitted.
+    /// Spends a fixed bitrate; quality varies with how busy the screen is.
+    Interactive {
+        /// Target bitrate, or `None` to derive one from the encode resolution.
+        bitrate: Option<u32>,
+    },
+    /// Recording and offline capture. Drops the low-latency constraint so the
+    /// encoder honours a constant quality target and spends bits where the
+    /// picture needs them. Latency is unbounded in principle, so this is the
+    /// wrong choice for anything anyone is watching live.
+    Recording {
+        /// Target quality from 0 to 1.
+        quality: f64,
+    },
+}
+
+impl Tuning {
+    fn is_interactive(self) -> bool {
+        matches!(self, Tuning::Interactive { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
     pub fps: u32,
-    /// Explicit bitrate, or `None` to derive one from the encode resolution.
-    ///
-    /// Constant-quality rate control was tried here and does not work: with
-    /// `EnableLowLatencyRateControl` the `Quality` property is ignored
-    /// outright, measured at 0.0221 bpp for quality 1.0 against 0.0223 for
-    /// quality 0.4. Low latency matters more to an interactive stream than
-    /// constant quality, so bitrate it is.
-    pub bitrate: Option<u32>,
+    pub tuning: Tuning,
     /// Longest edge of the encoded video. The source is scaled down to fit.
     pub max_dimension: Option<u32>,
     /// Seconds between scheduled keyframes.
@@ -100,7 +125,7 @@ impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
             fps: 60,
-            bitrate: None,
+            tuning: Tuning::Interactive { bitrate: None },
             max_dimension: Some(DEFAULT_MAX_DIMENSION),
             keyframe_interval_secs: 2,
             nal_format: NalFormat::AnnexB,
@@ -128,8 +153,9 @@ impl EncoderConfig {
         )
     }
 
-    fn resolved_bitrate(&self, width: i32, height: i32) -> u32 {
-        self.bitrate.unwrap_or_else(|| {
+    /// Bitrate for interactive tuning, derived from the encode size if unset.
+    fn resolved_bitrate(&self, bitrate: Option<u32>, width: i32, height: i32) -> u32 {
+        bitrate.unwrap_or_else(|| {
             let pixels = (width as f64) * (height as f64);
             (pixels * self.fps as f64 * TARGET_BITS_PER_PIXEL) as u32
         })
@@ -262,12 +288,17 @@ impl H264Encoder {
 
         // Low-latency rate control keeps the decoder's frame buffering small.
         // Without it browsers routinely add ~300ms of latency even though we
-        // emit no B-frames. It is not available on every encoder, so a plain
-        // session is an acceptable fallback.
-        let low_latency = cf_dict(&[(
-            unsafe { objc2_video_toolbox::kVTVideoEncoderSpecification_EnableLowLatencyRateControl },
-            CFBoolean::new(true).as_ref(),
-        )]);
+        // emit no B-frames. It also makes the encoder ignore any quality
+        // target, which is exactly why recording tuning omits it.
+        let interactive = self.config.tuning.is_interactive();
+        let low_latency = interactive.then(|| {
+            cf_dict(&[(
+                unsafe {
+                    objc2_video_toolbox::kVTVideoEncoderSpecification_EnableLowLatencyRateControl
+                },
+                CFBoolean::new(true).as_ref(),
+            )])
+        });
 
         let mut status = unsafe {
             VTCompressionSession::create(
@@ -275,7 +306,7 @@ impl H264Encoder {
                 width,
                 height,
                 CODEC_H264,
-                Some(&low_latency),
+                low_latency.as_deref(),
                 None,
                 kCFAllocatorDefault,
                 None,
@@ -307,10 +338,17 @@ impl H264Encoder {
             .ok_or_else(|| anyhow!("VTCompressionSessionCreate failed: {status}"))?;
 
         let keyframe_interval = self.config.fps * self.config.keyframe_interval_secs;
-        let bitrate = self.config.resolved_bitrate(width, height);
         set_bool(&session, "RealTime", true);
+        // Frames stay in decode order in both tunings. B-frames would help
+        // recording quality, but every consumer downstream — WebRTC's
+        // payloader and the raw stream's framing — assumes output order
+        // matches input order.
         set_bool(&session, "AllowFrameReordering", false);
-        set_i32(&session, "MaxFrameDelayCount", 0);
+        if interactive {
+            // Emit each frame as soon as it is encoded rather than letting the
+            // encoder hold a pipeline of them.
+            set_i32(&session, "MaxFrameDelayCount", 0);
+        }
         // Baseline is the safest bet for WebRTC: every browser negotiates it,
         // and we gain nothing from High on a UI stream with no B-frames.
         set_string(&session, "ProfileLevel", "H264_Baseline_AutoLevel");
@@ -325,7 +363,15 @@ impl H264Encoder {
             "MaxKeyFrameIntervalDuration",
             self.config.keyframe_interval_secs as f64,
         );
-        set_i32(&session, "AverageBitRate", bitrate as i32);
+        match self.config.tuning {
+            Tuning::Interactive { bitrate } => {
+                let bitrate = self.config.resolved_bitrate(bitrate, width, height);
+                set_i32(&session, "AverageBitRate", bitrate as i32);
+            }
+            Tuning::Recording { quality } => {
+                set_f64(&session, "Quality", quality.clamp(0.0, 1.0));
+            }
+        }
 
         self.session = Some(session);
         self.frame_index = 0;

@@ -230,13 +230,28 @@ surface). That measured a bare copy doing one job against a purpose-built
 transfer doing three; the transfer also removes the BGRA-to-NV12 conversion
 that `VTCompressionSession` would otherwise do internally.
 
-### Constant-quality rate control does not work here
+### Latency and quality are one choice, not two knobs
 
-`kVTCompressionPropertyKey_Quality` is ignored when
-`EnableLowLatencyRateControl` is set. Measured: quality 1.0 gave 0.0221 bpp
-and quality 0.4 gave 0.0223 — the knob does nothing. Low latency is worth more
-to an interactive stream than constant quality, so the encoder targets a
-bitrate derived from the encode resolution instead.
+`kVTCompressionPropertyKey_Quality` is **ignored** while
+`EnableLowLatencyRateControl` is set. Measured with it on, quality 1.0 gave
+0.0221 bpp and quality 0.4 gave 0.0223 — no effect whatsoever. Measured with
+it off, quality 0.3 gave 0.70 Mbps and quality 0.9 gave 11.82 Mbps, a
+sixteenfold range.
+
+So the two settings are mutually exclusive, and `Tuning` pairs them into a
+single choice rather than letting the useless combination be expressed:
+
+- `Interactive { bitrate }` — low-latency rate control and `MaxFrameDelayCount`
+  0, spending a bitrate derived from the encode resolution. Omitting
+  low-latency costs roughly 300ms of decoder buffering, so this is what any
+  live viewer wants.
+- `Recording { quality }` — no low-latency constraint, so the quality target is
+  honoured and bits go where the picture needs them. Latency is unbounded in
+  principle.
+
+Frames stay in decode order in both: B-frames would help recording quality,
+but WebRTC's payloader and the raw stream framing both assume output order
+matches input order.
 
 ### Main display selection
 

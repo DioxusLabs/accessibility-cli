@@ -69,7 +69,9 @@ pub use common::{
     ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point, Rect, ScreenSpace,
     Screenshot, Size, TreeFilter, load_frameworks,
 };
-pub use encoder::{ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat};
+pub use encoder::{
+    ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat, Tuning,
+};
 pub use framebuffer::{CapturedFrame, FrameSink, FramebufferStats, SimFramebuffer};
 pub use hid::{Orientation, SimulatorHID, TouchEdge, TouchPhase};
 pub use reader::IOSSimulatorAccessibility;

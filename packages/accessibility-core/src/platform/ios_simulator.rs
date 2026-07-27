@@ -19,7 +19,8 @@ use crate::accessibility::{
     Size, Target, TreeFilter,
 };
 use crate::video::{
-    EncodedFrame, FrameKind, FrameSink, NalFormat, ScreenGeometry, VideoCapture, VideoConfig,
+    EncodedFrame, FrameKind, FrameSink, NalFormat, ScreenGeometry, Tuning, VideoCapture,
+    VideoConfig,
 };
 
 pub use sys::{ButtonDirection, HardwareButton};
@@ -326,7 +327,10 @@ impl SimulatorVideoCapture {
     pub fn start(udid: &str, config: &VideoConfig, sink: FrameSink) -> Result<Self> {
         let sys_config = sys::EncoderConfig {
             fps: config.fps,
-            bitrate: config.bitrate,
+            tuning: match config.tuning {
+                Tuning::Interactive { bitrate } => sys::Tuning::Interactive { bitrate },
+                Tuning::Recording { quality } => sys::Tuning::Recording { quality },
+            },
             max_dimension: config.max_dimension,
             keyframe_interval_secs: config.keyframe_interval_secs,
             nal_format: match config.nal_format {

@@ -101,5 +101,6 @@ not see them.
   Gating encode on subscriber count is not worth it.
 - A plain GPU blit is slower than `memcpy` for a bare copy. The pixel
   transfer that replaced it wins by doing the conversion and scale too.
-- Constant-quality rate control is ignored under low-latency rate control;
-  measured, the knob does nothing.
+- Constant-quality rate control is ignored *while low-latency rate control is
+  enabled*. With it disabled the knob works and spans a 16x bitrate range,
+  which is what the `recording` tuning is for.

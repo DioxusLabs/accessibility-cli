@@ -1877,10 +1877,22 @@ pub struct ServeSimArgs {
     #[arg(long, default_value_t = 60)]
     pub fps: u32,
 
-    /// Target bitrate in bits per second. Defaults to a value derived from
-    /// the encode resolution, which is usually the right choice.
-    #[arg(long)]
+    /// What the encoder should optimize for.
+    ///
+    /// `interactive` keeps latency low and spends a fixed bitrate.
+    /// `recording` drops the low-latency constraint so a quality target is
+    /// honoured, at the cost of latency — wrong for anyone watching live.
+    #[arg(long, default_value = "interactive")]
+    pub tuning: String,
+
+    /// Target bitrate in bits per second, for interactive tuning. Defaults to
+    /// a value derived from the encode resolution.
+    #[arg(long, conflicts_with = "quality")]
     pub bitrate: Option<u32>,
+
+    /// Target quality from 0 to 1, for recording tuning.
+    #[arg(long, default_value_t = 0.75)]
+    pub quality: f64,
 
     /// Longest edge to encode at. The device framebuffer is scaled down to
     /// fit, which is where most of the quality-per-bit comes from.
@@ -1941,7 +1953,17 @@ async fn run_serve_sim(args: &ServeSimArgs) -> anyhow::Result<()> {
         transport,
         video: VideoConfig {
             fps: args.fps,
-            bitrate: args.bitrate,
+            tuning: match args.tuning.as_str() {
+                "interactive" => accessibility_core::video::Tuning::Interactive {
+                    bitrate: args.bitrate,
+                },
+                "recording" => accessibility_core::video::Tuning::Recording {
+                    quality: args.quality,
+                },
+                other => anyhow::bail!(
+                    "unknown tuning '{other}' (expected interactive or recording)"
+                ),
+            },
             max_dimension: (!args.native_resolution).then_some(args.max_dimension),
             keyframe_interval_secs: args.keyframe_interval,
             // WebRTC needs Annex-B; the raw H.264 transport converts on the
