@@ -38,6 +38,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use accessibility_core::accessibility::{Element, Rect, TreeFilter};
 
+use crate::coverage::CoverageGrid;
+
 /// A rectangle in normalized display space (0..1 on both axes).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct NormalizedRect {
@@ -75,6 +77,20 @@ impl NormalizedRect {
     }
 }
 
+/// How an element was found.
+///
+/// Worth surfacing: a swept element is a point sample with no parent, no
+/// children and no document order, so consumers should not treat it as
+/// equivalent to a node the tree walk returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Discovery {
+    /// Walked from the application root.
+    Recursive,
+    /// Found by hit testing a grid point the tree could not explain.
+    PointGrid,
+}
+
 /// One inspectable element, flattened for the browser.
 #[derive(Debug, Clone, Serialize)]
 pub struct ElementDetail {
@@ -91,6 +107,7 @@ pub struct ElementDetail {
     pub depth: u32,
     /// A selector that would target this element from the CLI.
     pub selector: String,
+    pub discovery: Discovery,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +115,13 @@ pub struct AxSnapshot {
     pub app_name: Option<String>,
     pub pid: Option<u32>,
     pub elements: Vec<ElementDetail>,
+    /// Fraction of the display explained by the tree walk alone, before any
+    /// sweep. Low numbers on a busy screen mean out-of-process content.
+    pub coverage: f64,
+    /// Coverage after sweeping, when a scan was requested.
+    pub coverage_after_scan: Option<f64>,
+    /// How many points the sweep probed. `None` when no scan was requested.
+    pub probes: Option<usize>,
     /// Whether the app reports itself wider than tall.
     ///
     /// Accessibility bounds are in logical space, so this is the one cheap
@@ -108,6 +132,8 @@ pub struct AxSnapshot {
 
 pub enum AxCommand {
     Snapshot {
+        /// Also sweep the regions the tree walk cannot explain.
+        scan: bool,
         reply: oneshot::Sender<Result<AxSnapshot>>,
     },
     HitTest {
@@ -131,9 +157,15 @@ fn selector_for(element: &Element, role: &str) -> String {
     role.to_string()
 }
 
-fn to_detail(element: &Element, app_bounds: &Rect, depth: u32) -> ElementDetail {
+fn to_detail(
+    element: &Element,
+    app_bounds: &Rect,
+    depth: u32,
+    discovery: Discovery,
+) -> ElementDetail {
     let role = format!("{:?}", element.role);
     ElementDetail {
+        discovery,
         id: element.id.to_string(),
         selector: selector_for(element, &role),
         role,
@@ -152,7 +184,7 @@ fn to_detail(element: &Element, app_bounds: &Rect, depth: u32) -> ElementDetail 
 }
 
 fn flatten(element: &Element, app_bounds: &Rect, depth: u32, out: &mut Vec<ElementDetail>) {
-    out.push(to_detail(element, app_bounds, depth));
+    out.push(to_detail(element, app_bounds, depth, Discovery::Recursive));
     for child in &element.children {
         flatten(child, app_bounds, depth + 1, out);
     }
@@ -171,8 +203,8 @@ pub fn spawn_ax_worker(udid: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
         .spawn(move || {
             while let Some(command) = rx.blocking_recv() {
                 match command {
-                    AxCommand::Snapshot { reply } => {
-                        let _ = reply.send(snapshot(&mut reader));
+                    AxCommand::Snapshot { scan, reply } => {
+                        let _ = reply.send(snapshot(&mut reader, scan));
                     }
                     AxCommand::HitTest { x, y, reply } => {
                         let _ = reply.send(hit_test(&mut reader, x, y));
@@ -187,13 +219,14 @@ pub fn spawn_ax_worker(udid: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
 #[cfg(target_os = "macos")]
 fn snapshot(
     reader: &mut accessibility_core::platform::ios_simulator::IOSSimulatorAccessibility,
+    scan: bool,
 ) -> Result<AxSnapshot> {
     let tree = reader.get_tree(&TreeFilter::default())?;
     // `get_screen_bounds` is only populated once a tree has been read, so it
     // has to be queried after the fetch above.
     let app_bounds = reader.get_screen_bounds()?;
 
-    let mut elements = Vec::with_capacity(tree.element_count);
+    let mut elements: Vec<ElementDetail> = Vec::with_capacity(tree.element_count);
     flatten(&tree.root, &app_bounds, 0, &mut elements);
 
     // Drop backdrops and anything with no usable geometry. Both are real parts
@@ -205,10 +238,31 @@ fn snapshot(
             .is_some_and(|bounds| !bounds.is_backdrop() && bounds.width > 0.0 && bounds.height > 0.0)
     });
 
+    // Everything the tree walk explained, so the sweep can skip it.
+    let mut coverage = CoverageGrid::new();
+    for element in &elements {
+        if let Some(bounds) = element.bounds {
+            coverage.mark(&bounds);
+        }
+    }
+    let coverage_before = coverage.ratio();
+
+    let mut probes = None;
+    let mut coverage_after_scan = None;
+    if scan {
+        let swept = sweep(reader, &app_bounds, &mut coverage, &elements)?;
+        probes = Some(swept.probes);
+        elements.extend(swept.elements);
+        coverage_after_scan = Some(coverage.ratio());
+    }
+
     Ok(AxSnapshot {
         app_name: tree.app_name,
         pid: tree.pid,
         elements,
+        coverage: coverage_before,
+        coverage_after_scan,
+        probes,
         is_landscape: app_bounds.size.width > app_bounds.size.height,
     })
 }
@@ -231,7 +285,7 @@ fn hit_test(
     let Some(element) = reader.element_at_point(screen_x, screen_y)? else {
         return Ok(None);
     };
-    let detail = to_detail(&element, &app_bounds, 0);
+    let detail = to_detail(&element, &app_bounds, 0, Discovery::Recursive);
 
     // Nothing pointable here. Reporting the backdrop would highlight the whole
     // device; reporting nothing lets the caller leave the previous selection
@@ -245,6 +299,105 @@ fn hit_test(
 #[cfg(not(target_os = "macos"))]
 pub fn spawn_ax_worker(_udid: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
     anyhow::bail!("Simulator accessibility requires macOS")
+}
+
+/// Spacing between sweep probes, in device points.
+///
+/// idb uses 50; 40 is a little denser for phone-sized screens, where rows are
+/// around 50 points tall and a coarser grid can step straight over one. Every
+/// probe is a hit test, so this trades roughly linearly against scan time.
+#[cfg(target_os = "macos")]
+const SWEEP_STEP_POINTS: f64 = 40.0;
+
+/// Upper bound on probes, so a scan cannot run away on a large display.
+#[cfg(target_os = "macos")]
+const SWEEP_MAX_PROBES: usize = 400;
+
+#[cfg(target_os = "macos")]
+struct SweepResult {
+    elements: Vec<ElementDetail>,
+    probes: usize,
+}
+
+/// Hit test the regions the tree walk could not explain.
+///
+/// This is the only way to reach content in another process — `WKWebView` and
+/// Safari above all — because such content is individually addressable by
+/// point but has no traversable hierarchy. The result is a flat set of point
+/// samples, which is why each is tagged [`Discovery::PointGrid`].
+#[cfg(target_os = "macos")]
+fn sweep(
+    reader: &mut accessibility_core::platform::ios_simulator::IOSSimulatorAccessibility,
+    app_bounds: &Rect,
+    coverage: &mut CoverageGrid,
+    known: &[ElementDetail],
+) -> Result<SweepResult> {
+    use std::collections::HashSet;
+
+    // Elements the tree already reported, keyed by position, so a probe that
+    // lands on one does not report it twice under a different provenance.
+    let mut seen: HashSet<String> = known
+        .iter()
+        .filter_map(|element| element.bounds.map(frame_key))
+        .collect();
+
+    let mut elements = Vec::new();
+    let mut probes = 0usize;
+
+    let columns = (app_bounds.size.width / SWEEP_STEP_POINTS).floor().max(1.0) as usize;
+    let rows = (app_bounds.size.height / SWEEP_STEP_POINTS).floor().max(1.0) as usize;
+
+    for row in 0..rows {
+        for column in 0..columns {
+            if probes >= SWEEP_MAX_PROBES {
+                return Ok(SweepResult { elements, probes });
+            }
+
+            // Probe cell centres so a point never lands exactly on a boundary.
+            let x = (column as f64 + 0.5) / columns as f64;
+            let y = (row as f64 + 0.5) / rows as f64;
+
+            // Already explained by the tree; nothing to learn here.
+            if coverage.is_filled(x, y) {
+                continue;
+            }
+            probes += 1;
+
+            let screen_x = app_bounds.origin.x + x * app_bounds.size.width;
+            let screen_y = app_bounds.origin.y + y * app_bounds.size.height;
+            let Ok(Some(element)) = reader.element_at_point(screen_x, screen_y) else {
+                continue;
+            };
+
+            let detail = to_detail(&element, app_bounds, 0, Discovery::PointGrid);
+            let Some(bounds) = detail.bounds else {
+                continue;
+            };
+            if bounds.is_backdrop() || bounds.width <= 0.0 || bounds.height <= 0.0 {
+                continue;
+            }
+            // A 40 point grid lands on a large element many times over.
+            if !seen.insert(frame_key(bounds)) {
+                // Still mark it: further probes inside it are wasted.
+                coverage.mark(&bounds);
+                continue;
+            }
+
+            coverage.mark(&bounds);
+            elements.push(detail);
+        }
+    }
+
+    Ok(SweepResult { elements, probes })
+}
+
+/// Position key for deduplication, rounded so float noise does not defeat it.
+#[cfg(target_os = "macos")]
+fn frame_key(bounds: NormalizedRect) -> String {
+    format!(
+        "{:.4},{:.4},{:.4},{:.4}",
+        bounds.x, bounds.y, bounds.width, bounds.height
+    )
 }
 
 #[cfg(test)]

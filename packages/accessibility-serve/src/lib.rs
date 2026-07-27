@@ -7,6 +7,7 @@
 
 pub mod avcc;
 pub mod ax;
+pub mod coverage;
 pub mod http;
 pub mod input;
 pub mod keymap;

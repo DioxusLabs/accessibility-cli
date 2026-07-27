@@ -127,8 +127,15 @@ fn internal_error(error: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
 }
 
-async fn ax_tree(State(state): State<AppState>) -> Response {
-    match state.session.ax_snapshot().await {
+#[derive(Deserialize)]
+struct TreeQuery {
+    /// Sweep the regions the tree walk cannot explain, reaching web content.
+    #[serde(default)]
+    scan: bool,
+}
+
+async fn ax_tree(State(state): State<AppState>, Query(query): Query<TreeQuery>) -> Response {
+    match state.session.ax_snapshot(query.scan).await {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => internal_error(error),
     }

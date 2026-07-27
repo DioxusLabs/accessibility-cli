@@ -500,9 +500,15 @@ document.getElementById("btnSettings").onclick = () => {
 
 async function refreshTree() {
   try {
-    const response = await fetch("/api/ax/tree");
+    // scan=true also sweeps the regions the tree walk cannot explain, which is
+    // the only way the cached hover preview sees WKWebView and Safari content.
+    // Costs a few hundred milliseconds, which is fine on an explicit toggle.
+    const response = await fetch("/api/ax/tree?scan=true");
     if (!response.ok) throw new Error(await response.text());
-    axElements = (await response.json()).elements.filter((e) => e.bounds);
+    const snapshot = await response.json();
+    axElements = snapshot.elements.filter((e) => e.bounds);
+    const after = snapshot.coverage_after_scan ?? snapshot.coverage;
+    setStatus(`inspecting · ${axElements.length} elements · ${Math.round(after * 100)}% covered`);
   } catch (error) {
     console.warn("accessibility tree unavailable:", error);
     axElements = [];

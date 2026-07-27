@@ -234,10 +234,15 @@ impl SimSession {
         let _ = self.input.send(command);
     }
 
-    pub async fn ax_snapshot(&self) -> Result<AxSnapshot> {
+    /// Read the accessibility tree.
+    ///
+    /// `scan` additionally hit-tests the regions the tree walk cannot explain,
+    /// which is the only way to reach `WKWebView` and Safari content. It costs
+    /// a few hundred milliseconds, so it is opt-in.
+    pub async fn ax_snapshot(&self, scan: bool) -> Result<AxSnapshot> {
         let (tx, rx) = oneshot::channel();
         self.ax
-            .send(AxCommand::Snapshot { reply: tx })
+            .send(AxCommand::Snapshot { scan, reply: tx })
             .map_err(|_| anyhow!("accessibility worker stopped"))?;
         let snapshot = rx
             .await
@@ -271,7 +276,7 @@ impl SimSession {
     /// Without this the server would assume portrait and render a sideways
     /// device whenever it attaches to an already-rotated simulator.
     pub async fn seed_orientation(&self) {
-        if let Ok(snapshot) = self.ax_snapshot().await {
+        if let Ok(snapshot) = self.ax_snapshot(false).await {
             self.reconcile_orientation(snapshot.is_landscape);
         }
     }
