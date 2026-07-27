@@ -12,8 +12,7 @@
 //!
 //! # Coordinate spaces
 //!
-//! Accessibility frames come back in macOS screen points, positioned wherever
-//! the Simulator window happens to be. The browser knows nothing about that,
+//! Accessibility frames come back in points relative to the Simulator window,
 //! so every rect is converted to a 0..1 fraction of the app's own bounds
 //! before it leaves this module:
 //!
@@ -21,8 +20,17 @@
 //! normalized = (ax_rect.origin - app_bounds.origin) / app_bounds.size
 //! ```
 //!
-//! That also makes the values independent of the display scale factor, which
-//! is why no pixel/point conversion appears here.
+//! That makes the values independent of the display scale factor, which is
+//! why no pixel/point conversion appears here.
+//!
+//! Crucially, these are **logical** coordinates, already rotated by iOS: in
+//! landscape the app reports its bounds as 874x402 rather than 402x874, so the
+//! normalized rects are upright and need no further rotation to be drawn.
+//!
+//! This is the opposite of the HID input path, which is in *raw framebuffer*
+//! space — the framebuffer never rotates, so pointer coordinates have to be
+//! un-rotated before injection. The two spaces coincide in portrait, which is
+//! exactly what makes the difference easy to miss.
 
 use anyhow::{Result, anyhow};
 use serde::Serialize;
@@ -76,6 +84,12 @@ pub struct AxSnapshot {
     pub app_name: Option<String>,
     pub pid: Option<u32>,
     pub elements: Vec<ElementDetail>,
+    /// Whether the app reports itself wider than tall.
+    ///
+    /// Accessibility bounds are in logical space, so this is the one cheap
+    /// signal that reveals the device's real orientation. The framebuffer
+    /// cannot provide it: it never rotates.
+    pub is_landscape: bool,
 }
 
 pub enum AxCommand {
@@ -172,6 +186,7 @@ fn snapshot(
         app_name: tree.app_name,
         pid: tree.pid,
         elements,
+        is_landscape: app_bounds.size.width > app_bounds.size.height,
     })
 }
 

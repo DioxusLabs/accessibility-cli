@@ -17,7 +17,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use accessibility_core::video::{EncodedFrame, FrameKind, VideoCapture, VideoConfig};
 
 use crate::ax::{AxCommand, AxSnapshot, ElementDetail, spawn_ax_worker};
-use crate::input::{InputCommand, spawn_input_worker};
+use crate::input::{InputCommand, Orientation, spawn_input_worker};
+use crate::settings::{Setting, SettingKey};
 
 /// How many encoded frames to buffer per subscriber.
 ///
@@ -29,8 +30,11 @@ const FRAME_BUFFER: usize = 16;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceInfo {
     pub udid: String,
+    /// Raw framebuffer width. Does not change with orientation.
     pub width: u32,
+    /// Raw framebuffer height. Does not change with orientation.
     pub height: u32,
+    pub orientation: Orientation,
 }
 
 pub struct SimSession {
@@ -40,8 +44,14 @@ pub struct SimSession {
     /// Most recent parameter set, replayed to clients that join mid-stream.
     latest_parameter_set: Arc<std::sync::Mutex<Option<EncodedFrame>>>,
     frames_encoded: Arc<AtomicU64>,
-    input: mpsc::UnboundedSender<InputCommand>,
+    input: std::sync::mpsc::Sender<InputCommand>,
     ax: mpsc::UnboundedSender<AxCommand>,
+    /// Last orientation we asked for.
+    ///
+    /// The framebuffer is always portrait-native — rotating the device
+    /// rotates the *content* inside a fixed-size surface — so orientation
+    /// cannot be recovered from the video and has to be tracked here.
+    orientation: std::sync::Mutex<Orientation>,
 }
 
 impl SimSession {
@@ -77,6 +87,7 @@ impl SimSession {
             frames_encoded,
             input,
             ax,
+            orientation: std::sync::Mutex::new(Orientation::Portrait),
         }))
     }
 
@@ -106,12 +117,34 @@ impl SimSession {
             udid: self.device_udid.clone(),
             width: geometry.width,
             height: geometry.height,
+            orientation: self.orientation(),
         }
+    }
+
+    pub fn orientation(&self) -> Orientation {
+        *self.orientation.lock().unwrap()
+    }
+
+    /// Rotate the device and remember the new orientation.
+    pub fn set_orientation(&self, orientation: Orientation) {
+        *self.orientation.lock().unwrap() = orientation;
+        self.send_input(InputCommand::Rotate { orientation });
+    }
+
+    pub fn settings(&self) -> Vec<Setting> {
+        crate::settings::read_all(&self.device_udid)
+    }
+
+    pub fn set_setting(&self, key: SettingKey, value: &str) -> Result<String> {
+        crate::settings::write(&self.device_udid, key, value)
     }
 
     /// Queue an input event. Fire-and-forget: pointer events must never block
     /// the socket reader.
     pub fn send_input(&self, command: InputCommand) {
+        if let InputCommand::Rotate { orientation } = command {
+            *self.orientation.lock().unwrap() = orientation;
+        }
         let _ = self.input.send(command);
     }
 
@@ -120,7 +153,41 @@ impl SimSession {
         self.ax
             .send(AxCommand::Snapshot { reply: tx })
             .map_err(|_| anyhow!("accessibility worker stopped"))?;
-        rx.await.map_err(|_| anyhow!("accessibility worker stopped"))?
+        let snapshot = rx
+            .await
+            .map_err(|_| anyhow!("accessibility worker stopped"))??;
+        self.reconcile_orientation(snapshot.is_landscape);
+        Ok(snapshot)
+    }
+
+    /// Correct the tracked orientation against what the device reports.
+    ///
+    /// Orientation can change without us: the user can rotate from the
+    /// Simulator menu, an app can force an orientation, or the server can be
+    /// restarted while the device is already sideways. Accessibility bounds
+    /// are the only cheap signal, and they only reveal landscape vs portrait,
+    /// so a disagreement resolves to a sensible default of the right kind
+    /// rather than to an exact rotation.
+    fn reconcile_orientation(&self, is_landscape: bool) {
+        let mut orientation = self.orientation.lock().unwrap();
+        if orientation.is_landscape() == is_landscape {
+            return;
+        }
+        *orientation = if is_landscape {
+            Orientation::LandscapeLeft
+        } else {
+            Orientation::Portrait
+        };
+    }
+
+    /// Best-effort orientation seed at startup.
+    ///
+    /// Without this the server would assume portrait and render a sideways
+    /// device whenever it attaches to an already-rotated simulator.
+    pub async fn seed_orientation(&self) {
+        if let Ok(snapshot) = self.ax_snapshot().await {
+            self.reconcile_orientation(snapshot.is_landscape);
+        }
     }
 
     pub async fn ax_hit_test(&self, x: f64, y: f64) -> Result<Option<ElementDetail>> {

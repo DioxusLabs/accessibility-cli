@@ -11,12 +11,24 @@ use super::*;
 /// Function pointer types for Indigo message creation (loaded from SimulatorKit via dlsym).
 type IndigoMessageForButtonFn =
     unsafe extern "C" fn(source: i32, action: i32, target: i32) -> *mut c_void;
+/// `IndigoHIDMessageForMouseNSEvent(CGPoint*, CGPoint*, IndigoHIDTarget,
+///  NSEventType, NSSize, IndigoHIDEdge)`
+///
+/// On arm64 the integer and floating-point arguments are numbered
+/// independently, so the pointers, target, event type and edge land in x0-x4
+/// while the `NSSize` occupies d0/d1. Declaring the size last therefore still
+/// produces the correct register assignment.
+///
+/// Apple's Simulator.app always passes `NSSize(1.0, 1.0)`, which makes the
+/// ratio computation inside the function reduce to the point itself.
 type IndigoMessageForTouchFn = unsafe extern "C" fn(
     point0: *const objc2_core_foundation::CGPoint,
     point1: *const objc2_core_foundation::CGPoint,
     target: i32,
     event_type: i32,
-    something: Bool,
+    edge: u32,
+    size_width: f64,
+    size_height: f64,
 ) -> *mut c_void;
 type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i32) -> *mut c_void;
 
@@ -31,6 +43,24 @@ pub enum TouchPhase {
     Begin,
     Move,
     End,
+}
+
+/// Screen edge a touch is treated as originating from.
+///
+/// iOS only recognizes system gestures — most importantly swipe-up-to-home on
+/// Face ID devices — when the touch is flagged with the edge it started from.
+/// Without this a drag from the bottom is just an in-app drag.
+///
+/// These are edges of the *raw framebuffer*, which never rotates, so callers
+/// working in display space have to map through the current orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TouchEdge {
+    None = 0,
+    Left = 1,
+    Top = 2,
+    Bottom = 3,
+    Right = 4,
 }
 
 /// Device orientation, using the GSEvent numbering.
@@ -232,6 +262,20 @@ impl SimulatorHID {
     /// `x` and `y` are 0..1 fractions of the screen, matching what the web UI
     /// already computes, so no point/pixel/scale conversion is involved.
     pub fn touch_normalized(&self, x: f64, y: f64, phase: TouchPhase) -> Result<()> {
+        self.touch_normalized_edge(x, y, phase, TouchEdge::None)
+    }
+
+    /// As [`Self::touch_normalized`], but flagged as a system edge gesture.
+    ///
+    /// The same edge must be supplied for every event in the gesture, or iOS
+    /// will not recognize it.
+    pub fn touch_normalized_edge(
+        &self,
+        x: f64,
+        y: f64,
+        phase: TouchPhase,
+        edge: TouchEdge,
+    ) -> Result<()> {
         let x = x.clamp(0.0, 1.0);
         let y = y.clamp(0.0, 1.0);
         // Indigo has no distinct "move" phase; contact is maintained by
@@ -241,7 +285,7 @@ impl SimulatorHID {
             TouchPhase::Begin | TouchPhase::Move => ButtonDirection::Down,
             TouchPhase::End => ButtonDirection::Up,
         };
-        self.send_touch(x, y, direction)
+        self.send_touch_edge(x, y, direction, edge)
     }
 
     /// Rotate the device.
@@ -357,6 +401,16 @@ impl SimulatorHID {
 
     /// Send a touch event at the given ratio coordinates.
     fn send_touch(&self, x_ratio: f64, y_ratio: f64, direction: ButtonDirection) -> Result<()> {
+        self.send_touch_edge(x_ratio, y_ratio, direction, TouchEdge::None)
+    }
+
+    fn send_touch_edge(
+        &self,
+        x_ratio: f64,
+        y_ratio: f64,
+        direction: ButtonDirection,
+        edge: TouchEdge,
+    ) -> Result<()> {
         // First get a template message from IndigoHIDMessageForMouseNSEvent
         let point = objc2_core_foundation::CGPoint {
             x: x_ratio,
@@ -368,8 +422,17 @@ impl SimulatorHID {
             ButtonDirection::Up => 2,
         };
 
-        let template_msg =
-            unsafe { (self.msg_for_touch)(&point, std::ptr::null(), 0x32, event_type, Bool::NO) };
+        let template_msg = unsafe {
+            (self.msg_for_touch)(
+                &point,
+                std::ptr::null(),
+                0x32,
+                event_type,
+                edge as u32,
+                1.0,
+                1.0,
+            )
+        };
 
         if template_msg.is_null() {
             return Err(anyhow!("Failed to create template touch message"));

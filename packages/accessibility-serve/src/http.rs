@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use accessibility_core::video::FrameKind;
 
 use crate::avcc;
-use crate::input::InputCommand;
+use crate::input::{InputCommand, Orientation};
 use crate::session::SimSession;
+use crate::settings::{Setting, SettingKey};
 use crate::webrtc_stream::WebRtcEngine;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -32,6 +33,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/api/ax/tree", get(ax_tree))
         .route("/api/ax/hit", get(ax_hit))
+        .route("/api/settings", get(settings).post(set_setting))
+        .route("/api/orientation", post(set_orientation))
         .route("/webrtc/offer", post(webrtc_offer))
         .route("/ws/stream", get(stream_socket))
         .route("/ws/input", get(input_socket))
@@ -45,8 +48,10 @@ async fn index() -> Html<&'static str> {
 #[derive(Serialize)]
 struct ConfigResponse {
     udid: String,
+    /// Raw framebuffer size. Constant regardless of orientation.
     width: u32,
     height: u32,
+    orientation: Orientation,
     default_transport: String,
     transports: Vec<&'static str>,
     home_indicator_band: f64,
@@ -58,10 +63,55 @@ async fn config(State(state): State<AppState>) -> Json<ConfigResponse> {
         udid: device.udid,
         width: device.width,
         height: device.height,
+        orientation: device.orientation,
         default_transport: state.default_transport.clone(),
         transports: vec!["webrtc", "h264"],
         home_indicator_band: crate::input::HOME_INDICATOR_BAND,
     })
+}
+
+async fn settings(State(state): State<AppState>) -> Json<Vec<Setting>> {
+    // Each read shells out to simctl, so keep it off the async worker threads.
+    let session = Arc::clone(&state.session);
+    Json(
+        tokio::task::spawn_blocking(move || session.settings())
+            .await
+            .unwrap_or_default(),
+    )
+}
+
+#[derive(Deserialize)]
+struct SettingRequest {
+    key: SettingKey,
+    value: String,
+}
+
+async fn set_setting(
+    State(state): State<AppState>,
+    Json(request): Json<SettingRequest>,
+) -> Response {
+    let session = Arc::clone(&state.session);
+    let result =
+        tokio::task::spawn_blocking(move || session.set_setting(request.key, &request.value)).await;
+
+    match result {
+        Ok(Ok(value)) => Json(serde_json::json!({ "value": value })).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => internal_error(anyhow::anyhow!(error)),
+    }
+}
+
+#[derive(Deserialize)]
+struct OrientationRequest {
+    orientation: Orientation,
+}
+
+async fn set_orientation(
+    State(state): State<AppState>,
+    Json(request): Json<OrientationRequest>,
+) -> Response {
+    state.session.set_orientation(request.orientation);
+    Json(serde_json::json!({ "orientation": request.orientation })).into_response()
 }
 
 /// Map an `anyhow` error onto a 500 with the message preserved.

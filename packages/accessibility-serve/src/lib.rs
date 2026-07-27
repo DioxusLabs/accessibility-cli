@@ -10,6 +10,7 @@ pub mod ax;
 pub mod http;
 pub mod input;
 pub mod session;
+pub mod settings;
 pub mod webrtc_stream;
 
 use std::net::SocketAddr;
@@ -81,6 +82,9 @@ impl Default for ServeConfig {
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let session = SimSession::start(config.udid.as_deref(), config.video)
         .context("failed to start simulator capture")?;
+    // The framebuffer cannot reveal orientation, so ask accessibility once
+    // before serving; otherwise an already-rotated device renders sideways.
+    session.seed_orientation().await;
     let device = session.device_info();
 
     let webrtc = Arc::new(

@@ -7,140 +7,208 @@
 <style>
   :root {
     --bg: #0d0f12;
-    --panel: #16191f;
-    --border: #262b34;
+    --panel: #14171d;
+    --raised: #1e222a;
+    --border: #272c36;
     --text: #e6e9ef;
-    --muted: #99a1b0;
+    --muted: #8b93a3;
     --accent: #4c8dff;
-    --accent-soft: rgba(76, 141, 255, 0.18);
+    --accent-soft: rgba(76, 141, 255, 0.16);
     --good: #3fb950;
     --bad: #f85149;
   }
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; height: 100%;
+    margin: 0; height: 100%; overflow: hidden;
     background: var(--bg); color: var(--text);
     font: 13px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
   }
-  body { display: flex; }
+  body { display: flex; align-items: stretch; }
+
+  /* ── device ─────────────────────────────────────────────── */
 
   main {
-    flex: 1; display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    padding: 20px; gap: 12px; min-width: 0;
+    flex: 1; min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
   }
-
   #stage {
     position: relative;
-    height: min(88vh, 900px);
-    border-radius: 22px;
-    overflow: hidden;
     background: #000;
-    box-shadow: 0 18px 50px rgba(0,0,0,.55);
+    border-radius: 20px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
   }
-  #stage video, #stage canvas#screen {
-    display: block; height: 100%; width: 100%; object-fit: fill;
+  /* The framebuffer is always portrait-native; the media element is rotated
+     into place and the stage takes the resulting upright dimensions. */
+  #media {
+    position: absolute; top: 50%; left: 50%;
+    transform-origin: center center;
+    display: block;
   }
-  #stage canvas#screen { display: none; }
-  #stage.h264 video { display: none; }
-  #stage.h264 canvas#screen { display: block; }
+  #media video, #media canvas { display: block; width: 100%; height: 100%; }
+  #media canvas { display: none; }
+  #media.h264 video { display: none; }
+  #media.h264 canvas { display: block; }
 
-  #overlay {
-    position: absolute; inset: 0;
-    pointer-events: none;
-  }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
   #stage.inspecting { cursor: crosshair; }
 
-  .chip {
-    position: absolute;
-    background: var(--accent);
-    color: #fff;
-    font-size: 11px; font-weight: 600;
-    padding: 2px 6px; border-radius: 4px;
-    white-space: nowrap;
-    pointer-events: none;
-    max-width: 90%; overflow: hidden; text-overflow: ellipsis;
-  }
   .box {
     position: absolute;
     border: 1.5px solid var(--accent);
     background: var(--accent-soft);
     border-radius: 3px;
-    pointer-events: none;
+  }
+  .chip {
+    position: absolute;
+    background: var(--accent); color: #fff;
+    font-size: 11px; font-weight: 600;
+    padding: 2px 6px; border-radius: 4px;
+    white-space: nowrap; max-width: 92%;
+    overflow: hidden; text-overflow: ellipsis;
   }
 
-  #toolbar {
-    display: flex; align-items: center; gap: 8px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 6px 8px;
-  }
-  button {
-    background: #1e222a; color: var(--text);
-    border: 1px solid var(--border); border-radius: 7px;
-    padding: 6px 11px; font: inherit; font-weight: 500;
-    cursor: pointer;
-  }
-  button:hover { background: #262b34; }
-  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .status { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 0 6px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .dot.live { background: var(--good); }
-  .dot.error { background: var(--bad); }
+  /* ── side ribbon ────────────────────────────────────────── */
 
-  aside {
-    width: 330px; flex: none;
+  #ribbon {
+    flex: none; width: 48px;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 4px; padding: 10px 0;
     background: var(--panel);
     border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+  #ribbon .spacer { flex: 1; }
+  #ribbon .sep { width: 24px; height: 1px; background: var(--border); margin: 5px 0; }
+
+  .tool {
+    position: relative;
+    width: 34px; height: 34px;
+    display: grid; place-items: center;
+    background: transparent; color: var(--muted);
+    border: 1px solid transparent; border-radius: 8px;
+    cursor: pointer; padding: 0;
+  }
+  .tool:hover { background: var(--raised); color: var(--text); }
+  .tool[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tool svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* Tooltips sit to the left so they never leave the viewport. */
+  .tool::after {
+    content: attr(data-label);
+    position: absolute; right: calc(100% + 8px); top: 50%;
+    transform: translateY(-50%);
+    background: #000; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 3px 8px; font-size: 11px; white-space: nowrap;
+    opacity: 0; pointer-events: none; transition: opacity .12s;
+  }
+  .tool:hover::after { opacity: 1; }
+
+  #statusDot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  #statusDot.live { background: var(--good); }
+  #statusDot.error { background: var(--bad); }
+
+  /* ── drawer ─────────────────────────────────────────────── */
+
+  aside {
+    flex: none; width: 320px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
     padding: 16px; overflow-y: auto;
     display: none;
   }
   aside.open { display: block; }
-  aside h2 { margin: 0 0 4px; font-size: 13px; }
-  aside .role { color: var(--accent); font-weight: 600; }
-  aside .hint { color: var(--muted); }
-  dl { display: grid; grid-template-columns: 84px 1fr; gap: 6px 10px; margin: 14px 0 0; }
+  aside h2 { margin: 0 0 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .empty { color: var(--muted); }
+
+  .role { color: var(--accent); font-weight: 600; font-size: 14px; }
+  dl { display: grid; grid-template-columns: 84px 1fr; gap: 6px 10px; margin: 12px 0 0; }
   dt { color: var(--muted); }
   dd { margin: 0; word-break: break-word; }
   code {
     display: block; margin-top: 6px; padding: 8px;
-    background: #0d1016; border: 1px solid var(--border); border-radius: 6px;
+    background: #0b0e13; border: 1px solid var(--border); border-radius: 6px;
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
     color: #a5d6ff; word-break: break-all;
   }
-  .copy { margin-top: 8px; width: 100%; }
+  button.wide {
+    margin-top: 8px; width: 100%;
+    background: var(--raised); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 7px; font: inherit; cursor: pointer;
+  }
+  button.wide:hover { background: #262b34; }
+
+  .field { margin-bottom: 14px; }
+  .field label { display: block; margin-bottom: 5px; color: var(--muted); }
+  .field select {
+    width: 100%; padding: 6px 8px;
+    background: var(--raised); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    font: inherit;
+  }
+  .seg { display: flex; gap: 4px; }
+  .seg button {
+    flex: 1; padding: 6px;
+    background: var(--raised); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    font: inherit; cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
 
 <main>
   <div id="stage">
-    <video id="video" autoplay playsinline muted></video>
-    <canvas id="screen"></canvas>
+    <div id="media">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="screen"></canvas>
+    </div>
     <div id="overlay"></div>
-  </div>
-
-  <div id="toolbar">
-    <button id="home" title="Home">Home</button>
-    <button id="inspect" aria-pressed="false" title="Inspect elements (hold Option)">Inspect</button>
-    <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting</span></div>
   </div>
 </main>
 
-<aside id="panel">
-  <h2><span class="role" id="d-role">—</span></h2>
-  <div class="hint" id="d-label"></div>
-  <dl>
-    <dt>value</dt><dd id="d-value">—</dd>
-    <dt>identifier</dt><dd id="d-id">—</dd>
-    <dt>enabled</dt><dd id="d-enabled">—</dd>
-    <dt>actions</dt><dd id="d-actions">—</dd>
-  </dl>
-  <div style="margin-top:14px">
-    <div class="hint">CLI selector</div>
-    <code id="d-selector">—</code>
-    <button class="copy" id="copy">Copy selector</button>
+<div id="ribbon">
+  <button class="tool" id="btnHome" data-label="Home">
+    <svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg>
+  </button>
+  <button class="tool" id="btnLock" data-label="Lock">
+    <svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7a3.5 3.5 0 1 1 7 0v3.5"/></svg>
+  </button>
+
+  <div class="sep"></div>
+
+  <button class="tool" id="btnRotateL" data-label="Rotate left">
+    <svg viewBox="0 0 24 24"><path d="M4 9a8 8 0 1 1 1.5 6"/><path d="M3.5 4.5V9H8"/></svg>
+  </button>
+  <button class="tool" id="btnRotateR" data-label="Rotate right">
+    <svg viewBox="0 0 24 24"><path d="M20 9a8 8 0 1 0-1.5 6"/><path d="M20.5 4.5V9H16"/></svg>
+  </button>
+
+  <div class="sep"></div>
+
+  <button class="tool" id="btnInspect" aria-pressed="false" data-label="Inspect (hold ⌥)">
+    <svg viewBox="0 0 24 24"><path d="M4 4l6.5 16 2.5-6.5L19.5 11z"/></svg>
+  </button>
+  <button class="tool" id="btnSettings" aria-pressed="false" data-label="Device settings">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
+  </button>
+
+  <div class="spacer"></div>
+  <div id="statusDot" title="connecting"></div>
+</div>
+
+<aside id="drawer">
+  <div id="inspectorPanel" hidden>
+    <h2>Element</h2>
+    <div id="inspectorBody" class="empty">Hover the device to inspect.</div>
+  </div>
+  <div id="settingsPanel" hidden>
+    <h2>Device settings</h2>
+    <div id="settingsBody" class="empty">Loading…</div>
   </div>
 </aside>
 
@@ -148,37 +216,121 @@
 "use strict";
 
 const stage = document.getElementById("stage");
+const media = document.getElementById("media");
 const video = document.getElementById("video");
-const screen = document.getElementById("screen");
+const screenCanvas = document.getElementById("screen");
 const overlay = document.getElementById("overlay");
-const panel = document.getElementById("panel");
-const dot = document.getElementById("dot");
-const statusText = document.getElementById("statusText");
+const drawer = document.getElementById("drawer");
+const statusDot = document.getElementById("statusDot");
 
 let config = null;
+let orientation = "portrait";
 let inputSocket = null;
 let inspecting = false;
 let axElements = [];
 let selected = null;
 let pointerDown = false;
+let openDrawer = null;
 
-function setStatus(text, state) {
-  statusText.textContent = text;
-  dot.className = "dot" + (state ? " " + state : "");
+const setStatus = (text, state) => {
+  statusDot.title = text;
+  statusDot.className = state || "";
+};
+
+/* ── orientation ────────────────────────────────────────────
+   The framebuffer never rotates: the simulator renders rotated content into
+   a fixed portrait surface. So the media element is rotated for display, and
+   pointer coordinates are rotated back before being sent. */
+
+const ROTATION = {
+  portrait: 0,
+  landscape_left: 90,
+  landscape_right: -90,
+  portrait_upside_down: 180,
+};
+
+const isLandscape = () =>
+  orientation === "landscape_left" || orientation === "landscape_right";
+
+/** Upright display point (0..1) to raw framebuffer point. */
+function toRawPoint(x, y) {
+  switch (orientation) {
+    case "landscape_left": return { x: y, y: 1 - x };
+    case "landscape_right": return { x: 1 - y, y: x };
+    case "portrait_upside_down": return { x: 1 - x, y: 1 - y };
+    default: return { x, y };
+  }
 }
 
-/* ---------------------------------------------------------------- layout */
+/* The display edge a point sits on, mapped into raw framebuffer edges.
+   iOS only recognizes swipe-up-to-home when the touch is flagged with the
+   edge it started from, and those edges are in raw framebuffer space, which
+   never rotates. So "bottom of what the user sees" becomes a different raw
+   edge in each orientation. */
+const BOTTOM_EDGE_BY_ORIENTATION = {
+  portrait: "bottom",
+  landscape_left: "right",
+  landscape_right: "left",
+  portrait_upside_down: "top",
+};
 
-// The stage is pinned to the device aspect ratio so the media element's
-// bounding box is exactly the video content box. That keeps pointer mapping
-// a plain rect division with no letterbox correction.
-function applyAspectRatio() {
-  stage.style.aspectRatio = `${config.width} / ${config.height}`;
-  screen.width = config.width;
-  screen.height = config.height;
+/** The raw edge for a display point, or "none" if it is not near one. */
+function edgeForDisplayPoint(y) {
+  if (y < config.home_indicator_band) return "none";
+  return BOTTOM_EDGE_BY_ORIENTATION[orientation] || "bottom";
 }
 
-/* ----------------------------------------------------------------- input */
+/** Rotate a delta, which has direction but no origin. */
+function toRawDelta(dx, dy) {
+  switch (orientation) {
+    case "landscape_left": return { dx: dy, dy: -dx };
+    case "landscape_right": return { dx: -dy, dy: dx };
+    case "portrait_upside_down": return { dx: -dx, dy: -dy };
+    default: return { dx, dy };
+  }
+}
+
+/* Accessibility coordinates need no rotation.
+   There are two distinct spaces here and conflating them is the easiest
+   mistake to make:
+
+   - HID input is in *raw framebuffer* space. The framebuffer is always
+     portrait-native, so pointer coordinates must be un-rotated before being
+     sent (see toRawPoint).
+   - Accessibility frames are in *logical* space, already rotated by iOS. In
+     landscape the app's own bounds are reported as 874x402 rather than
+     402x874, so normalizing against them yields upright display coordinates
+     directly.
+
+   So AX rects are drawn as-is, and hit tests are sent in display coordinates
+   while touches are sent in raw coordinates. */
+
+/** Size the stage to the upright device and rotate the media into it. */
+function layout() {
+  const fbW = config.width;
+  const fbH = config.height;
+  const uprightW = isLandscape() ? fbH : fbW;
+  const uprightH = isLandscape() ? fbW : fbH;
+
+  const available = {
+    width: window.innerWidth - document.getElementById("ribbon").offsetWidth
+      - (drawer.classList.contains("open") ? drawer.offsetWidth : 0) - 48,
+    height: window.innerHeight - 48,
+  };
+  const scale = Math.min(available.width / uprightW, available.height / uprightH);
+
+  stage.style.width = `${uprightW * scale}px`;
+  stage.style.height = `${uprightH * scale}px`;
+
+  // The media keeps the framebuffer's own aspect and is rotated on top of it.
+  media.style.width = `${fbW * scale}px`;
+  media.style.height = `${fbH * scale}px`;
+  media.style.transform =
+    `translate(-50%, -50%) rotate(${ROTATION[orientation] || 0}deg)`;
+}
+window.addEventListener("resize", () => config && layout());
+
+/* ── input ──────────────────────────────────────────────── */
 
 function connectInput() {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
@@ -192,7 +344,8 @@ function sendInput(message) {
   }
 }
 
-function pointToNormalized(event) {
+/** Pointer event to upright display coordinates. */
+function displayPoint(event) {
   const rect = stage.getBoundingClientRect();
   return {
     x: Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1),
@@ -200,32 +353,51 @@ function pointToNormalized(event) {
   };
 }
 
+// The edge is decided when the gesture starts and held for its whole life:
+// iOS ignores the gesture if the flag changes partway through.
+let activeEdge = "none";
+
+function sendTouch(phase, event) {
+  const display = displayPoint(event);
+  const raw = toRawPoint(display.x, display.y);
+  if (phase === "begin") activeEdge = edgeForDisplayPoint(display.y);
+  sendInput({ type: "touch", phase, x: raw.x, y: raw.y, edge: activeEdge });
+  if (phase === "end") activeEdge = "none";
+}
+
 stage.addEventListener("pointerdown", (event) => {
-  if (inspecting) { pickAt(event, true); return; }
+  if (inspecting) { pick(event, true); return; }
   pointerDown = true;
   stage.setPointerCapture(event.pointerId);
-  const { x, y } = pointToNormalized(event);
-  sendInput({ type: "touch", phase: "begin", x, y });
+  sendTouch("begin", event);
 });
 
 stage.addEventListener("pointermove", (event) => {
-  if (inspecting) { hoverAt(event); return; }
-  if (!pointerDown) return;
-  const { x, y } = pointToNormalized(event);
-  sendInput({ type: "touch", phase: "move", x, y });
+  if (inspecting) { hover(event); return; }
+  if (pointerDown) sendTouch("move", event);
 });
 
-function endTouch(event) {
+const endTouch = (event) => {
   if (!pointerDown) return;
   pointerDown = false;
-  const { x, y } = pointToNormalized(event);
-  sendInput({ type: "touch", phase: "end", x, y });
-}
+  sendTouch("end", event);
+};
 stage.addEventListener("pointerup", endTouch);
 stage.addEventListener("pointercancel", endTouch);
 
-// A US-keyboard subset is enough to type into fields and drive navigation.
-// These are HIToolbox virtual key codes, which is what the HID path wants.
+// Wheel deltas are sent as a fraction of the display; the server turns them
+// into a touch drag, re-planting the finger when it runs out of screen.
+stage.addEventListener("wheel", (event) => {
+  if (inspecting) return;
+  event.preventDefault();
+  const rect = stage.getBoundingClientRect();
+  const display = displayPoint(event);
+  const raw = toRawPoint(display.x, display.y);
+  const delta = toRawDelta(event.deltaX / rect.width, event.deltaY / rect.height);
+  sendInput({ type: "scroll", dx: delta.dx, dy: delta.dy, x: raw.x, y: raw.y });
+}, { passive: false });
+
+// HIToolbox virtual key codes: enough to type and navigate.
 const KEY_CODES = {
   a:0,s:1,d:2,f:3,h:4,g:5,z:6,x:7,c:8,v:9,b:11,q:12,w:13,e:14,r:15,y:16,t:17,
   "1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"=":24,"9":25,"7":26,"-":27,"8":28,
@@ -235,84 +407,107 @@ const KEY_CODES = {
 };
 
 window.addEventListener("keydown", (event) => {
+  if (event.key === "Alt" && !inspecting) { setInspecting(true, true); return; }
   if (inspecting && event.key === "Escape") { clearSelection(); return; }
-  if (event.metaKey || event.ctrlKey) return;
+  if (event.metaKey || event.ctrlKey || event.target.tagName === "SELECT") return;
   const code = KEY_CODES[event.key] ?? KEY_CODES[event.key.toLowerCase()];
   if (code === undefined) return;
   event.preventDefault();
   sendInput({ type: "key", key_code: code });
 });
+window.addEventListener("keyup", (event) => {
+  if (event.key === "Alt" && momentaryInspect) setInspecting(false);
+});
 
-document.getElementById("home").onclick = () =>
-  sendInput({ type: "button", button: "home" });
+/* ── ribbon ─────────────────────────────────────────────── */
 
-/* ------------------------------------------------------------- inspector */
+const ROTATE_LEFT = { portrait: "landscape_right", landscape_right: "portrait_upside_down", portrait_upside_down: "landscape_left", landscape_left: "portrait" };
+const ROTATE_RIGHT = { portrait: "landscape_left", landscape_left: "portrait_upside_down", portrait_upside_down: "landscape_right", landscape_right: "portrait" };
 
-const inspectButton = document.getElementById("inspect");
+async function rotate(map) {
+  const next = map[orientation] || "portrait";
+  await fetch("/api/orientation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orientation: next }),
+  });
+  orientation = next;
+  layout();
+  if (selected) drawSelection(selected);
+}
 
-function setInspecting(on) {
+document.getElementById("btnHome").onclick = () => sendInput({ type: "button", button: "home" });
+document.getElementById("btnLock").onclick = () => sendInput({ type: "button", button: "lock" });
+document.getElementById("btnRotateL").onclick = () => rotate(ROTATE_LEFT);
+document.getElementById("btnRotateR").onclick = () => rotate(ROTATE_RIGHT);
+
+function showDrawer(name) {
+  openDrawer = openDrawer === name ? null : name;
+  drawer.classList.toggle("open", openDrawer !== null);
+  document.getElementById("inspectorPanel").hidden = openDrawer !== "inspector";
+  document.getElementById("settingsPanel").hidden = openDrawer !== "settings";
+  document.getElementById("btnSettings").setAttribute("aria-pressed", String(openDrawer === "settings"));
+  layout();
+}
+
+/* ── inspector ──────────────────────────────────────────── */
+
+const btnInspect = document.getElementById("btnInspect");
+let momentaryInspect = false;
+
+function setInspecting(on, momentary = false) {
   inspecting = on;
-  inspectButton.setAttribute("aria-pressed", String(on));
+  momentaryInspect = on && momentary;
+  btnInspect.setAttribute("aria-pressed", String(on));
   stage.classList.toggle("inspecting", on);
   if (on) {
     refreshTree();
+    if (openDrawer !== "inspector") showDrawer("inspector");
   } else {
     clearSelection();
   }
 }
-
-inspectButton.onclick = () => setInspecting(!inspecting);
-
-// Option acts as a momentary inspect toggle, so you can peek at an element
-// without leaving interaction mode.
-window.addEventListener("keydown", (e) => { if (e.key === "Alt" && !inspecting) setInspecting(true); });
-window.addEventListener("keyup", (e) => { if (e.key === "Alt" && inspecting) setInspecting(false); });
+btnInspect.onclick = () => setInspecting(!inspecting);
+document.getElementById("btnSettings").onclick = () => {
+  showDrawer("settings");
+  if (openDrawer === "settings") loadSettings();
+};
 
 async function refreshTree() {
   try {
     const response = await fetch("/api/ax/tree");
     if (!response.ok) throw new Error(await response.text());
-    const snapshot = await response.json();
-    // Only elements with bounds can be hit or drawn.
-    axElements = snapshot.elements.filter((e) => e.bounds);
+    axElements = (await response.json()).elements.filter((e) => e.bounds);
   } catch (error) {
     console.warn("accessibility tree unavailable:", error);
     axElements = [];
   }
 }
 
-function area(element) {
-  return element.bounds.width * element.bounds.height;
-}
+const area = (e) => e.bounds.width * e.bounds.height;
 
-// Client-side pick against the cached tree. Instant, but can be stale, so it
-// is only used for hover feedback while the pointer is moving.
-function pickFromCache(x, y) {
+/** Client-side pick against the cached tree: instant, but can be stale. */
+function pickCached(x, y) {
   let best = null;
   for (const element of axElements) {
     const b = element.bounds;
     if (x < b.x || y < b.y || x > b.x + b.width || y > b.y + b.height) continue;
-    // The innermost element is the one the user means; among equals prefer
-    // the deeper node.
-    if (!best || area(element) < area(best) ||
-        (area(element) === area(best) && element.depth > best.depth)) {
-      best = element;
-    }
+    if (!best || area(element) < area(best)) best = element;
   }
   return best;
 }
 
 let hoverTimer = null;
 
-function hoverAt(event) {
-  const { x, y } = pointToNormalized(event);
-  const cached = pickFromCache(x, y);
+function hover(event) {
+  const display = displayPoint(event);
+  const cached = pickCached(display.x, display.y);
   if (cached) drawSelection(cached);
 
-  // Once the pointer settles, confirm with a real hit test. The cached tree
-  // mis-picks overlapping and transformed views; the simulator does not.
+  // Confirm with a real hit test once the pointer settles; the cached tree
+  // mis-picks overlapping and transformed views.
   clearTimeout(hoverTimer);
-  hoverTimer = setTimeout(() => confirmHit(x, y), 110);
+  hoverTimer = setTimeout(() => confirmHit(display.x, display.y), 110);
 }
 
 async function confirmHit(x, y) {
@@ -324,62 +519,140 @@ async function confirmHit(x, y) {
   } catch { /* hover is best-effort */ }
 }
 
-async function pickAt(event, sticky) {
-  const { x, y } = pointToNormalized(event);
-  const cached = pickFromCache(x, y);
+async function pick(event, sticky) {
+  const display = displayPoint(event);
+  const cached = pickCached(display.x, display.y);
   if (cached) drawSelection(cached);
-  await confirmHit(x, y);
+  await confirmHit(display.x, display.y);
   if (sticky && selected) showDetails(selected);
 }
 
 function drawSelection(element) {
   selected = element;
+  // Already in upright display space; see the note above toRawPoint.
   const b = element.bounds;
   overlay.innerHTML = "";
 
   const box = document.createElement("div");
   box.className = "box";
-  box.style.left = `${b.x * 100}%`;
-  box.style.top = `${b.y * 100}%`;
-  box.style.width = `${b.width * 100}%`;
-  box.style.height = `${b.height * 100}%`;
+  box.style.cssText =
+    `left:${b.x * 100}%;top:${b.y * 100}%;width:${b.width * 100}%;height:${b.height * 100}%`;
   overlay.appendChild(box);
 
   const chip = document.createElement("div");
   chip.className = "chip";
   chip.textContent = element.label ? `${element.role} · ${element.label}` : element.role;
-  // Flip the chip below the box when there is no room above it.
-  const above = b.y > 0.04;
   chip.style.left = `${b.x * 100}%`;
-  chip.style.top = above ? `calc(${b.y * 100}% - 20px)` : `calc(${(b.y + b.height) * 100}% + 4px)`;
+  // Flip below the box when there is no room above it.
+  chip.style.top = b.y > 0.04
+    ? `calc(${b.y * 100}% - 20px)`
+    : `calc(${(b.y + b.height) * 100}% + 4px)`;
   overlay.appendChild(chip);
 }
 
 function clearSelection() {
   selected = null;
   overlay.innerHTML = "";
-  panel.classList.remove("open");
 }
+
+const orDash = (value) => (value === null || value === undefined || value === "" ? "—" : value);
 
 function showDetails(element) {
-  panel.classList.add("open");
-  const text = (value) => (value === null || value === undefined || value === "" ? "—" : value);
-  document.getElementById("d-role").textContent = element.role;
-  document.getElementById("d-label").textContent = text(element.label);
-  document.getElementById("d-value").textContent = text(element.value);
-  document.getElementById("d-id").textContent = text(element.identifier);
-  document.getElementById("d-enabled").textContent = element.enabled ? "yes" : "no";
-  document.getElementById("d-actions").textContent =
+  if (openDrawer !== "inspector") showDrawer("inspector");
+  document.getElementById("inspectorBody").innerHTML = `
+    <div class="role"></div>
+    <div class="muted" id="dLabel"></div>
+    <dl>
+      <dt>value</dt><dd id="dValue"></dd>
+      <dt>identifier</dt><dd id="dIdent"></dd>
+      <dt>enabled</dt><dd id="dEnabled"></dd>
+      <dt>actions</dt><dd id="dActions"></dd>
+    </dl>
+    <div style="margin-top:14px">
+      <label style="color:var(--muted)">CLI selector</label>
+      <code id="dSelector"></code>
+      <button class="wide" id="dCopy">Copy selector</button>
+    </div>`;
+  const body = document.getElementById("inspectorBody");
+  body.classList.remove("empty");
+  body.querySelector(".role").textContent = element.role;
+  document.getElementById("dLabel").textContent = orDash(element.label);
+  document.getElementById("dValue").textContent = orDash(element.value);
+  document.getElementById("dIdent").textContent = orDash(element.identifier);
+  document.getElementById("dEnabled").textContent = element.enabled ? "yes" : "no";
+  document.getElementById("dActions").textContent =
     element.actions.length ? element.actions.join(", ") : "—";
-  document.getElementById("d-selector").textContent = element.selector;
+  document.getElementById("dSelector").textContent = element.selector;
+  document.getElementById("dCopy").onclick = () =>
+    navigator.clipboard.writeText(element.selector);
 }
 
-document.getElementById("copy").onclick = () => {
-  const selector = document.getElementById("d-selector").textContent;
-  navigator.clipboard.writeText(selector);
+/* ── device settings ────────────────────────────────────── */
+
+const SETTING_LABELS = {
+  appearance: "Appearance",
+  increase_contrast: "Increase contrast",
+  content_size: "Text size",
 };
 
-/* ---------------------------------------------------------------- webrtc */
+async function loadSettings() {
+  const body = document.getElementById("settingsBody");
+  body.textContent = "Loading…";
+  const settings = await (await fetch("/api/settings")).json();
+  body.innerHTML = "";
+  body.classList.remove("empty");
+
+  for (const setting of settings) {
+    const field = document.createElement("div");
+    field.className = "field";
+    const label = document.createElement("label");
+    label.textContent = SETTING_LABELS[setting.key] || setting.key;
+    field.appendChild(label);
+
+    if (setting.value === "unsupported") {
+      const note = document.createElement("div");
+      note.className = "empty";
+      note.textContent = "Not supported by this runtime";
+      field.appendChild(note);
+    } else if (setting.allowed.length === 2) {
+      // Two-valued settings read better as a segmented control.
+      const seg = document.createElement("div");
+      seg.className = "seg";
+      for (const value of setting.allowed) {
+        const button = document.createElement("button");
+        button.textContent = value;
+        button.setAttribute("aria-pressed", String(setting.value === value));
+        button.onclick = () => applySetting(setting.key, value);
+        seg.appendChild(button);
+      }
+      field.appendChild(seg);
+    } else {
+      const select = document.createElement("select");
+      for (const value of setting.allowed) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value.replace(/-/g, " ");
+        option.selected = setting.value === value;
+        select.appendChild(option);
+      }
+      select.onchange = () => applySetting(setting.key, select.value);
+      field.appendChild(select);
+    }
+    body.appendChild(field);
+  }
+}
+
+async function applySetting(key, value) {
+  const response = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key, value }),
+  });
+  if (!response.ok) console.warn("setting failed:", await response.text());
+  loadSettings();
+}
+
+/* ── webrtc ─────────────────────────────────────────────── */
 
 async function startWebRtc() {
   const peer = new RTCPeerConnection({ iceServers: [] });
@@ -390,11 +663,8 @@ async function startWebRtc() {
     if (peer.connectionState === "failed") setStatus("webrtc failed", "error");
   };
 
-  const offer = await peer.createOffer();
-  await peer.setLocalDescription(offer);
-
-  // Signaling is a single round trip, so wait out ICE gathering rather than
-  // trickling candidates.
+  await peer.setLocalDescription(await peer.createOffer());
+  // Single-round-trip signaling, so wait out gathering instead of trickling.
   await new Promise((resolve) => {
     if (peer.iceGatheringState === "complete") return resolve();
     peer.addEventListener("icegatheringstatechange", () => {
@@ -411,14 +681,13 @@ async function startWebRtc() {
   if (!response.ok) throw new Error(await response.text());
   await peer.setRemoteDescription({ type: "answer", sdp: (await response.json()).sdp });
 
-  // Report failure if no frame ever arrives, so the caller can fall back.
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("no webrtc media")), 6000);
     video.addEventListener("loadeddata", () => { clearTimeout(timer); resolve(); }, { once: true });
   });
 }
 
-/* ------------------------------------------------------- h264 / webcodecs */
+/* ── h264 / webcodecs ───────────────────────────────────── */
 
 const TAG_PARAMETER_SET = 0x01;
 const TAG_KEYFRAME = 0x02;
@@ -426,26 +695,26 @@ const TAG_KEYFRAME = 0x02;
 async function startH264() {
   if (!("VideoDecoder" in window)) throw new Error("WebCodecs unavailable");
 
-  stage.classList.add("h264");
-  const context = screen.getContext("2d");
+  media.classList.add("h264");
+  screenCanvas.width = config.width;
+  screenCanvas.height = config.height;
+  const context = screenCanvas.getContext("2d");
   let decoder = null;
 
-  // `configure` reports success synchronously and only surfaces an
-  // unsupported configuration through the async error callback, so the
-  // support check has to happen up front.
-  async function configureDecoder(config) {
-    const support = await VideoDecoder.isConfigSupported(config);
-    if (!support.supported) {
-      throw new Error(`${config.codec} not supported by this browser`);
+  // configure() reports success synchronously and only surfaces an
+  // unsupported configuration through the async error callback.
+  async function configureDecoder(cfg) {
+    if (!(await VideoDecoder.isConfigSupported(cfg)).supported) {
+      throw new Error(`${cfg.codec} not supported by this browser`);
     }
     decoder = new VideoDecoder({
       output: (frame) => {
-        context.drawImage(frame, 0, 0, screen.width, screen.height);
+        context.drawImage(frame, 0, 0, screenCanvas.width, screenCanvas.height);
         frame.close();
       },
       error: (error) => setStatus(`decode error: ${error.message}`, "error"),
     });
-    decoder.configure(config);
+    decoder.configure(cfg);
     setStatus("live · h264", "live");
   }
 
@@ -460,23 +729,13 @@ async function startH264() {
     const payload = new Uint8Array(event.data, 5, length - 1);
 
     if (tag === TAG_PARAMETER_SET) {
-      // The avcC record carries profile/compatibility/level in bytes 1..3,
-      // which is exactly what the codec string needs.
       const codec = `avc1.${[...payload.slice(1, 4)]
         .map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
-
-      // Note: no `hardwareAcceleration` hint. Despite the name,
-      // "prefer-hardware" is treated as a requirement, and phone-shaped
-      // resolutions like 1206x2622 exceed what hardware decoders accept —
-      // asking for it makes the configuration unsupported outright.
-      const config = {
-        codec,
-        description: payload.slice(),
-        optimizeForLatency: true,
-      };
-
-      configureDecoder(config).catch((error) =>
-        setStatus(`cannot decode: ${error.message}`, "error"));
+      // No hardwareAcceleration hint: despite the name "prefer-hardware" is
+      // a requirement, and phone-shaped resolutions exceed what hardware
+      // decoders accept, making the configuration unsupported outright.
+      configureDecoder({ codec, description: payload.slice(), optimizeForLatency: true })
+        .catch((error) => setStatus(`cannot decode: ${error.message}`, "error"));
       return;
     }
 
@@ -487,26 +746,27 @@ async function startH264() {
       data: payload.slice(),
     }));
   };
-
-  socket.onerror = () => setStatus("stream socket error", "error");
   socket.onclose = () => setStatus("stream closed", "error");
 }
 
-/* ------------------------------------------------------------------ boot */
+/* ── boot ───────────────────────────────────────────────── */
 
 async function main() {
   config = await (await fetch("/api/config")).json();
-  applyAspectRatio();
+  orientation = config.orientation || "portrait";
+  layout();
   connectInput();
 
   const preferWebRtc = config.default_transport === "webrtc";
+  const primary = preferWebRtc ? startWebRtc : startH264;
+  const fallback = preferWebRtc ? startH264 : startWebRtc;
+
   try {
-    if (preferWebRtc) { await startWebRtc(); } else { await startH264(); }
+    await primary();
   } catch (error) {
-    console.warn(`${preferWebRtc ? "webrtc" : "h264"} failed, falling back:`, error);
-    setStatus("falling back…");
+    console.warn("primary transport failed, falling back:", error);
     try {
-      if (preferWebRtc) { await startH264(); } else { await startWebRtc(); }
+      await fallback();
     } catch (fallbackError) {
       setStatus(`no stream: ${fallbackError.message}`, "error");
     }
