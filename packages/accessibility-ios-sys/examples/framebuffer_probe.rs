@@ -49,6 +49,11 @@ fn main() -> anyhow::Result<()> {
         nal_format: NalFormat::AnnexB,
         ..Default::default()
     };
+    println!(
+        "encode size for 1206x2622: {:?} (max_dimension = {:?})",
+        config.encode_size(1206, 2622),
+        config.max_dimension
+    );
     let stream = SimVideoStream::start(None, config, sink)?;
     println!("device udid: {}", stream.device_udid());
 

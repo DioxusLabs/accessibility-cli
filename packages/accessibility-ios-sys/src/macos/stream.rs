@@ -23,6 +23,7 @@ pub struct ScreenGeometry {
 pub struct SimVideoStream {
     framebuffer: SimFramebuffer,
     force_keyframe: Arc<AtomicBool>,
+    config: EncoderConfig,
 }
 
 impl SimVideoStream {
@@ -48,6 +49,7 @@ impl SimVideoStream {
         Ok(Self {
             framebuffer,
             force_keyframe,
+            config,
         })
     }
 
@@ -64,6 +66,21 @@ impl SimVideoStream {
         ScreenGeometry {
             width: stats.width,
             height: stats.height,
+        }
+    }
+
+    /// Geometry actually handed to the encoder, after any downscale.
+    pub fn encoded_geometry(&self) -> ScreenGeometry {
+        let source = self.geometry();
+        if source.width == 0 || source.height == 0 {
+            return source;
+        }
+        let (width, height) = self
+            .config
+            .encode_size(source.width as i32, source.height as i32);
+        ScreenGeometry {
+            width: width as u32,
+            height: height as u32,
         }
     }
 

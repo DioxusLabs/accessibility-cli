@@ -1877,9 +1877,19 @@ pub struct ServeSimArgs {
     #[arg(long, default_value_t = 60)]
     pub fps: u32,
 
-    /// Target bitrate in bits per second.
-    #[arg(long, default_value_t = 6_000_000)]
-    pub bitrate: u32,
+    /// Target bitrate in bits per second. Defaults to a value derived from
+    /// the encode resolution, which is usually the right choice.
+    #[arg(long)]
+    pub bitrate: Option<u32>,
+
+    /// Longest edge to encode at. The device framebuffer is scaled down to
+    /// fit, which is where most of the quality-per-bit comes from.
+    #[arg(long, default_value_t = 1280)]
+    pub max_dimension: u32,
+
+    /// Encode at the device's native resolution instead of downscaling.
+    #[arg(long)]
+    pub native_resolution: bool,
 
     /// Seconds between scheduled keyframes.
     #[arg(long, default_value_t = 2)]
@@ -1932,6 +1942,7 @@ async fn run_serve_sim(args: &ServeSimArgs) -> anyhow::Result<()> {
         video: VideoConfig {
             fps: args.fps,
             bitrate: args.bitrate,
+            max_dimension: (!args.native_resolution).then_some(args.max_dimension),
             keyframe_interval_secs: args.keyframe_interval,
             // WebRTC needs Annex-B; the raw H.264 transport converts on the
             // way out so a single encoder feeds both.

@@ -80,7 +80,18 @@ pub struct VideoConfig {
     pub codec: VideoCodec,
     pub nal_format: NalFormat,
     pub fps: u32,
-    pub bitrate: u32,
+    /// Target bitrate, or `None` to derive one from the encode resolution.
+    ///
+    /// Deriving is usually right: a fixed bitrate that suits a phone
+    /// framebuffer is wildly wrong for a watch, and too low a value does not
+    /// just soften the image, it makes the encoder drop frames.
+    pub bitrate: Option<u32>,
+    /// Longest edge to encode at; the source is scaled down to fit.
+    ///
+    /// Device framebuffers are far larger than any browser preview of them,
+    /// and every extra pixel costs bitrate that would otherwise go into
+    /// quality.
+    pub max_dimension: Option<u32>,
     /// Seconds between scheduled keyframes. Shorter means faster recovery for
     /// clients that join late or drop packets, at the cost of bitrate.
     pub keyframe_interval_secs: u32,
@@ -92,7 +103,8 @@ impl Default for VideoConfig {
             codec: VideoCodec::default(),
             nal_format: NalFormat::default(),
             fps: 60,
-            bitrate: 6_000_000,
+            bitrate: None,
+            max_dimension: Some(1280),
             keyframe_interval_secs: 2,
         }
     }
@@ -113,6 +125,11 @@ pub type FrameSink = Arc<dyn Fn(EncodedFrame) + Send + Sync>;
 pub trait VideoCapture: Send + Sync {
     /// Pixel geometry of the source. May be zero until the first frame lands.
     fn geometry(&self) -> ScreenGeometry;
+
+    /// Geometry actually being encoded, after any downscale.
+    fn encoded_geometry(&self) -> ScreenGeometry {
+        self.geometry()
+    }
 
     /// Request that the next encoded frame be a keyframe.
     ///

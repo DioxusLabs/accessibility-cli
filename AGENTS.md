@@ -131,7 +131,45 @@ colour filters, transparency, VoiceOver) have no simctl verb and need a helper
 binary spawned inside the simulator that drives the private libAccessibility
 setters.
 
-## Performance
+## Stream quality
+
+`GET /api/stats` reports frames, fps, bitrate, mean frame size, keyframe
+requests, lag events and — the number that matters — **bits per pixel** against
+the *encoded* resolution. Use it before changing anything here.
+
+Rules of thumb for screen content:
+
+    < 0.05 bpp    heavy blocking, and the encoder starts dropping frames
+    0.10-0.20     what to aim for
+    > 0.30        wasted bandwidth
+
+**Starving the encoder costs frame rate, not just quality.** With low-latency
+rate control VideoToolbox drops frames to stay inside its per-frame budget,
+which is `AverageBitRate / ExpectedFrameRate` regardless of the rate actually
+being achieved. Measured on a 1206x2622 device during scrolling:
+
+    6 Mbps    12.2 KB/frame   0.0315 bpp   33.9 fps
+    24 Mbps   32.2 KB/frame   0.0835 bpp   60.3 fps
+
+So "chunky, slow and janky" was a single root cause, not three.
+
+The fix is resolution, not bitrate. A phone framebuffer is roughly fifteen
+times the pixels the browser actually displays, so the long edge is capped at
+1280 by default (`--max-dimension`, or `--native-resolution` to disable) and
+the bitrate is derived from the encode resolution at ~0.15 bpp rather than
+being a fixed number. Same stimulus, same bandwidth:
+
+    native 3.16 MP @ 6 Mbps   4.99 Mbps   0.0297 bpp
+    588x1280 @ derived        4.95 Mbps   0.1338 bpp
+
+Raise `--max-dimension` if viewing in a large or retina window; the default
+trades sharpness for bits on the assumption of a normal-sized preview.
+
+`MaxKeyFrameInterval` counts frames, so on its own a "2 second" interval
+stretches to twenty when the device is idle at 5fps. `MaxKeyFrameIntervalDuration`
+is what actually bounds it in time; both are set.
+
+### Do not bother with a GPU frame copy
 
 The per-frame framebuffer `memcpy` looks like an obvious optimization target
 and is not. Measured on a 1206x2622 surface with cache-cold sources:

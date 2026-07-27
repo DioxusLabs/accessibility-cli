@@ -696,8 +696,9 @@ async function startH264() {
   if (!("VideoDecoder" in window)) throw new Error("WebCodecs unavailable");
 
   media.classList.add("h264");
-  screenCanvas.width = config.width;
-  screenCanvas.height = config.height;
+  // Sized from the first decoded frame rather than the capture resolution:
+  // the server downscales before encoding, and painting a small frame onto a
+  // full-resolution canvas would just cost an extra upscale.
   const context = screenCanvas.getContext("2d");
   let decoder = null;
 
@@ -709,6 +710,11 @@ async function startH264() {
     }
     decoder = new VideoDecoder({
       output: (frame) => {
+        if (screenCanvas.width !== frame.displayWidth
+            || screenCanvas.height !== frame.displayHeight) {
+          screenCanvas.width = frame.displayWidth;
+          screenCanvas.height = frame.displayHeight;
+        }
         context.drawImage(frame, 0, 0, screenCanvas.width, screenCanvas.height);
         frame.close();
       },

@@ -154,6 +154,7 @@ fn spawn_forwarder(
                 // Lagging just means this viewer fell behind; the next
                 // keyframe will resynchronize it.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    session.note_lag();
                     session.request_keyframe();
                     continue;
                 }

@@ -60,10 +60,31 @@ pub struct EncodedChunk {
     pub kind: ChunkKind,
 }
 
+/// Bits per pixel per frame to aim for when no explicit bitrate is given.
+///
+/// Screen content needs roughly 0.10-0.20 bpp to avoid visible blocking on
+/// motion. Below that VideoToolbox does not merely soften the picture: with
+/// low-latency rate control it starts *dropping frames* to stay inside its
+/// per-frame budget, so starving the encoder costs frame rate as well as
+/// quality.
+const TARGET_BITS_PER_PIXEL: f64 = 0.15;
+
+/// Longest edge to encode at when no limit is given.
+///
+/// A phone framebuffer is far larger than the browser ever displays it — an
+/// iPhone 17 is 1206x2622, roughly fifteen times the pixels of the preview —
+/// and every one of those pixels costs bitrate. Capping the long edge keeps
+/// the picture comfortably sharper than the viewport while spending a
+/// fraction of the bits.
+const DEFAULT_MAX_DIMENSION: u32 = 1280;
+
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
     pub fps: u32,
-    pub bitrate: u32,
+    /// Explicit bitrate, or `None` to derive one from the encode resolution.
+    pub bitrate: Option<u32>,
+    /// Longest edge of the encoded video. The source is scaled down to fit.
+    pub max_dimension: Option<u32>,
     /// Seconds between scheduled keyframes.
     pub keyframe_interval_secs: u32,
     pub nal_format: NalFormat,
@@ -73,11 +94,44 @@ impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
             fps: 60,
-            bitrate: 6_000_000,
+            bitrate: None,
+            max_dimension: Some(DEFAULT_MAX_DIMENSION),
             keyframe_interval_secs: 2,
             nal_format: NalFormat::AnnexB,
         }
     }
+}
+
+impl EncoderConfig {
+    /// Encode dimensions for a given source size, preserving aspect ratio.
+    ///
+    /// Both axes are rounded to even numbers because H.264 chroma is
+    /// subsampled 2x2 and odd dimensions are not representable.
+    pub fn encode_size(&self, width: i32, height: i32) -> (i32, i32) {
+        let longest = width.max(height);
+        let Some(limit) = self.max_dimension else {
+            return (even(width), even(height));
+        };
+        if longest <= limit as i32 {
+            return (even(width), even(height));
+        }
+        let scale = limit as f64 / longest as f64;
+        (
+            even((width as f64 * scale).round() as i32),
+            even((height as f64 * scale).round() as i32),
+        )
+    }
+
+    fn resolved_bitrate(&self, width: i32, height: i32) -> u32 {
+        self.bitrate.unwrap_or_else(|| {
+            let pixels = (width as f64) * (height as f64);
+            (pixels * self.fps as f64 * TARGET_BITS_PER_PIXEL) as u32
+        })
+    }
+}
+
+fn even(value: i32) -> i32 {
+    (value.max(2) / 2) * 2
 }
 
 /// Sink for encoded chunks, invoked on the capture queue.
@@ -86,6 +140,9 @@ pub type ChunkSink = Arc<dyn Fn(EncodedChunk) + Send + Sync>;
 pub struct H264Encoder {
     session: Option<CFRetained<VTCompressionSession>>,
     config: EncoderConfig,
+    /// Size of the frames coming in.
+    source_dimensions: (i32, i32),
+    /// Size we actually encode at, after any downscale.
     dimensions: (i32, i32),
     /// Frame index, used to synthesize presentation timestamps.
     frame_index: i64,
@@ -105,6 +162,7 @@ impl H264Encoder {
         Self {
             session: None,
             config,
+            source_dimensions: (0, 0),
             dimensions: (0, 0),
             frame_index: 0,
             force_keyframe,
@@ -114,9 +172,13 @@ impl H264Encoder {
     }
 
     /// Encode one frame, rebuilding the session if the source resized.
+    ///
+    /// `width`/`height` describe the *source*; the session may be smaller if
+    /// the config caps the long edge, in which case VideoToolbox scales.
     pub fn encode(&mut self, image: &CVImageBuffer, width: i32, height: i32) -> Result<()> {
-        if self.session.is_none() || self.dimensions != (width, height) {
-            self.dimensions = (width, height);
+        if self.session.is_none() || self.source_dimensions != (width, height) {
+            self.source_dimensions = (width, height);
+            self.dimensions = self.config.encode_size(width, height);
             self.rebuild_session()?;
         }
         let session = self.session.as_ref().expect("session built above");
@@ -221,6 +283,7 @@ impl H264Encoder {
             .ok_or_else(|| anyhow!("VTCompressionSessionCreate failed: {status}"))?;
 
         let keyframe_interval = self.config.fps * self.config.keyframe_interval_secs;
+        let bitrate = self.config.resolved_bitrate(width, height);
         set_bool(&session, "RealTime", true);
         set_bool(&session, "AllowFrameReordering", false);
         set_i32(&session, "MaxFrameDelayCount", 0);
@@ -229,7 +292,16 @@ impl H264Encoder {
         set_string(&session, "ProfileLevel", "H264_Baseline_AutoLevel");
         set_i32(&session, "ExpectedFrameRate", self.config.fps as i32);
         set_i32(&session, "MaxKeyFrameInterval", keyframe_interval as i32);
-        set_i32(&session, "AverageBitRate", self.config.bitrate as i32);
+        // MaxKeyFrameInterval counts *frames*, and the simulator's frame rate
+        // swings between ~5 idle and ~60 animating, so on its own it would
+        // stretch a "2 second" interval out to twenty. The duration limit is
+        // what actually bounds it in time.
+        set_f64(
+            &session,
+            "MaxKeyFrameIntervalDuration",
+            self.config.keyframe_interval_secs as f64,
+        );
+        set_i32(&session, "AverageBitRate", bitrate as i32);
 
         self.session = Some(session);
         self.frame_index = 0;
@@ -428,4 +500,8 @@ fn set_i32(session: &VTCompressionSession, key: &str, value: i32) {
 
 fn set_string(session: &VTCompressionSession, key: &str, value: &str) {
     set_property(session, key, CFString::from_str(value).as_ref());
+}
+
+fn set_f64(session: &VTCompressionSession, key: &str, value: f64) {
+    set_property(session, key, CFNumber::new_f64(value).as_ref());
 }

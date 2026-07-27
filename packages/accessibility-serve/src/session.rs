@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -25,6 +26,45 @@ use crate::settings::{Setting, SettingKey};
 /// Small on purpose: for interactive video a dropped frame is better than a
 /// late one, and a slow client should not be able to inflate memory.
 const FRAME_BUFFER: usize = 16;
+
+/// Counters for diagnosing stream quality and pacing.
+///
+/// Cheap enough to always collect: the interesting failures here (keyframe
+/// storms, subscribers falling behind) are invisible without them and only
+/// show up under load, which is exactly when you cannot attach a profiler.
+#[derive(Default)]
+pub struct StreamStats {
+    pub frames: AtomicU64,
+    pub keyframes: AtomicU64,
+    pub bytes: AtomicU64,
+    /// Keyframes asked for by a new subscriber, an RTCP PLI, or a lagging
+    /// receiver. A high rate here starves the stream of bitrate for delta
+    /// frames and is self-reinforcing.
+    pub keyframe_requests: AtomicU64,
+    /// Times a subscriber fell far enough behind to drop frames.
+    pub lag_events: AtomicU64,
+}
+
+/// A snapshot of [`StreamStats`] with rates worked out.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsReport {
+    pub uptime_secs: f64,
+    pub frames: u64,
+    pub keyframes: u64,
+    pub fps: f64,
+    pub mbps: f64,
+    pub bits_per_pixel: f64,
+    pub mean_frame_kb: f64,
+    pub keyframe_requests: u64,
+    pub lag_events: u64,
+    pub subscribers: usize,
+    /// Capture resolution.
+    pub width: u32,
+    pub height: u32,
+    /// Resolution actually encoded, after downscaling.
+    pub encoded_width: u32,
+    pub encoded_height: u32,
+}
 
 /// Geometry and identity of the device being served.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,7 +83,8 @@ pub struct SimSession {
     frames: broadcast::Sender<EncodedFrame>,
     /// Most recent parameter set, replayed to clients that join mid-stream.
     latest_parameter_set: Arc<std::sync::Mutex<Option<EncodedFrame>>>,
-    frames_encoded: Arc<AtomicU64>,
+    stats: Arc<StreamStats>,
+    started: Instant,
     input: std::sync::mpsc::Sender<InputCommand>,
     ax: mpsc::UnboundedSender<AxCommand>,
     /// Last orientation we asked for.
@@ -59,17 +100,21 @@ impl SimSession {
     pub fn start(udid: Option<&str>, config: VideoConfig) -> Result<Arc<Self>> {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let latest_parameter_set = Arc::new(std::sync::Mutex::new(None));
-        let frames_encoded = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(StreamStats::default());
 
         let sink = {
             let frames = frames.clone();
             let latest_parameter_set = Arc::clone(&latest_parameter_set);
-            let frames_encoded = Arc::clone(&frames_encoded);
+            let stats = Arc::clone(&stats);
             Arc::new(move |frame: EncodedFrame| {
                 if frame.kind == FrameKind::ParameterSet {
                     *latest_parameter_set.lock().unwrap() = Some(frame.clone());
                 }
-                frames_encoded.fetch_add(1, Ordering::Relaxed);
+                stats.frames.fetch_add(1, Ordering::Relaxed);
+                stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                if frame.kind == FrameKind::Keyframe {
+                    stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                }
                 // A send error just means nobody is watching yet.
                 let _ = frames.send(frame);
             })
@@ -84,7 +129,8 @@ impl SimSession {
             capture,
             frames,
             latest_parameter_set,
-            frames_encoded,
+            stats,
+            started: Instant::now(),
             input,
             ax,
             orientation: std::sync::Mutex::new(Orientation::Portrait),
@@ -93,6 +139,7 @@ impl SimSession {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EncodedFrame> {
         let receiver = self.frames.subscribe();
+        #[allow(clippy::let_and_return)]
         // A new subscriber cannot decode anything until the next keyframe, so
         // ask for one immediately instead of making them wait out the interval.
         self.capture.request_keyframe();
@@ -104,11 +151,50 @@ impl SimSession {
     }
 
     pub fn request_keyframe(&self) {
+        self.stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
         self.capture.request_keyframe();
     }
 
-    pub fn frames_encoded(&self) -> u64 {
-        self.frames_encoded.load(Ordering::Relaxed)
+    pub fn note_lag(&self) {
+        self.stats.lag_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> StatsReport {
+        let elapsed = self.started.elapsed().as_secs_f64().max(1e-6);
+        let frames = self.stats.frames.load(Ordering::Relaxed);
+        let bytes = self.stats.bytes.load(Ordering::Relaxed);
+        let geometry = self.capture.geometry();
+        let encoded = self.capture.encoded_geometry();
+        // Bits per pixel only means anything against the encoded size.
+        let pixels = (encoded.width as f64) * (encoded.height as f64);
+        let fps = frames as f64 / elapsed;
+
+        StatsReport {
+            uptime_secs: (elapsed * 10.0).round() / 10.0,
+            frames,
+            keyframes: self.stats.keyframes.load(Ordering::Relaxed),
+            fps: (fps * 10.0).round() / 10.0,
+            mbps: ((bytes as f64 * 8.0 / elapsed / 1e6) * 100.0).round() / 100.0,
+            // The headline number: anything much under 0.1 will visibly
+            // block up on motion.
+            bits_per_pixel: if pixels > 0.0 && fps > 0.0 {
+                ((bytes as f64 * 8.0 / elapsed) / (pixels * fps) * 10000.0).round() / 10000.0
+            } else {
+                0.0
+            },
+            mean_frame_kb: if frames > 0 {
+                ((bytes as f64 / frames as f64 / 1024.0) * 100.0).round() / 100.0
+            } else {
+                0.0
+            },
+            keyframe_requests: self.stats.keyframe_requests.load(Ordering::Relaxed),
+            lag_events: self.stats.lag_events.load(Ordering::Relaxed),
+            subscribers: self.frames.receiver_count(),
+            width: geometry.width,
+            height: geometry.height,
+            encoded_width: encoded.width,
+            encoded_height: encoded.height,
+        }
     }
 
     pub fn device_info(&self) -> DeviceInfo {

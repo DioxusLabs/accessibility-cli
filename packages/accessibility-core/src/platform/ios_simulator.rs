@@ -327,6 +327,7 @@ impl SimulatorVideoCapture {
         let sys_config = sys::EncoderConfig {
             fps: config.fps,
             bitrate: config.bitrate,
+            max_dimension: config.max_dimension,
             keyframe_interval_secs: config.keyframe_interval_secs,
             nal_format: match config.nal_format {
                 NalFormat::AnnexB => sys::NalFormat::AnnexB,
@@ -354,6 +355,14 @@ impl SimulatorVideoCapture {
 impl VideoCapture for SimulatorVideoCapture {
     fn geometry(&self) -> ScreenGeometry {
         let geometry = self.inner.geometry();
+        ScreenGeometry {
+            width: geometry.width,
+            height: geometry.height,
+        }
+    }
+
+    fn encoded_geometry(&self) -> ScreenGeometry {
+        let geometry = self.inner.encoded_geometry();
         ScreenGeometry {
             width: geometry.width,
             height: geometry.height,

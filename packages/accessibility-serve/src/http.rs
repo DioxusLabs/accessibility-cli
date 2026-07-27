@@ -33,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/api/ax/tree", get(ax_tree))
         .route("/api/ax/hit", get(ax_hit))
+        .route("/api/stats", get(stats))
         .route("/api/settings", get(settings).post(set_setting))
         .route("/api/orientation", post(set_orientation))
         .route("/webrtc/offer", post(webrtc_offer))
@@ -68,6 +69,10 @@ async fn config(State(state): State<AppState>) -> Json<ConfigResponse> {
         transports: vec!["webrtc", "h264"],
         home_indicator_band: crate::input::HOME_INDICATOR_BAND,
     })
+}
+
+async fn stats(State(state): State<AppState>) -> Json<crate::session::StatsReport> {
+    Json(state.session.stats())
 }
 
 async fn settings(State(state): State<AppState>) -> Json<Vec<Setting>> {
@@ -183,6 +188,7 @@ async fn pump_h264(state: AppState, mut socket: WebSocket) {
         let frame = match frames.recv().await {
             Ok(frame) => frame,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                state.session.note_lag();
                 state.session.request_keyframe();
                 continue;
             }
