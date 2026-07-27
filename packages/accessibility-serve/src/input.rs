@@ -97,9 +97,18 @@ pub enum InputCommand {
     Button {
         button: HardwareButton,
     },
-    /// A US-keyboard virtual key code (HIToolbox `Events.h`).
+    /// A single key press by USB HID usage code, with optional held modifiers.
+    ///
+    /// Used for navigation and shortcuts; text goes through [`InputCommand::Text`]
+    /// so the character-to-key table lives in one place.
     Key {
         key_code: u32,
+        #[serde(default)]
+        modifiers: Vec<u32>,
+    },
+    /// Type a string, expanded server-side into key presses.
+    Text {
+        text: String,
     },
     /// A wheel or trackpad delta, as a fraction of the display.
     Scroll {
@@ -192,7 +201,11 @@ pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
                                 };
                                 hid.press_button(button, 0)
                             }
-                            InputCommand::Key { key_code } => hid.send_key(key_code),
+                            InputCommand::Key {
+                                key_code,
+                                ref modifiers,
+                            } => hid.send_key_with_modifiers(key_code, modifiers),
+                            InputCommand::Text { ref text } => type_text(&hid, text),
                             InputCommand::Rotate { orientation } => {
                                 hid.set_orientation(match orientation {
                                     Orientation::Portrait => SysOrientation::Portrait,
@@ -234,6 +247,18 @@ pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
         })?;
 
     Ok(tx)
+}
+
+/// Expand text into key presses and send them.
+///
+/// Rejects the whole string if any character is untypeable, so a partial or
+/// subtly wrong string is never entered.
+#[cfg(target_os = "macos")]
+fn type_text(hid: &accessibility_ios_sys::SimulatorHID, text: &str) -> Result<()> {
+    for stroke in crate::keymap::keystrokes_for(text)? {
+        hid.send_key_with_modifiers(stroke.usage, &stroke.modifiers())?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

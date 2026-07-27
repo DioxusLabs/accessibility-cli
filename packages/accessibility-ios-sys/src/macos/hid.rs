@@ -63,6 +63,45 @@ pub enum TouchEdge {
     Right = 4,
 }
 
+/// USB HID keyboard usage codes (usage page 0x07).
+///
+/// `IndigoHIDMessageForKeyboardArbitrary` takes usages from this page, *not*
+/// HIToolbox virtual keycodes. The two overlap in range and disagree on almost
+/// every value, so getting it wrong does not fail — it silently types
+/// different letters.
+pub mod usage {
+    pub const A: u32 = 4;
+    pub const Z: u32 = 29;
+    pub const DIGIT_1: u32 = 30;
+    pub const DIGIT_0: u32 = 39;
+    pub const RETURN: u32 = 40;
+    pub const ESCAPE: u32 = 41;
+    pub const BACKSPACE: u32 = 42;
+    pub const TAB: u32 = 43;
+    pub const SPACE: u32 = 44;
+    pub const MINUS: u32 = 45;
+    pub const EQUALS: u32 = 46;
+    pub const LEFT_BRACKET: u32 = 47;
+    pub const RIGHT_BRACKET: u32 = 48;
+    pub const BACKSLASH: u32 = 49;
+    pub const SEMICOLON: u32 = 51;
+    pub const QUOTE: u32 = 52;
+    pub const GRAVE: u32 = 53;
+    pub const COMMA: u32 = 54;
+    pub const PERIOD: u32 = 55;
+    pub const SLASH: u32 = 56;
+
+    pub const RIGHT_ARROW: u32 = 79;
+    pub const LEFT_ARROW: u32 = 80;
+    pub const DOWN_ARROW: u32 = 81;
+    pub const UP_ARROW: u32 = 82;
+
+    pub const LEFT_CONTROL: u32 = 224;
+    pub const LEFT_SHIFT: u32 = 225;
+    pub const LEFT_ALT: u32 = 226;
+    pub const LEFT_GUI: u32 = 227;
+}
+
 /// Device orientation, using the GSEvent numbering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -388,14 +427,29 @@ impl SimulatorHID {
     /// # Arguments
     /// * `key_code` - The key code (from HIToolbox/Events.h)
     pub fn send_key(&self, key_code: u32) -> Result<()> {
-        // Key down
+        self.send_key_with_modifiers(key_code, &[])
+    }
+
+    /// Send a key press with modifier keys held down around it.
+    ///
+    /// Modifiers are ordinary key events, not a bitmask: they are pressed in
+    /// order, then the key is pressed and released, then they are released in
+    /// reverse. This is the only way to produce capitals and shifted symbols —
+    /// there is no shift flag on the Indigo message.
+    ///
+    /// Codes are USB HID usages; see [`usage`].
+    pub fn send_key_with_modifiers(&self, key_code: u32, modifiers: &[u32]) -> Result<()> {
+        for modifier in modifiers {
+            self.send_keyboard(*modifier, ButtonDirection::Down)?;
+        }
+
         self.send_keyboard(key_code, ButtonDirection::Down)?;
-
-        std::thread::sleep(std::time::Duration::from_millis(30));
-
-        // Key up
+        std::thread::sleep(std::time::Duration::from_millis(12));
         self.send_keyboard(key_code, ButtonDirection::Up)?;
 
+        for modifier in modifiers.iter().rev() {
+            self.send_keyboard(*modifier, ButtonDirection::Up)?;
+        }
         Ok(())
     }
 

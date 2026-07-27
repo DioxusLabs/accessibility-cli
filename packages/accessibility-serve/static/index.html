@@ -397,26 +397,51 @@ stage.addEventListener("wheel", (event) => {
   sendInput({ type: "scroll", dx: delta.dx, dy: delta.dy, x: raw.x, y: raw.y });
 }, { passive: false });
 
-// HIToolbox virtual key codes: enough to type and navigate.
-const KEY_CODES = {
-  a:0,s:1,d:2,f:3,h:4,g:5,z:6,x:7,c:8,v:9,b:11,q:12,w:13,e:14,r:15,y:16,t:17,
-  "1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"=":24,"9":25,"7":26,"-":27,"8":28,
-  "0":29,"]":30,o:31,u:32,"[":33,i:34,p:35,Enter:36,l:37,j:38,"'":39,k:40,
-  ";":41,"\\":42,",":43,"/":44,n:45,m:46,".":47,Tab:48," ":49,"`":50,
-  Backspace:51,Escape:53,ArrowLeft:123,ArrowRight:124,ArrowDown:125,ArrowUp:126,
+/* Keys that are not text. Values are USB HID usage codes, which is what the
+   simulator's keyboard takes — not HIToolbox virtual keycodes. Printable
+   characters are not listed here: they are sent as text and expanded to key
+   presses server-side, so the US-ASCII table lives in one tested place. */
+const NAMED_KEYS = {
+  Enter: 40, Escape: 41, Backspace: 42, Tab: 43,
+  ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
 };
+const MODIFIER_USAGES = { control: 224, shift: 225, alt: 226, meta: 227 };
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Alt" && !inspecting) { setInspecting(true, true); return; }
   if (inspecting && event.key === "Escape") { clearSelection(); return; }
-  if (event.metaKey || event.ctrlKey || event.target.tagName === "SELECT") return;
-  const code = KEY_CODES[event.key] ?? KEY_CODES[event.key.toLowerCase()];
-  if (code === undefined) return;
-  event.preventDefault();
-  sendInput({ type: "key", key_code: code });
+  if (event.target.tagName === "SELECT" || event.target.tagName === "BUTTON") return;
+
+  const modifiers = [];
+  if (event.ctrlKey) modifiers.push(MODIFIER_USAGES.control);
+  if (event.altKey) modifiers.push(MODIFIER_USAGES.alt);
+  if (event.metaKey) modifiers.push(MODIFIER_USAGES.meta);
+
+  const named = NAMED_KEYS[event.key];
+  if (named !== undefined) {
+    event.preventDefault();
+    sendInput({ type: "key", key_code: named, modifiers });
+    return;
+  }
+
+  // A single printable character. Shift is implied by the character itself,
+  // so it is not added to the modifier list.
+  if ([...event.key].length === 1 && !event.metaKey && !event.ctrlKey) {
+    event.preventDefault();
+    sendInput({ type: "text", text: event.key });
+  }
 });
 window.addEventListener("keyup", (event) => {
   if (event.key === "Alt" && momentaryInspect) setInspecting(false);
+});
+
+// Paste types the clipboard contents, which is the practical way to enter a
+// long string. Still US-ASCII only; the server rejects anything else.
+window.addEventListener("paste", (event) => {
+  const text = event.clipboardData?.getData("text");
+  if (!text) return;
+  event.preventDefault();
+  sendInput({ type: "text", text });
 });
 
 /* ── ribbon ─────────────────────────────────────────────── */

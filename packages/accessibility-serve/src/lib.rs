@@ -9,6 +9,7 @@ pub mod avcc;
 pub mod ax;
 pub mod http;
 pub mod input;
+pub mod keymap;
 pub mod session;
 pub mod settings;
 pub mod webrtc_stream;
