@@ -63,45 +63,6 @@ pub enum TouchEdge {
     Right = 4,
 }
 
-/// USB HID keyboard usage codes (usage page 0x07).
-///
-/// `IndigoHIDMessageForKeyboardArbitrary` takes usages from this page, *not*
-/// HIToolbox virtual keycodes. The two overlap in range and disagree on almost
-/// every value, so getting it wrong does not fail — it silently types
-/// different letters.
-pub mod usage {
-    pub const A: u32 = 4;
-    pub const Z: u32 = 29;
-    pub const DIGIT_1: u32 = 30;
-    pub const DIGIT_0: u32 = 39;
-    pub const RETURN: u32 = 40;
-    pub const ESCAPE: u32 = 41;
-    pub const BACKSPACE: u32 = 42;
-    pub const TAB: u32 = 43;
-    pub const SPACE: u32 = 44;
-    pub const MINUS: u32 = 45;
-    pub const EQUALS: u32 = 46;
-    pub const LEFT_BRACKET: u32 = 47;
-    pub const RIGHT_BRACKET: u32 = 48;
-    pub const BACKSLASH: u32 = 49;
-    pub const SEMICOLON: u32 = 51;
-    pub const QUOTE: u32 = 52;
-    pub const GRAVE: u32 = 53;
-    pub const COMMA: u32 = 54;
-    pub const PERIOD: u32 = 55;
-    pub const SLASH: u32 = 56;
-
-    pub const RIGHT_ARROW: u32 = 79;
-    pub const LEFT_ARROW: u32 = 80;
-    pub const DOWN_ARROW: u32 = 81;
-    pub const UP_ARROW: u32 = 82;
-
-    pub const LEFT_CONTROL: u32 = 224;
-    pub const LEFT_SHIFT: u32 = 225;
-    pub const LEFT_ALT: u32 = 226;
-    pub const LEFT_GUI: u32 = 227;
-}
-
 /// Device orientation, using the GSEvent numbering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -437,7 +398,10 @@ impl SimulatorHID {
     /// reverse. This is the only way to produce capitals and shifted symbols —
     /// there is no shift flag on the Indigo message.
     ///
-    /// Codes are USB HID usages; see [`usage`].
+    /// `key_code` and `modifiers` are **USB HID usage codes** (page 0x07),
+    /// not HIToolbox virtual keycodes. The ranges overlap and the meanings
+    /// differ, so passing the wrong kind types different letters rather than
+    /// failing. Left Shift is 225.
     pub fn send_key_with_modifiers(&self, key_code: u32, modifiers: &[u32]) -> Result<()> {
         for modifier in modifiers {
             self.send_keyboard(*modifier, ButtonDirection::Down)?;
