@@ -33,8 +33,19 @@ pub enum TouchPhase {
     End,
 }
 
+/// Device orientation, using the GSEvent numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Orientation {
+    Portrait = 1,
+    PortraitUpsideDown = 2,
+    LandscapeRight = 3,
+    LandscapeLeft = 4,
+}
+
 pub struct SimulatorHID {
     client: *mut AnyObject, // SimDeviceLegacyHIDClient
+    device: *mut AnyObject, // SimDevice, retained for GSEvent port lookup
     queue: *mut AnyObject,  // dispatch_queue_t
     screen_size: (f64, f64),
     screen_scale: f64,
@@ -130,6 +141,7 @@ impl SimulatorHID {
 
         Ok(Self {
             client,
+            device,
             queue,
             screen_size,
             screen_scale,
@@ -230,6 +242,80 @@ impl SimulatorHID {
             TouchPhase::End => ButtonDirection::Up,
         };
         self.send_touch(x, y, direction)
+    }
+
+    /// Rotate the device.
+    ///
+    /// Orientation does not travel over Indigo like touches do. It is a
+    /// GSEvent delivered by mach message to the simulator's
+    /// `PurpleWorkspacePort`, which is the same path Simulator.app itself uses
+    /// when you pick Device > Rotate.
+    pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+        // GSEvent constants, as used by Simulator.app and idb.
+        const GSEVENT_MACH_MESSAGE_ID: i32 = 0x7B;
+        const GSEVENT_TYPE_ORIENTATION_CHANGED: u32 = 50;
+        const GSEVENT_HOST_FLAG: u32 = 0x0002_0000;
+        const MACH_MSG_TYPE_COPY_SEND: u32 = 19;
+        /// `align4(4 + 0x6B)` — a GSEvent header plus a 4-byte payload.
+        const MESSAGE_SIZE: u32 = 108;
+
+        unsafe extern "C" {
+            fn mach_msg_send(message: *mut c_void) -> i32;
+        }
+
+        let port = self.purple_workspace_port()?;
+
+        // Oversized so the 108-byte message is comfortably in bounds.
+        let mut buffer = [0u8; 112];
+        let base = buffer.as_mut_ptr();
+        unsafe {
+            // mach_msg_header_t: bits, size, remote, local, voucher, id.
+            std::ptr::write_unaligned(base.add(0x00) as *mut u32, MACH_MSG_TYPE_COPY_SEND);
+            std::ptr::write_unaligned(base.add(0x04) as *mut u32, MESSAGE_SIZE);
+            std::ptr::write_unaligned(base.add(0x08) as *mut u32, port);
+            std::ptr::write_unaligned(base.add(0x0c) as *mut u32, 0);
+            std::ptr::write_unaligned(base.add(0x10) as *mut u32, 0);
+            std::ptr::write_unaligned(base.add(0x14) as *mut i32, GSEVENT_MACH_MESSAGE_ID);
+
+            std::ptr::write_unaligned(
+                base.add(0x18) as *mut u32,
+                GSEVENT_TYPE_ORIENTATION_CHANGED | GSEVENT_HOST_FLAG,
+            );
+            // record_info_size, then the orientation itself.
+            std::ptr::write_unaligned(base.add(0x48) as *mut u32, 4);
+            std::ptr::write_unaligned(base.add(0x4c) as *mut u32, orientation as u32);
+        }
+
+        let result = unsafe { mach_msg_send(base as *mut c_void) };
+        if result != 0 {
+            return Err(anyhow!("mach_msg_send for orientation failed: {result}"));
+        }
+        Ok(())
+    }
+
+    /// Look up the simulator's `PurpleWorkspacePort` mach port.
+    fn purple_workspace_port(&self) -> Result<u32> {
+        let name = NSString::from_str("PurpleWorkspacePort");
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let port: u32 = unsafe { msg_send![self.device, lookup: &*name, error: &mut error] };
+
+        if port == 0 {
+            let detail = unsafe {
+                (!error.is_null())
+                    .then(|| {
+                        let description: *mut AnyObject = msg_send![error, localizedDescription];
+                        nsstring_to_string_static(description)
+                    })
+                    .flatten()
+            };
+            // The port is published by Simulator.app, not by the runtime, so a
+            // headless `simctl boot` will not have one.
+            return Err(anyhow!(
+                "PurpleWorkspacePort unavailable ({}). Rotation needs Simulator.app running.",
+                detail.as_deref().unwrap_or("no error detail")
+            ));
+        }
+        Ok(port)
     }
 
     /// Press a hardware button.

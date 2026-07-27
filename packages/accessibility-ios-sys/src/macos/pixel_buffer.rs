@@ -7,8 +7,19 @@
 //! copy or it will encode torn frames.
 //!
 //! The copy is a straightforward row-wise `memcpy` into a size-keyed
-//! `CVPixelBufferPool`. It is the single largest CPU cost in the capture path;
-//! a Metal blit or an IOSurface ring would avoid it, but correctness first.
+//! `CVPixelBufferPool`.
+//!
+//! This looks like an obvious target for a GPU blit, and it isn't. Both
+//! surfaces are IOSurface-backed, so they can be wrapped as `MTLTexture`s and
+//! copied with a blit encoder — but that was measured at **0.517 ms/frame
+//! against 0.377 ms for the `memcpy`** on an iPhone 17 surface (1206x2622,
+//! 12.1 MB), with cache-cold sources. Command buffer submission plus the
+//! `waitUntilCompleted` round trip costs more than the copy saves, because
+//! unified memory already gives the CPU path ~34 GB/s.
+//!
+//! At 60fps the `memcpy` is ~23 ms/s, or about 2% of one core. It is not worth
+//! optimizing, and the GPU version was slower and more complex. Measure before
+//! trying again.
 
 use std::ptr::NonNull;
 
