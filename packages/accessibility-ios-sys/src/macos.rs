@@ -56,11 +56,16 @@ use slotmap::SecondaryMap;
 
 mod common;
 mod dispatcher;
+mod dynamic;
+mod framebuffer;
 mod hid;
+mod pixel_buffer;
 mod reader;
+mod void_block;
 
 pub use common::{
     ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point, Rect, ScreenSpace,
     Screenshot, Size, TreeFilter, load_frameworks,
 };
+pub use framebuffer::{CapturedFrame, FrameSink, FramebufferStats, SimFramebuffer};
 pub use reader::IOSSimulatorAccessibility;
