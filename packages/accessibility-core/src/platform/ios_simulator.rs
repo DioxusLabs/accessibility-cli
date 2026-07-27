@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::future;
+use std::sync::Arc;
 
 use accessibility_ios_sys as sys;
 use accesskit::{Action, Role};
@@ -16,6 +17,9 @@ use slotmap::SecondaryMap;
 use crate::accessibility::{
     AccessibilityReader, Element, ElementCache, ElementKey, ElementTree, Point, Rect, Screenshot,
     Size, Target, TreeFilter,
+};
+use crate::video::{
+    EncodedFrame, FrameKind, FrameSink, NalFormat, ScreenGeometry, VideoCapture, VideoConfig,
 };
 
 pub use sys::{ButtonDirection, HardwareButton};
@@ -293,6 +297,75 @@ impl AccessibilityReader for IOSSimulatorAccessibility {
 
     fn supports_hit_test(&self) -> bool {
         true
+    }
+
+    fn start_video_capture(
+        &self,
+        config: &VideoConfig,
+        sink: FrameSink,
+    ) -> Result<Box<dyn VideoCapture>> {
+        let session = SimulatorVideoCapture::start(self.device_udid(), config, sink)?;
+        Ok(Box::new(session))
+    }
+
+    fn supports_video_capture(&self) -> bool {
+        true
+    }
+}
+
+/// Live framebuffer capture for the simulator, wrapping `accessibility-ios-sys`.
+pub struct SimulatorVideoCapture {
+    inner: sys::SimVideoStream,
+}
+
+impl SimulatorVideoCapture {
+    /// Start capturing the given device.
+    ///
+    /// The returned session owns the SimulatorKit registration; dropping it
+    /// tears the capture pipeline down.
+    pub fn start(udid: &str, config: &VideoConfig, sink: FrameSink) -> Result<Self> {
+        let sys_config = sys::EncoderConfig {
+            fps: config.fps,
+            bitrate: config.bitrate,
+            keyframe_interval_secs: config.keyframe_interval_secs,
+            nal_format: match config.nal_format {
+                NalFormat::AnnexB => sys::NalFormat::AnnexB,
+                NalFormat::Avcc => sys::NalFormat::Avcc,
+            },
+        };
+
+        let sys_sink: sys::ChunkSink = Arc::new(move |chunk: sys::EncodedChunk| {
+            sink(EncodedFrame {
+                data: chunk.data,
+                kind: match chunk.kind {
+                    sys::ChunkKind::ParameterSet => FrameKind::ParameterSet,
+                    sys::ChunkKind::Keyframe => FrameKind::Keyframe,
+                    sys::ChunkKind::Delta => FrameKind::Delta,
+                },
+            });
+        });
+
+        Ok(Self {
+            inner: sys::SimVideoStream::start(Some(udid), sys_config, sys_sink)?,
+        })
+    }
+}
+
+impl VideoCapture for SimulatorVideoCapture {
+    fn geometry(&self) -> ScreenGeometry {
+        let geometry = self.inner.geometry();
+        ScreenGeometry {
+            width: geometry.width,
+            height: geometry.height,
+        }
+    }
+
+    fn request_keyframe(&self) {
+        self.inner.request_keyframe();
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
     }
 }
 

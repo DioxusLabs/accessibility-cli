@@ -25,7 +25,15 @@ type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i3
 /// Uses the Indigo protocol via SimulatorKit's SimDeviceLegacyHIDClient
 /// to inject touch events, button presses, and keyboard input directly
 /// into the simulator's HID subsystem.
-pub(super) struct SimulatorHID {
+/// Phase of an interactive touch stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Begin,
+    Move,
+    End,
+}
+
+pub struct SimulatorHID {
     client: *mut AnyObject, // SimDeviceLegacyHIDClient
     queue: *mut AnyObject,  // dispatch_queue_t
     screen_size: (f64, f64),
@@ -131,6 +139,17 @@ impl SimulatorHID {
         })
     }
 
+    /// Create a HID client for a booted device, resolving it by UDID.
+    ///
+    /// `None` picks the first booted simulator. This exists so an input path
+    /// can be opened independently of the accessibility reader, which keeps
+    /// pointer events from queueing behind slow AX tree fetches.
+    pub fn for_device(udid: Option<&str>) -> Result<Self> {
+        crate::frameworks::load_coresimulator_framework()?;
+        let device = unsafe { super::common::find_booted_device(udid)? };
+        Self::new(device)
+    }
+
     /// Get the screen size in points.
     pub fn screen_size(&self) -> (f64, f64) {
         self.screen_size
@@ -190,6 +209,27 @@ impl SimulatorHID {
         self.send_touch(end_x_ratio, end_y_ratio, ButtonDirection::Up)?;
 
         Ok(())
+    }
+
+    /// Send a single interactive touch event in normalized screen space.
+    ///
+    /// Unlike [`Self::tap`] and [`Self::swipe`], this does not synthesize a
+    /// whole gesture: the caller drives the phases itself, which is what a live
+    /// pointer stream from a browser needs.
+    ///
+    /// `x` and `y` are 0..1 fractions of the screen, matching what the web UI
+    /// already computes, so no point/pixel/scale conversion is involved.
+    pub fn touch_normalized(&self, x: f64, y: f64, phase: TouchPhase) -> Result<()> {
+        let x = x.clamp(0.0, 1.0);
+        let y = y.clamp(0.0, 1.0);
+        // Indigo has no distinct "move" phase; contact is maintained by
+        // repeating the down event at the new position, which is exactly what
+        // `swipe` does internally.
+        let direction = match phase {
+            TouchPhase::Begin | TouchPhase::Move => ButtonDirection::Down,
+            TouchPhase::End => ButtonDirection::Up,
+        };
+        self.send_touch(x, y, direction)
     }
 
     /// Press a hardware button.

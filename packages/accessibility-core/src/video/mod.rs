@@ -1,0 +1,130 @@
+//! Platform-agnostic live video capture.
+//!
+//! This is the streaming counterpart to [`crate::accessibility::Screenshot`]:
+//! where a screenshot is a single decoded image, a [`VideoCapture`] is a
+//! continuous source of *encoded* frames.
+//!
+//! Deliberately encoded-frame oriented. Every platform that can do this at all
+//! has a hardware encoder sitting right next to its capture API, and handing
+//! raw surfaces across the abstraction boundary would force a copy and make
+//! the zero-copy paths unreachable.
+//!
+//! Only the iOS Simulator backend is implemented today; every other platform
+//! reports [`VideoCapture`] as unsupported.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use bytes::Bytes;
+
+/// Compressed video codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+}
+
+/// How H.264 NAL units are framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NalFormat {
+    /// `00 00 00 01` start codes. What WebRTC's H.264 payloader expects.
+    #[default]
+    AnnexB,
+    /// 4-byte big-endian length prefixes, paired with a separate parameter set
+    /// record. What the browser `VideoDecoder` API expects.
+    Avcc,
+}
+
+/// What a given [`EncodedFrame`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Codec configuration (an `avcC` record for H.264). Only produced in
+    /// [`NalFormat::Avcc`]; in Annex-B the parameter sets are inline.
+    ParameterSet,
+    /// An independently decodable frame.
+    Keyframe,
+    /// A frame that depends on earlier frames.
+    Delta,
+}
+
+impl FrameKind {
+    /// Whether a client joining at this frame can start decoding.
+    pub fn is_decodable_entry_point(self) -> bool {
+        matches!(self, FrameKind::ParameterSet | FrameKind::Keyframe)
+    }
+}
+
+/// One encoded unit, ready to be put on a wire.
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    pub data: Bytes,
+    pub kind: FrameKind,
+}
+
+/// Pixel dimensions of the captured display.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScreenGeometry {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ScreenGeometry {
+    pub fn is_valid(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+}
+
+/// Encoder tuning.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoConfig {
+    pub codec: VideoCodec,
+    pub nal_format: NalFormat,
+    pub fps: u32,
+    pub bitrate: u32,
+    /// Seconds between scheduled keyframes. Shorter means faster recovery for
+    /// clients that join late or drop packets, at the cost of bitrate.
+    pub keyframe_interval_secs: u32,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            codec: VideoCodec::default(),
+            nal_format: NalFormat::default(),
+            fps: 60,
+            bitrate: 6_000_000,
+            keyframe_interval_secs: 2,
+        }
+    }
+}
+
+/// Sink for encoded frames.
+///
+/// Invoked on the platform's capture thread, so implementations must not
+/// block. The expected shape is a bounded channel that drops on overflow: for
+/// interactive streaming, a stale frame is worth less than a fresh one.
+pub type FrameSink = Arc<dyn Fn(EncodedFrame) + Send + Sync>;
+
+/// A running video capture session.
+///
+/// `Sync` is required because a session is shared across every connected
+/// viewer. Implementations only expose atomics and locked state through
+/// `&self`; anything that mutates the pipeline takes `&mut self`.
+pub trait VideoCapture: Send + Sync {
+    /// Pixel geometry of the source. May be zero until the first frame lands.
+    fn geometry(&self) -> ScreenGeometry;
+
+    /// Request that the next encoded frame be a keyframe.
+    ///
+    /// Called when a new client subscribes, or in response to an RTCP PLI/FIR
+    /// from a WebRTC receiver.
+    fn request_keyframe(&self);
+
+    /// Stop capturing and release platform resources.
+    fn stop(&mut self);
+}
+
+/// Error returned by platforms without a video backend.
+pub fn unsupported<T>(platform: &str) -> Result<T> {
+    anyhow::bail!("Video capture is not supported on {platform}")
+}

@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulator</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --panel: #16191f;
+    --border: #262b34;
+    --text: #e6e9ef;
+    --muted: #99a1b0;
+    --accent: #4c8dff;
+    --accent-soft: rgba(76, 141, 255, 0.18);
+    --good: #3fb950;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+  }
+  body { display: flex; }
+
+  main {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 20px; gap: 12px; min-width: 0;
+  }
+
+  #stage {
+    position: relative;
+    height: min(88vh, 900px);
+    border-radius: 22px;
+    overflow: hidden;
+    background: #000;
+    box-shadow: 0 18px 50px rgba(0,0,0,.55);
+  }
+  #stage video, #stage canvas#screen {
+    display: block; height: 100%; width: 100%; object-fit: fill;
+  }
+  #stage canvas#screen { display: none; }
+  #stage.h264 video { display: none; }
+  #stage.h264 canvas#screen { display: block; }
+
+  #overlay {
+    position: absolute; inset: 0;
+    pointer-events: none;
+  }
+  #stage.inspecting { cursor: crosshair; }
+
+  .chip {
+    position: absolute;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px; font-weight: 600;
+    padding: 2px 6px; border-radius: 4px;
+    white-space: nowrap;
+    pointer-events: none;
+    max-width: 90%; overflow: hidden; text-overflow: ellipsis;
+  }
+  .box {
+    position: absolute;
+    border: 1.5px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 3px;
+    pointer-events: none;
+  }
+
+  #toolbar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 6px 8px;
+  }
+  button {
+    background: #1e222a; color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 11px; font: inherit; font-weight: 500;
+    cursor: pointer;
+  }
+  button:hover { background: #262b34; }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .status { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 0 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--good); }
+  .dot.error { background: var(--bad); }
+
+  aside {
+    width: 330px; flex: none;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    padding: 16px; overflow-y: auto;
+    display: none;
+  }
+  aside.open { display: block; }
+  aside h2 { margin: 0 0 4px; font-size: 13px; }
+  aside .role { color: var(--accent); font-weight: 600; }
+  aside .hint { color: var(--muted); }
+  dl { display: grid; grid-template-columns: 84px 1fr; gap: 6px 10px; margin: 14px 0 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; word-break: break-word; }
+  code {
+    display: block; margin-top: 6px; padding: 8px;
+    background: #0d1016; border: 1px solid var(--border); border-radius: 6px;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #a5d6ff; word-break: break-all;
+  }
+  .copy { margin-top: 8px; width: 100%; }
+</style>
+</head>
+<body>
+
+<main>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="screen"></canvas>
+    <div id="overlay"></div>
+  </div>
+
+  <div id="toolbar">
+    <button id="home" title="Home">Home</button>
+    <button id="inspect" aria-pressed="false" title="Inspect elements (hold Option)">Inspect</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting</span></div>
+  </div>
+</main>
+
+<aside id="panel">
+  <h2><span class="role" id="d-role">—</span></h2>
+  <div class="hint" id="d-label"></div>
+  <dl>
+    <dt>value</dt><dd id="d-value">—</dd>
+    <dt>identifier</dt><dd id="d-id">—</dd>
+    <dt>enabled</dt><dd id="d-enabled">—</dd>
+    <dt>actions</dt><dd id="d-actions">—</dd>
+  </dl>
+  <div style="margin-top:14px">
+    <div class="hint">CLI selector</div>
+    <code id="d-selector">—</code>
+    <button class="copy" id="copy">Copy selector</button>
+  </div>
+</aside>
+
+<script>
+"use strict";
+
+const stage = document.getElementById("stage");
+const video = document.getElementById("video");
+const screen = document.getElementById("screen");
+const overlay = document.getElementById("overlay");
+const panel = document.getElementById("panel");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statusText");
+
+let config = null;
+let inputSocket = null;
+let inspecting = false;
+let axElements = [];
+let selected = null;
+let pointerDown = false;
+
+function setStatus(text, state) {
+  statusText.textContent = text;
+  dot.className = "dot" + (state ? " " + state : "");
+}
+
+/* ---------------------------------------------------------------- layout */
+
+// The stage is pinned to the device aspect ratio so the media element's
+// bounding box is exactly the video content box. That keeps pointer mapping
+// a plain rect division with no letterbox correction.
+function applyAspectRatio() {
+  stage.style.aspectRatio = `${config.width} / ${config.height}`;
+  screen.width = config.width;
+  screen.height = config.height;
+}
+
+/* ----------------------------------------------------------------- input */
+
+function connectInput() {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  inputSocket = new WebSocket(`${scheme}//${location.host}/ws/input`);
+  inputSocket.onclose = () => setTimeout(connectInput, 1000);
+}
+
+function sendInput(message) {
+  if (inputSocket && inputSocket.readyState === WebSocket.OPEN) {
+    inputSocket.send(JSON.stringify(message));
+  }
+}
+
+function pointToNormalized(event) {
+  const rect = stage.getBoundingClientRect();
+  return {
+    x: Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1),
+    y: Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1),
+  };
+}
+
+stage.addEventListener("pointerdown", (event) => {
+  if (inspecting) { pickAt(event, true); return; }
+  pointerDown = true;
+  stage.setPointerCapture(event.pointerId);
+  const { x, y } = pointToNormalized(event);
+  sendInput({ type: "touch", phase: "begin", x, y });
+});
+
+stage.addEventListener("pointermove", (event) => {
+  if (inspecting) { hoverAt(event); return; }
+  if (!pointerDown) return;
+  const { x, y } = pointToNormalized(event);
+  sendInput({ type: "touch", phase: "move", x, y });
+});
+
+function endTouch(event) {
+  if (!pointerDown) return;
+  pointerDown = false;
+  const { x, y } = pointToNormalized(event);
+  sendInput({ type: "touch", phase: "end", x, y });
+}
+stage.addEventListener("pointerup", endTouch);
+stage.addEventListener("pointercancel", endTouch);
+
+// A US-keyboard subset is enough to type into fields and drive navigation.
+// These are HIToolbox virtual key codes, which is what the HID path wants.
+const KEY_CODES = {
+  a:0,s:1,d:2,f:3,h:4,g:5,z:6,x:7,c:8,v:9,b:11,q:12,w:13,e:14,r:15,y:16,t:17,
+  "1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"=":24,"9":25,"7":26,"-":27,"8":28,
+  "0":29,"]":30,o:31,u:32,"[":33,i:34,p:35,Enter:36,l:37,j:38,"'":39,k:40,
+  ";":41,"\\":42,",":43,"/":44,n:45,m:46,".":47,Tab:48," ":49,"`":50,
+  Backspace:51,Escape:53,ArrowLeft:123,ArrowRight:124,ArrowDown:125,ArrowUp:126,
+};
+
+window.addEventListener("keydown", (event) => {
+  if (inspecting && event.key === "Escape") { clearSelection(); return; }
+  if (event.metaKey || event.ctrlKey) return;
+  const code = KEY_CODES[event.key] ?? KEY_CODES[event.key.toLowerCase()];
+  if (code === undefined) return;
+  event.preventDefault();
+  sendInput({ type: "key", key_code: code });
+});
+
+document.getElementById("home").onclick = () =>
+  sendInput({ type: "button", button: "home" });
+
+/* ------------------------------------------------------------- inspector */
+
+const inspectButton = document.getElementById("inspect");
+
+function setInspecting(on) {
+  inspecting = on;
+  inspectButton.setAttribute("aria-pressed", String(on));
+  stage.classList.toggle("inspecting", on);
+  if (on) {
+    refreshTree();
+  } else {
+    clearSelection();
+  }
+}
+
+inspectButton.onclick = () => setInspecting(!inspecting);
+
+// Option acts as a momentary inspect toggle, so you can peek at an element
+// without leaving interaction mode.
+window.addEventListener("keydown", (e) => { if (e.key === "Alt" && !inspecting) setInspecting(true); });
+window.addEventListener("keyup", (e) => { if (e.key === "Alt" && inspecting) setInspecting(false); });
+
+async function refreshTree() {
+  try {
+    const response = await fetch("/api/ax/tree");
+    if (!response.ok) throw new Error(await response.text());
+    const snapshot = await response.json();
+    // Only elements with bounds can be hit or drawn.
+    axElements = snapshot.elements.filter((e) => e.bounds);
+  } catch (error) {
+    console.warn("accessibility tree unavailable:", error);
+    axElements = [];
+  }
+}
+
+function area(element) {
+  return element.bounds.width * element.bounds.height;
+}
+
+// Client-side pick against the cached tree. Instant, but can be stale, so it
+// is only used for hover feedback while the pointer is moving.
+function pickFromCache(x, y) {
+  let best = null;
+  for (const element of axElements) {
+    const b = element.bounds;
+    if (x < b.x || y < b.y || x > b.x + b.width || y > b.y + b.height) continue;
+    // The innermost element is the one the user means; among equals prefer
+    // the deeper node.
+    if (!best || area(element) < area(best) ||
+        (area(element) === area(best) && element.depth > best.depth)) {
+      best = element;
+    }
+  }
+  return best;
+}
+
+let hoverTimer = null;
+
+function hoverAt(event) {
+  const { x, y } = pointToNormalized(event);
+  const cached = pickFromCache(x, y);
+  if (cached) drawSelection(cached);
+
+  // Once the pointer settles, confirm with a real hit test. The cached tree
+  // mis-picks overlapping and transformed views; the simulator does not.
+  clearTimeout(hoverTimer);
+  hoverTimer = setTimeout(() => confirmHit(x, y), 110);
+}
+
+async function confirmHit(x, y) {
+  try {
+    const response = await fetch(`/api/ax/hit?x=${x}&y=${y}`);
+    if (!response.ok) return;
+    const element = await response.json();
+    if (element) drawSelection(element);
+  } catch { /* hover is best-effort */ }
+}
+
+async function pickAt(event, sticky) {
+  const { x, y } = pointToNormalized(event);
+  const cached = pickFromCache(x, y);
+  if (cached) drawSelection(cached);
+  await confirmHit(x, y);
+  if (sticky && selected) showDetails(selected);
+}
+
+function drawSelection(element) {
+  selected = element;
+  const b = element.bounds;
+  overlay.innerHTML = "";
+
+  const box = document.createElement("div");
+  box.className = "box";
+  box.style.left = `${b.x * 100}%`;
+  box.style.top = `${b.y * 100}%`;
+  box.style.width = `${b.width * 100}%`;
+  box.style.height = `${b.height * 100}%`;
+  overlay.appendChild(box);
+
+  const chip = document.createElement("div");
+  chip.className = "chip";
+  chip.textContent = element.label ? `${element.role} · ${element.label}` : element.role;
+  // Flip the chip below the box when there is no room above it.
+  const above = b.y > 0.04;
+  chip.style.left = `${b.x * 100}%`;
+  chip.style.top = above ? `calc(${b.y * 100}% - 20px)` : `calc(${(b.y + b.height) * 100}% + 4px)`;
+  overlay.appendChild(chip);
+}
+
+function clearSelection() {
+  selected = null;
+  overlay.innerHTML = "";
+  panel.classList.remove("open");
+}
+
+function showDetails(element) {
+  panel.classList.add("open");
+  const text = (value) => (value === null || value === undefined || value === "" ? "—" : value);
+  document.getElementById("d-role").textContent = element.role;
+  document.getElementById("d-label").textContent = text(element.label);
+  document.getElementById("d-value").textContent = text(element.value);
+  document.getElementById("d-id").textContent = text(element.identifier);
+  document.getElementById("d-enabled").textContent = element.enabled ? "yes" : "no";
+  document.getElementById("d-actions").textContent =
+    element.actions.length ? element.actions.join(", ") : "—";
+  document.getElementById("d-selector").textContent = element.selector;
+}
+
+document.getElementById("copy").onclick = () => {
+  const selector = document.getElementById("d-selector").textContent;
+  navigator.clipboard.writeText(selector);
+};
+
+/* ---------------------------------------------------------------- webrtc */
+
+async function startWebRtc() {
+  const peer = new RTCPeerConnection({ iceServers: [] });
+  peer.addTransceiver("video", { direction: "recvonly" });
+  peer.ontrack = (event) => { video.srcObject = event.streams[0]; };
+  peer.onconnectionstatechange = () => {
+    if (peer.connectionState === "connected") setStatus("live · webrtc", "live");
+    if (peer.connectionState === "failed") setStatus("webrtc failed", "error");
+  };
+
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+
+  // Signaling is a single round trip, so wait out ICE gathering rather than
+  // trickling candidates.
+  await new Promise((resolve) => {
+    if (peer.iceGatheringState === "complete") return resolve();
+    peer.addEventListener("icegatheringstatechange", () => {
+      if (peer.iceGatheringState === "complete") resolve();
+    });
+    setTimeout(resolve, 2000);
+  });
+
+  const response = await fetch("/webrtc/offer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: peer.localDescription.sdp }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  await peer.setRemoteDescription({ type: "answer", sdp: (await response.json()).sdp });
+
+  // Report failure if no frame ever arrives, so the caller can fall back.
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("no webrtc media")), 6000);
+    video.addEventListener("loadeddata", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+/* ------------------------------------------------------- h264 / webcodecs */
+
+const TAG_PARAMETER_SET = 0x01;
+const TAG_KEYFRAME = 0x02;
+
+async function startH264() {
+  if (!("VideoDecoder" in window)) throw new Error("WebCodecs unavailable");
+
+  stage.classList.add("h264");
+  const context = screen.getContext("2d");
+  let decoder = null;
+
+  // `configure` reports success synchronously and only surfaces an
+  // unsupported configuration through the async error callback, so the
+  // support check has to happen up front.
+  async function configureDecoder(config) {
+    const support = await VideoDecoder.isConfigSupported(config);
+    if (!support.supported) {
+      throw new Error(`${config.codec} not supported by this browser`);
+    }
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        context.drawImage(frame, 0, 0, screen.width, screen.height);
+        frame.close();
+      },
+      error: (error) => setStatus(`decode error: ${error.message}`, "error"),
+    });
+    decoder.configure(config);
+    setStatus("live · h264", "live");
+  }
+
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${location.host}/ws/stream`);
+  socket.binaryType = "arraybuffer";
+
+  socket.onmessage = (event) => {
+    const view = new DataView(event.data);
+    const length = view.getUint32(0);
+    const tag = view.getUint8(4);
+    const payload = new Uint8Array(event.data, 5, length - 1);
+
+    if (tag === TAG_PARAMETER_SET) {
+      // The avcC record carries profile/compatibility/level in bytes 1..3,
+      // which is exactly what the codec string needs.
+      const codec = `avc1.${[...payload.slice(1, 4)]
+        .map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+
+      // Note: no `hardwareAcceleration` hint. Despite the name,
+      // "prefer-hardware" is treated as a requirement, and phone-shaped
+      // resolutions like 1206x2622 exceed what hardware decoders accept —
+      // asking for it makes the configuration unsupported outright.
+      const config = {
+        codec,
+        description: payload.slice(),
+        optimizeForLatency: true,
+      };
+
+      configureDecoder(config).catch((error) =>
+        setStatus(`cannot decode: ${error.message}`, "error"));
+      return;
+    }
+
+    if (!decoder) return;
+    decoder.decode(new EncodedVideoChunk({
+      type: tag === TAG_KEYFRAME ? "key" : "delta",
+      timestamp: performance.now() * 1000,
+      data: payload.slice(),
+    }));
+  };
+
+  socket.onerror = () => setStatus("stream socket error", "error");
+  socket.onclose = () => setStatus("stream closed", "error");
+}
+
+/* ------------------------------------------------------------------ boot */
+
+async function main() {
+  config = await (await fetch("/api/config")).json();
+  applyAspectRatio();
+  connectInput();
+
+  const preferWebRtc = config.default_transport === "webrtc";
+  try {
+    if (preferWebRtc) { await startWebRtc(); } else { await startH264(); }
+  } catch (error) {
+    console.warn(`${preferWebRtc ? "webrtc" : "h264"} failed, falling back:`, error);
+    setStatus("falling back…");
+    try {
+      if (preferWebRtc) { await startH264(); } else { await startWebRtc(); }
+    } catch (fallbackError) {
+      setStatus(`no stream: ${fallbackError.message}`, "error");
+    }
+  }
+}
+
+main();
+</script>
+</body>
+</html>

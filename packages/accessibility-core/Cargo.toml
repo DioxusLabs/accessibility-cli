@@ -16,6 +16,7 @@ accessibility-android-sys.workspace = true
 accesskit.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 cssparser.workspace = true
 euclid.workspace = true
 image.workspace = true

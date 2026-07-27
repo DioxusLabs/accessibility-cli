@@ -112,8 +112,18 @@ struct Registration {
 }
 
 /// State shared between the capture queue, the idle timer, and the owner.
+///
+/// The wiring state (device, IO client, registrations, blocks) lives here
+/// rather than on [`SimFramebuffer`] so the idle timer can rebuild the whole
+/// pipeline without needing `&mut` access to the owner.
 struct CaptureState {
+    device: ObjcPtr,
+    queue: DispatchRetained<DispatchQueue>,
     registrations: Mutex<Vec<Registration>>,
+    /// SimulatorKit retains these blocks for the lifetime of the registration.
+    /// Dropping them early is a use-after-free, not a clean failure, so they
+    /// are held until the matching unregister call.
+    blocks: Mutex<Vec<VoidBlock>>,
     photocopier: Mutex<Photocopier>,
     sink: Mutex<Option<FrameSink>>,
     last_capture: Mutex<Instant>,
@@ -223,91 +233,16 @@ impl CaptureState {
             });
         }
     }
-}
-
-/// Live framebuffer capture session for one simulator device.
-pub struct SimFramebuffer {
-    device: ObjcPtr,
-    device_udid: String,
-    io_client: Option<ObjcPtr>,
-    queue: DispatchRetained<DispatchQueue>,
-    state: Arc<CaptureState>,
-    /// SimulatorKit retains these blocks for the lifetime of the registration.
-    /// Dropping them early is a use-after-free, not a clean failure.
-    blocks: Vec<VoidBlock>,
-    idle_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-// The raw pointers are only messaged from the capture queue or from methods
-// that take `&mut self`, so the type is safe to move between threads.
-unsafe impl Send for SimFramebuffer {}
-
-impl SimFramebuffer {
-    /// Attach to a booted simulator. `udid` of `None` picks the first booted one.
-    pub fn new(udid: Option<&str>) -> Result<Self> {
-        crate::frameworks::load_coresimulator_framework()?;
-        crate::frameworks::load_simulatorkit_framework()?;
-
-        let device = unsafe { find_booted_device(udid)? };
-        let device_udid = unsafe { device_udid_string(device)? };
-
-        Ok(Self {
-            device: ObjcPtr(device),
-            device_udid,
-            io_client: None,
-            queue: DispatchQueue::new(
-                "com.accessibility_cli.framebuffer",
-                DispatchQueueAttr::SERIAL,
-            ),
-            state: Arc::new(CaptureState {
-                registrations: Mutex::new(Vec::new()),
-                photocopier: Mutex::new(Photocopier::new()),
-                sink: Mutex::new(None),
-                last_capture: Mutex::new(Instant::now()),
-                frame_count: AtomicU64::new(0),
-                rewire_count: AtomicU64::new(0),
-                width: AtomicUsize::new(0),
-                height: AtomicUsize::new(0),
-                running: AtomicBool::new(false),
-            }),
-            blocks: Vec::new(),
-            idle_thread: None,
-        })
-    }
-
-    pub fn device_udid(&self) -> &str {
-        &self.device_udid
-    }
-
-    pub fn stats(&self) -> FramebufferStats {
-        self.state.stats()
-    }
-
-    /// Install the frame sink. Called on the capture queue, so it must be quick.
-    pub fn set_sink(&mut self, sink: Option<FrameSink>) {
-        *self.state.sink.lock().unwrap() = sink;
-    }
-
-    /// Begin capturing. Idempotent-ish: calling twice re-wires the pipeline.
-    pub fn start(&mut self) -> Result<()> {
-        self.state.running.store(true, Ordering::Relaxed);
-        self.wire_up()?;
-        self.start_idle_timer();
-        Ok(())
-    }
 
     /// Walk the IO port graph and register screen callbacks on every
-    /// framebuffer descriptor.
-    fn wire_up(&mut self) -> Result<()> {
-        let device = self.device.as_ptr();
-
-        let io: *mut AnyObject = unsafe { msg_send![device, io] };
+    /// framebuffer descriptor, replacing any existing registration.
+    fn wire_up(self: &Arc<Self>) -> Result<()> {
+        let io: *mut AnyObject = unsafe { msg_send![self.device.as_ptr(), io] };
         if io.is_null() {
             return Err(anyhow!(
                 "SimDevice returned no IO client; is the simulator still booted?"
             ));
         }
-        self.io_client = Some(ObjcPtr(io));
 
         let _: () = unsafe { msg_send![io, updateIOPorts] };
 
@@ -326,10 +261,10 @@ impl SimFramebuffer {
         for descriptor in descriptors {
             let uuid = NSUUID::new();
 
-            let state = Arc::clone(&self.state);
+            let state = Arc::clone(self);
             let frame_cb = VoidBlock::new(move || state.capture(false));
             // `surfacesChanged` carries no payload; it just means "re-query".
-            let state = Arc::clone(&self.state);
+            let state = Arc::clone(self);
             let surfaces_cb = VoidBlock::new(move || state.capture(true));
             let props_cb = VoidBlock::new(|| {});
 
@@ -355,15 +290,99 @@ impl SimFramebuffer {
             });
         }
 
-        *self.state.registrations.lock().unwrap() = registrations;
-        self.blocks = blocks;
+        *self.registrations.lock().unwrap() = registrations;
+        *self.blocks.lock().unwrap() = blocks;
 
         // Registration alone does not deliver a first frame; prime it.
-        self.state.capture(true);
+        self.capture(true);
         Ok(())
     }
 
-    /// Drive forced re-emits, and re-wire while nothing has arrived yet.
+    fn unregister_all(&self) {
+        let mut registrations = self.registrations.lock().unwrap();
+        for registration in registrations.drain(..) {
+            let descriptor = registration.descriptor.as_ptr();
+            let selector = sel!(unregisterScreenCallbacksWithUUID:);
+            if unsafe { responds_to(descriptor, selector) } {
+                unsafe {
+                    send_void_with_id(
+                        descriptor,
+                        selector,
+                        &*registration.uuid as *const NSUUID as *mut AnyObject,
+                    );
+                }
+            }
+        }
+        drop(registrations);
+        // Only safe to release the blocks once SimulatorKit has been told to
+        // stop calling them.
+        self.blocks.lock().unwrap().clear();
+        self.width.store(0, Ordering::Relaxed);
+        self.height.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Live framebuffer capture session for one simulator device.
+pub struct SimFramebuffer {
+    device_udid: String,
+    state: Arc<CaptureState>,
+    idle_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SimFramebuffer {
+    /// Attach to a booted simulator. `udid` of `None` picks the first booted one.
+    pub fn new(udid: Option<&str>) -> Result<Self> {
+        crate::frameworks::load_coresimulator_framework()?;
+        crate::frameworks::load_simulatorkit_framework()?;
+
+        let device = unsafe { find_booted_device(udid)? };
+        let device_udid = unsafe { device_udid_string(device)? };
+
+        Ok(Self {
+            device_udid,
+            state: Arc::new(CaptureState {
+                device: ObjcPtr(device),
+                queue: DispatchQueue::new(
+                    "com.accessibility_cli.framebuffer",
+                    DispatchQueueAttr::SERIAL,
+                ),
+                registrations: Mutex::new(Vec::new()),
+                blocks: Mutex::new(Vec::new()),
+                photocopier: Mutex::new(Photocopier::new()),
+                sink: Mutex::new(None),
+                last_capture: Mutex::new(Instant::now()),
+                frame_count: AtomicU64::new(0),
+                rewire_count: AtomicU64::new(0),
+                width: AtomicUsize::new(0),
+                height: AtomicUsize::new(0),
+                running: AtomicBool::new(false),
+            }),
+            idle_thread: None,
+        })
+    }
+
+    pub fn device_udid(&self) -> &str {
+        &self.device_udid
+    }
+
+    pub fn stats(&self) -> FramebufferStats {
+        self.state.stats()
+    }
+
+    /// Install the frame sink. Called on the capture queue, so it must be quick.
+    pub fn set_sink(&mut self, sink: Option<FrameSink>) {
+        *self.state.sink.lock().unwrap() = sink;
+    }
+
+    /// Begin capturing. Calling twice rebuilds the pipeline.
+    pub fn start(&mut self) -> Result<()> {
+        self.state.running.store(true, Ordering::Relaxed);
+        self.state.wire_up()?;
+        self.start_idle_timer();
+        Ok(())
+    }
+
+    /// Drive forced re-emits, and rebuild the pipeline while nothing arrives.
     fn start_idle_timer(&mut self) {
         if self.idle_thread.is_some() {
             return;
@@ -383,32 +402,19 @@ impl SimFramebuffer {
                     state.capture(true);
                 }
 
-                // Self-heal only until the first frame ever lands. After that a
-                // silent pipeline means an idle screen, not a broken graph.
-                if state.frame_count.load(Ordering::Relaxed) == 0 && tick % REWIRE_TICKS == 0 {
+                // Self-heal only until the first frame ever lands. After that
+                // a silent pipeline means an idle screen, not a broken graph.
+                if state.frame_count.load(Ordering::Relaxed) == 0
+                    && tick.is_multiple_of(REWIRE_TICKS)
+                {
                     state.rewire_count.fetch_add(1, Ordering::Relaxed);
+                    // Descriptors are sometimes created lazily, so a
+                    // registration that happened too early yields nothing.
+                    // Failures are expected here; the next tick retries.
+                    let _ = state.wire_up();
                 }
             }
         }));
-    }
-
-    fn unregister_all(&mut self) {
-        let mut registrations = self.state.registrations.lock().unwrap();
-        for registration in registrations.drain(..) {
-            let descriptor = registration.descriptor.as_ptr();
-            let selector = sel!(unregisterScreenCallbacksWithUUID:);
-            if unsafe { responds_to(descriptor, selector) } {
-                unsafe {
-                    send_void_with_id(
-                        descriptor,
-                        selector,
-                        &*registration.uuid as *const NSUUID as *mut AnyObject,
-                    );
-                }
-            }
-        }
-        drop(registrations);
-        self.blocks.clear();
     }
 
     pub fn stop(&mut self) {
@@ -416,7 +422,7 @@ impl SimFramebuffer {
         if let Some(handle) = self.idle_thread.take() {
             let _ = handle.join();
         }
-        self.unregister_all();
+        self.state.unregister_all();
         *self.state.sink.lock().unwrap() = None;
     }
 }

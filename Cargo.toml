@@ -7,6 +7,7 @@ members = [
     "packages/accessibility-windows-sys",
     "packages/accessibility-ios-sys",
     "packages/accessibility-core",
+    "packages/accessibility-serve",
     "packages/accessibility-cli",
 ]
 
@@ -19,6 +20,7 @@ homepage = "https://github.com/DioxusLabs/accessibility-cli"
 
 [workspace.dependencies]
 accessibility-core = { path = "packages/accessibility-core", version = "0.1.0" }
+accessibility-serve = { path = "packages/accessibility-serve", version = "0.1.0" }
 accessibility-cli = { path = "packages/accessibility-cli", version = "0.1.0" }
 accessibility-android-sys = { path = "packages/accessibility-android-sys", version = "0.1.0" }
 accessibility-linux-sys = { path = "packages/accessibility-linux-sys", version = "0.1.0" }
@@ -30,6 +32,7 @@ accesskit = { version = "0.22", features = ["enumn", "schemars", "serde"] }
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 atspi = { version = "0.29", features = ["connection", "proxies"] }
+axum = "0.8"
 atspi-common = "0.13"
 block2 = "0.6"
 bytes = "1"
@@ -39,6 +42,7 @@ dispatch2 = "0.3"
 ctrlc = "3"
 euclid = { version = "0.22", features = ["serde"] }
 futures-lite = "2"
+futures-util = "0.3"
 image = "0.25"
 imageproc = "0.25"
 keyboard-types = "0.7"
@@ -77,8 +81,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 serial_test = { version = "3", features = ["file_locks"] }
 slotmap = { version = "1.1", features = ["serde"] }
+tower-http = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.49.0", features = ["full"] }
 viuer = "0.9"
+webrtc = "0.14"
 x11rb = { version = "0.13", features = ["randr"] }
 zbus = { version = "5", features = ["tokio"] }
 
