@@ -19,8 +19,8 @@ use crate::accessibility::{
     Size, Target, TreeFilter,
 };
 use crate::video::{
-    EncodedFrame, FrameKind, FrameSink, NalFormat, ScreenGeometry, Tuning, VideoCapture,
-    VideoConfig,
+    EncodedFrame, FrameKind, FrameSink, NalFormat, Recording, RecordingConfig, ScreenGeometry,
+    Tuning, VideoCapture, VideoConfig,
 };
 
 pub use sys::{ButtonDirection, HardwareButton};
@@ -375,6 +375,32 @@ impl VideoCapture for SimulatorVideoCapture {
 
     fn request_keyframe(&self) {
         self.inner.request_keyframe();
+    }
+
+    fn start_recording(&self, path: &std::path::Path, config: &RecordingConfig) -> Result<()> {
+        self.inner.start_recording(
+            path,
+            sys::RecordingConfig {
+                quality: config.quality,
+                max_dimension: config.max_dimension,
+                keyframe_interval_secs: config.keyframe_interval_secs,
+            },
+        )
+    }
+
+    fn stop_recording(&self) -> Result<Recording> {
+        let recording = self.inner.stop_recording()?;
+        Ok(Recording {
+            path: recording.path,
+            frames: recording.frames,
+            duration_secs: recording.duration.as_secs_f64(),
+            width: recording.width,
+            height: recording.height,
+        })
+    }
+
+    fn recording_frames(&self) -> Option<u64> {
+        self.inner.recording_frames()
     }
 
     fn stop(&mut self) {

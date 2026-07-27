@@ -190,6 +190,10 @@
 
   <div class="sep"></div>
 
+  <button class="tool" id="btnRecord" aria-pressed="false" data-label="Record video">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/></svg>
+  </button>
+
   <button class="tool" id="btnInspect" aria-pressed="false" data-label="Inspect (hold ⌥)">
     <svg viewBox="0 0 24 24"><path d="M4 4l6.5 16 2.5-6.5L19.5 11z"/></svg>
   </button>
@@ -396,6 +400,45 @@ stage.addEventListener("wheel", (event) => {
   const delta = toRawDelta(event.deltaX / rect.width, event.deltaY / rect.height);
   sendInput({ type: "scroll", dx: delta.dx, dy: delta.dy, x: raw.x, y: raw.y });
 }, { passive: false });
+
+/* ── recording ─────────────────────────────────────────────────────────── */
+const btnRecord = document.getElementById("btnRecord");
+let recording = false;
+let recordingTimer = null;
+
+btnRecord.addEventListener("click", async () => {
+  btnRecord.disabled = true;
+  try {
+    if (!recording) {
+      const response = await fetch("/api/recording/start", { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      recording = true;
+      btnRecord.setAttribute("aria-pressed", "true");
+      const startedAt = Date.now();
+      recordingTimer = setInterval(() => {
+        const seconds = Math.floor((Date.now() - startedAt) / 1000);
+        setStatus(`recording ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`);
+      }, 500);
+    } else {
+      // Finalizing flushes the file index, so it is not instant.
+      setStatus("finishing recording…");
+      const response = await fetch("/api/recording/stop", { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      const recorded = await response.json();
+      setStatus(`saved ${recorded.width}x${recorded.height}, ${recorded.frames} frames — ${recorded.path}`);
+      recording = false;
+      btnRecord.setAttribute("aria-pressed", "false");
+      clearInterval(recordingTimer);
+    }
+  } catch (error) {
+    setStatus(`recording failed: ${error.message}`);
+    recording = false;
+    btnRecord.setAttribute("aria-pressed", "false");
+    clearInterval(recordingTimer);
+  } finally {
+    btnRecord.disabled = false;
+  }
+});
 
 /* Keys that are not text. Values are USB HID usage codes, which is what the
    simulator's keyboard takes — not HIToolbox virtual keycodes. Printable

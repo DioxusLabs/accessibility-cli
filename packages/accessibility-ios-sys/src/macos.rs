@@ -62,6 +62,7 @@ mod framebuffer;
 mod hid;
 mod pixel_buffer;
 mod reader;
+mod recorder;
 mod stream;
 mod void_block;
 
@@ -75,4 +76,5 @@ pub use encoder::{
 pub use framebuffer::{CapturedFrame, FrameSink, FramebufferStats, SimFramebuffer};
 pub use hid::{Orientation, SimulatorHID, TouchEdge, TouchPhase};
 pub use reader::IOSSimulatorAccessibility;
+pub use recorder::{Recorder, Recording, RecordingConfig};
 pub use stream::{ScreenGeometry, SimVideoStream};

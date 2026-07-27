@@ -15,7 +15,9 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use accessibility_core::video::{EncodedFrame, FrameKind, VideoCapture, VideoConfig};
+use accessibility_core::video::{
+    EncodedFrame, FrameKind, Recording, RecordingConfig, VideoCapture, VideoConfig,
+};
 
 use crate::ax::{AxCommand, AxSnapshot, ElementDetail, spawn_ax_worker};
 use crate::input::{InputCommand, Orientation, spawn_input_worker};
@@ -58,6 +60,8 @@ pub struct StatsReport {
     pub keyframe_requests: u64,
     pub lag_events: u64,
     pub subscribers: usize,
+    /// Frames written to the current recording, or `None` when idle.
+    pub recording_frames: Option<u64>,
     /// Capture resolution.
     pub width: u32,
     pub height: u32,
@@ -190,6 +194,7 @@ impl SimSession {
             keyframe_requests: self.stats.keyframe_requests.load(Ordering::Relaxed),
             lag_events: self.stats.lag_events.load(Ordering::Relaxed),
             subscribers: self.frames.receiver_count(),
+            recording_frames: self.capture.recording_frames(),
             width: geometry.width,
             height: geometry.height,
             encoded_width: encoded.width,
@@ -215,6 +220,31 @@ impl SimSession {
     pub fn set_orientation(&self, orientation: Orientation) {
         *self.orientation.lock().unwrap() = orientation;
         self.send_input(InputCommand::Rotate { orientation });
+    }
+
+    /// Begin recording to a file beside the system temp directory.
+    ///
+    /// Runs a second encode of the same frames, so the live stream is
+    /// unaffected and the recording can use B-frames and its own resolution.
+    pub fn start_recording(&self, config: RecordingConfig) -> Result<std::path::PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "serve-sim-{}-{}.mp4",
+            self.device_udid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default()
+        ));
+        self.capture.start_recording(&path, &config)?;
+        Ok(path)
+    }
+
+    pub fn stop_recording(&self) -> Result<Recording> {
+        self.capture.stop_recording()
+    }
+
+    pub fn recording_frames(&self) -> Option<u64> {
+        self.capture.recording_frames()
     }
 
     pub fn settings(&self) -> Vec<Setting> {

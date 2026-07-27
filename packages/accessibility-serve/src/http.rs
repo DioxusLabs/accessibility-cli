@@ -36,6 +36,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/settings", get(settings).post(set_setting))
         .route("/api/orientation", post(set_orientation))
+        .route("/api/recording/start", post(start_recording))
+        .route("/api/recording/stop", post(stop_recording))
         .route("/webrtc/offer", post(webrtc_offer))
         .route("/ws/stream", get(stream_socket))
         .route("/ws/input", get(input_socket))
@@ -102,6 +104,46 @@ async fn set_setting(
     match result {
         Ok(Ok(value)) => Json(serde_json::json!({ "value": value })).into_response(),
         Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => internal_error(anyhow::anyhow!(error)),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RecordingRequest {
+    /// Quality from 0 to 1.
+    quality: Option<f64>,
+    /// Longest edge of the recording.
+    max_dimension: Option<u32>,
+}
+
+async fn start_recording(
+    State(state): State<AppState>,
+    body: Option<Json<RecordingRequest>>,
+) -> Response {
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let defaults = accessibility_core::video::RecordingConfig::default();
+    let config = accessibility_core::video::RecordingConfig {
+        quality: request.quality.unwrap_or(defaults.quality),
+        max_dimension: request.max_dimension.or(defaults.max_dimension),
+        ..defaults
+    };
+
+    // Starting touches AVFoundation and the filesystem, so keep it off the
+    // async worker threads.
+    let session = Arc::clone(&state.session);
+    match tokio::task::spawn_blocking(move || session.start_recording(config)).await {
+        Ok(Ok(path)) => Json(serde_json::json!({ "path": path })).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => internal_error(anyhow::anyhow!(error)),
+    }
+}
+
+async fn stop_recording(State(state): State<AppState>) -> Response {
+    // Finalizing blocks until the writer has flushed the file's index.
+    let session = Arc::clone(&state.session);
+    match tokio::task::spawn_blocking(move || session.stop_recording()).await {
+        Ok(Ok(recording)) => Json(recording).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, error.to_string()).into_response(),
         Err(error) => internal_error(anyhow::anyhow!(error)),
     }
 }

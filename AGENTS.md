@@ -71,13 +71,13 @@ These cost real debugging time; they are not obvious from the outside.
   Reading the property without registering does not reliably work.
 
 - **Several ports share `com.apple.framebuffer.display`** (main screen plus
-  secondary planes). Register on all of them and pick the largest live surface
-  each frame; the first match is often a small overlay.
+  secondary planes). Register on all of them and pick by `displayClass`; see
+  the display-selection note under Performance.
 
 - **The framebuffer IOSurface is recycled in place.** Retaining the
   `CVPixelBuffer` does not help because the surface mutates underneath it, so
-  frames are deep-copied before going downstream. This is the main CPU cost in
-  the capture path.
+  the sink must finish with a frame, or copy it, before returning. The
+  encoder's pixel transfer is what does that copy.
 
 - **SimulatorKit moved in Xcode 27** from `Developer/Library/PrivateFrameworks`
   to `Contents/SharedFrameworks`. Both are probed.
@@ -259,6 +259,34 @@ Pick the descriptor whose state reports `displayClass == 0`, falling back to
 the largest live surface. A booted iPhone exposes two framebuffer descriptors,
 classes 0 and 1; largest-area happens to pick correctly but is a heuristic
 standing in for a value the API actually reports.
+
+## Recording
+
+`start_recording` runs a **second, independent encode** of the same frames
+rather than retuning the streaming encoder. That is what lets a recording use
+B-frames: the live path cannot, because WebRTC's payloader and the raw stream
+framing both assume the encoder emits frames in submission order. It also lets
+a recording have its own resolution and quality regardless of what the viewer
+is watching.
+
+`AVAssetWriter` does the encoding and the muxing. Feeding it pixel buffers
+through an `AVAssetWriterInputPixelBufferAdaptor`, rather than encoding
+ourselves and appending sample buffers, avoids having to order decode and
+presentation timestamps by hand — which is precisely what B-frames complicate.
+
+Verify a recording really is what it claims to be:
+
+```sh
+ffprobe -v error -select_streams v:0 -show_entries frame=pict_type \
+  -of csv=p=0 -read_intervals "%+#120" recording.mp4
+```
+
+Expect a mix of `I`, `P` and `B`. All `I` and `P` means frame reordering
+silently failed to take.
+
+Timestamps are wall-clock elapsed at nanosecond timescale, so the variable
+capture rate is recorded at the speed it actually happened. Finalizing blocks
+until the writer flushes: an MP4 has no playable index until then.
 
 ## Browser video gotcha
 

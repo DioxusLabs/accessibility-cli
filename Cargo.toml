@@ -48,6 +48,15 @@ imageproc = "0.25"
 keyboard-types = "0.7"
 libc = "0.2"
 objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", features = [
+    "AVAssetWriter",
+    "AVAssetWriterInput",
+    "AVMediaFormat",
+    "AVVideoSettings",
+    "objc2-core-media",
+    "objc2-core-video",
+    "block2",
+] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase", "CFCGTypes"] }
 objc2-core-media = { version = "0.3", features = [
     "CMSampleBuffer",

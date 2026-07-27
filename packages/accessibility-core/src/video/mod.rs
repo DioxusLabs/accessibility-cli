@@ -140,6 +140,38 @@ impl Default for VideoConfig {
 /// interactive streaming, a stale frame is worth less than a fresh one.
 pub type FrameSink = Arc<dyn Fn(EncodedFrame) + Send + Sync>;
 
+/// Settings for a screen recording.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordingConfig {
+    /// Quality from 0 to 1.
+    pub quality: f64,
+    /// Longest edge of the recording; `None` records at capture resolution.
+    pub max_dimension: Option<u32>,
+    pub keyframe_interval_secs: u32,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            quality: 0.8,
+            // Recordings are watched rather than previewed in a corner, so
+            // they get more pixels than the live stream.
+            max_dimension: Some(1920),
+            keyframe_interval_secs: 4,
+        }
+    }
+}
+
+/// A finished recording.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Recording {
+    pub path: std::path::PathBuf,
+    pub frames: u64,
+    pub duration_secs: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A running video capture session.
 ///
 /// `Sync` is required because a session is shared across every connected
@@ -162,6 +194,29 @@ pub trait VideoCapture: Send + Sync {
 
     /// Stop capturing and release platform resources.
     fn stop(&mut self);
+
+    /// Begin recording to a file.
+    ///
+    /// Independent of the live stream: a recording encodes separately so it
+    /// can use settings — B-frames above all — that would break consumers of
+    /// the live stream.
+    fn start_recording(
+        &self,
+        _path: &std::path::Path,
+        _config: &RecordingConfig,
+    ) -> Result<()> {
+        anyhow::bail!("Recording is not supported on this platform")
+    }
+
+    /// Stop recording and finalize the file.
+    fn stop_recording(&self) -> Result<Recording> {
+        anyhow::bail!("Recording is not supported on this platform")
+    }
+
+    /// Frames written so far, or `None` when nothing is being recorded.
+    fn recording_frames(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Error returned by platforms without a video backend.
