@@ -139,8 +139,11 @@ Two more things worth knowing before debugging the picker:
   it paints over the whole device. They are filtered out rather than drawn.
 - The tree is app-scoped and the hit test is display-scoped, so the status bar
   appears in hit tests but never in `get_tree`.
-- Safari web content is in a separate process and simply is not in the tree.
-  See `docs/ios-safari-web-content-accessibility.md`.
+- Web content is not in the tree, but hit testing *does* reach it.
+  `objectAtPoint:` resolves elements inside a `WKWebView` while `get_tree`
+  returns only the host app's chrome, and there is no hierarchy to traverse
+  from either end. Applies to Safari and to any embedded web view.
+  See `docs/WEB_CONTENT_ACCESSIBILITY_PLAN.md`.
 
 ## Device settings
 

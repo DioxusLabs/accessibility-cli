@@ -74,14 +74,16 @@ does find it. The hybrid picker papers over this — hover preview misses those
 elements, the confirming hit test catches them — but a tree-only consumer will
 not see them.
 
-### Safari web content is not in the accessibility tree
+### Web content is missing from the tree, but hit testing does reach it
 
-Not a picker bug and not fixable from here. Web content lives in a separate
-WebContent process and `AXPTranslator` only returns Safari's own toolbar, so a
-web page shows six elements no matter how rich it is. See
-`docs/ios-safari-web-content-accessibility.md`; idb reaches it through
-SimulatorBridge over Distributed Objects, which is a separate mechanism from
-the one used here. Test the picker against native apps.
+Corrects an earlier note here that called this unfixable. Measured: the
+element picker works fine on web content — `objectAtPoint:` resolves links,
+buttons and text inside a `WKWebView` — while `get_tree` returns only the
+host app's own chrome. There is no hierarchy to walk in either direction.
+
+So picking works and every tree-based tool is blind, which matters most for
+hybrid apps (Capacitor, Cordova, React Native `WebView`) where the web view is
+most of the UI. See `docs/WEB_CONTENT_ACCESSIBILITY_PLAN.md`.
 
 ## Known limitations, probably fine
 
