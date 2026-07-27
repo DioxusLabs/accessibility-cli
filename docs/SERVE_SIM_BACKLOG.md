@@ -5,41 +5,6 @@ not by effort. Stream quality and performance are being worked separately.
 
 ## Broken
 
-### Text input types the wrong characters entirely
-
-Worse than first thought, and now measured. Two independent bugs.
-
-**1. The keycode space is wrong.** Our map uses HIToolbox virtual keycodes,
-but `IndigoHIDMessageForKeyboardArbitrary` takes **USB HID usage codes**.
-Sending `0, 11, 8` — our codes for `abc` — into Safari's address bar produced
-**`he`**, which is exactly what those values mean as USB HID usages (`0` is
-reserved and does nothing, `11` is `h`, `8` is `e`). So keyboard input has
-never worked; it silently types different letters.
-
-Note that idb's own comment in `FBSimulatorIndigoHID.swift:68` claims the
-keycodes are "'Hardware Independent' as described in `<HIToolbox/Events.h>`"
-and is wrong — their Python layer correctly uses USB HID usages.
-
-**2. No modifiers**, so no capitals and no shifted symbols. `@`, `?` and `:`
-are dropped, `T` and `E` silently lowercase.
-
-The fix, following idb (`idb/common/hid.py:102-254`):
-
-- Switch to USB HID usage codes: `a`-`z` are `4`-`29`, `1`-`9` are `30`-`38`,
-  `0` is `39`, Return `40`, Escape `41`, Backspace `42`, Tab `43`, Space `44`.
-- Model modifiers as ordinary key events held around the target key: Left
-  Shift `225`, Control `224`, Option `226`, Command `227`. Order is modifiers
-  down, key down, key up, modifiers up in reverse.
-- Port their US-ASCII table wholesale and error on unmappable characters
-  rather than dropping them silently. idb has no Unicode or emoji support and
-  no layout awareness either; do not claim more than is delivered.
-
-For arbitrary Unicode a pasteboard + Cmd-V path is still attractive, but note
-that `SimDevicePasteboard` was removed after Xcode 26.2 and replaced by
-`SimPasteboardPlus` (Xcode 26.6+), which is push/pull against a host
-`NSPasteboard` rather than one-shot get/set. idb has headers for both and
-implements neither.
-
 ### Xcode 27 will silently break keyboard input
 
 On Xcode 27 / CoreSimulator 1155.4+, an active `dtuhidd` disconnects the
@@ -107,17 +72,6 @@ does find it. The hybrid picker papers over this — hover preview misses those
 elements, the confirming hit test catches them — but a tree-only consumer will
 not see them.
 
-### Web content is missing from the tree, but hit testing does reach it
-
-Corrects an earlier note here that called this unfixable. Measured: the
-element picker works fine on web content — `objectAtPoint:` resolves links,
-buttons and text inside a `WKWebView` — while `get_tree` returns only the
-host app's own chrome. There is no hierarchy to walk in either direction.
-
-So picking works and every tree-based tool is blind, which matters most for
-hybrid apps (Capacitor, Cordova, React Native `WebView`) where the web view is
-most of the UI. See `docs/WEB_CONTENT_ACCESSIBILITY_PLAN.md`.
-
 ## Known limitations, probably fine
 
 - Landscape left vs right cannot be detected, only landscape vs portrait, so
@@ -129,11 +83,23 @@ most of the UI. See `docs/WEB_CONTENT_ACCESSIBILITY_PLAN.md`.
 - No auth on the input socket. Loopback by default, so `--bind 0.0.0.0`
   currently exposes an unauthenticated control channel.
 
+## Done since this list was written
+
+- **Text input.** Was typing the wrong characters entirely: Indigo takes USB
+  HID usages, not HIToolbox keycodes. Fixed, with modifiers, and verified by
+  typing `Test@Example.com?` verbatim on device.
+- **Web content discovery.** `?scan=true` sweeps what the tree walk cannot
+  explain. A Safari page goes from 5 elements at 4% coverage to 15 at 50%.
+- **Frame copy and display selection.** `VTPixelTransferSession` replaced the
+  memcpy; the main display is chosen by `displayClass`.
+
 ## Verified working, do not re-litigate
 
 - Multi-viewer including late join: a second viewer joining mid-stream gets
   its own parameter set and an immediate keyframe.
 - Idle cost with zero viewers: 0.4% of a core idle, ~8% while animating.
   Gating encode on subscriber count is not worth it.
-- The per-frame `memcpy` is not the bottleneck; a Metal blit measured slower.
-  See the note in `pixel_buffer.rs`.
+- A plain GPU blit is slower than `memcpy` for a bare copy. The pixel
+  transfer that replaced it wins by doing the conversion and scale too.
+- Constant-quality rate control is ignored under low-latency rate control;
+  measured, the knob does nothing.
