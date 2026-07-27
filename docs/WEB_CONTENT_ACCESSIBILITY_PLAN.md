@@ -3,7 +3,11 @@
 Plan for exposing `WKWebView` and Safari content, which the ordinary tree walk
 cannot see.
 
-## What was measured
+Settled by reading idb's source rather than guessing: Meta hit this exact
+problem, and the approach they landed on is grid-based hit testing. Details and
+citations below.
+
+## What was measured here
 
 Against a booted iPhone 17 running a probe page with a heading, link, button,
 text field and paragraph.
@@ -27,22 +31,17 @@ from a hit-test result gives one node at any depth. Climbing
 individually addressable but not enumerable.
 
 **Hit tests are cheap**: 3.2 ms median, 4.0 ms p90, measured over HTTP
-including the round trip. That is the number that makes option A viable.
+including the round trip.
 
 ## How this affects WebView apps
 
 Identically, and this matters more than the Safari case.
 
 Safari's content area *is* a `WKWebView` backed by a separate WebContent
-process. An app embedding `WKWebView` gets exactly the same architecture —
-there is no in-process mode. So the measurements above apply unchanged to:
-
-- React Native `WebView`
-- Capacitor and Cordova apps, which are almost entirely web content
-- in-app browsers and `SFSafariViewController`
-- any native app with an embedded `WKWebView`
-
-The practical consequences, in order of how much they hurt:
+process. An app embedding `WKWebView` gets the same architecture — there is no
+in-process mode. So the measurements above apply unchanged to React Native
+`WebView`, Capacitor and Cordova apps, in-app browsers,
+`SFSafariViewController`, and any embedded web view.
 
 | capability | native UI | web content |
 |---|---|---|
@@ -52,77 +51,120 @@ The practical consequences, in order of how much they hurt:
 | CSS-like selectors, `--click`, `--query` | works | **blind** |
 | tapping by coordinate | works | works |
 
-So a hybrid app is drivable by an agent that can see the screen, and invisible
-to one that reasons over the tree. For a Capacitor app that means essentially
-the whole UI is missing from every tree-based tool, while the element picker in
-the browser works fine.
+A hybrid app is therefore drivable by an agent that can see the screen, and
+invisible to one that reasons over the tree. For a Capacitor app that is
+essentially the whole UI.
 
-## Options
+## What idb does, and what that settles
 
-### A. Bounds-guided hit-test sweep
+Read from a clone of idb at `~/Dev/idb`.
 
-Enumerate by probing. Start at the top-left of the web area, hit test, record
-the element and its bounds, then step past its right edge and repeat; at the
-end of a row, step down past the shortest element in it. Because every probe
-returns the element's full bounds, the walk is roughly O(number of elements)
-rather than O(area).
+### SimulatorBridge is dead — they deleted it
 
-- **Cost**: a page with ~40 elements needs perhaps 60-150 probes, so 0.2-0.5 s
-  at the measured 3.2 ms. Fine on demand, fine as a background refresh, too
-  slow per-hover.
-- **Pros**: uses a primitive already proven to work, no new dependencies, and
-  it fixes *any* out-of-process content, not just WebKit.
-- **Cons**: it is sampling. Elements smaller than the step are missed,
-  fully-occluded elements are unreachable by construction, and the result is a
-  flat list with no parent/child structure or document order — so selectors
-  like "the third row in this section" remain impossible.
-- **Mitigation**: refine adaptively, probing denser inside regions where the
-  returned bounds are small.
+`accessibilityElementsWithDisplayId:` exists **only** in
+`PrivateHeaders/SimulatorBridge/SimulatorBridge-Protocol.h:19`. Nothing in idb
+calls it. `git log -S accessibilityElementsWithDisplayId` tells the whole
+story:
 
-### B. SimulatorBridge over Distributed Objects
+    d821fc904 Add SimulatorBridge Headers
+    a12a016b2 Add Accessiblity Elements API for Simulators
+    276435588 Delete FBSimulatorBridge
 
-What idb uses. A bridge process runs *inside* the simulator and
-`accessibilityElementsWithDisplayId:` returns every element as JSON in one
-call, from inside the simulated OS rather than across the host boundary.
+The only surviving trace is the output *format*, kept for compatibility —
+`FBSimulatorAccessibilitySerializer.swift:78` notes the values "mirror the old
+SimulatorBridge implementation for downstream compatibility". `SimulatorBridge`
+is otherwise referenced only to restart `com.apple.CoreSimulator.bridge` as
+SpringBoard-crash remediation, which we already do.
 
-- **Unverified, and this is the crux.** It is not established that
-  SimulatorBridge sees web content either; it may sit on the same
-  AXPTranslator plumbing and inherit the same blindness. Nothing should be
-  built here until that is answered.
-- **Pros, if it works**: one call, full hierarchy, correct ordering — strictly
-  better than sampling.
-- **Cons**: a much larger lift. Distributed Objects connection, bridge
-  lifecycle and versioning, and a dependency on a private service whose shape
-  changes between Xcode releases.
+**So option B is dead.** Had we built it, we would have reimplemented
+something its own authors removed.
 
-### C. Talk to WebKit's accessibility directly
+### idb's current mechanism is the same as ours
 
-VoiceOver reads web content on a real device, so the information is reachable
-in principle; WebKit vends it through remote element tokens. This is the
-deepest option and the least charted. Not worth considering unless both A and
-B fail.
+`FBSimulatorAccessibilityCommands.swift:114`:
 
-## Recommended order
+```swift
+// Uses the CoreSimulator accessibility API via
+// -[SimDevice sendAccessibilityRequestAsync:completionQueue:completionHandler:].
+```
 
-1. **Answer B with a 30-minute experiment, before writing any code.**
-   `brew install idb-companion`, put the probe page on screen, run
-   `idb ui describe-all`, and look for `Probe Link Alpha`. If it appears,
-   SimulatorBridge sees web content and option B is worth the work. If it does
-   not, B is dead and the choice is made for us.
-2. **Ship the cheap inspector win regardless.** Picking already works on web
-   content; only the instant hover preview is missing because it reads the
-   cached tree. Caching hit-test results as the pointer moves builds up a local
-   map for free and makes web areas feel the same as native ones. Small, self
-   contained, no dependency on the outcome of step 1.
-3. **Then implement A or B** depending on step 1, exposing it as an explicit
-   `scan` rather than something that happens on every tree fetch — a
-   half-second sweep should be opt-in.
-4. **Mark web content in the output either way.** Once elements arrive from a
-   different mechanism than the tree walk, consumers should be able to tell
-   which is which, if only to explain why ordering is missing.
+`AXPTranslator` with a `bridgeTokenDelegate`, and exactly two request kinds —
+`.frontmostApplication` and `.point(point)`. That is our implementation. It
+would inherit the identical blindness.
+
+### And they solve web content by grid hit testing
+
+`FBControlCore/Commands/FBAccessibilityRequestOptions.swift:11`:
+
+```swift
+/// Options for fetching remote process elements (e.g., WebView content).
+/// Remote elements are in separate processes and require grid-based hit-testing.
+```
+
+That is first-party confirmation that no better API exists. The implementation
+is `discoverRemoteElements` in `FBSimulatorControl/Commands/FBAXTranslationRequest.swift:160-247`,
+and it is more careful than a naive sweep in four ways worth copying:
+
+1. **A coverage grid, populated during the ordinary recursive traversal**
+   (`FBAccessibilityCoverageGrid.swift`, cell-based `markFilled` / `isFilled`).
+   Probe points that already sit on a natively-discovered element are skipped
+   entirely, so the sweep only pays for the parts of the screen the tree walk
+   could not explain.
+2. **Remote content is identified by pid.** Hits whose pid was already seen in
+   the traversal, or which belong to the frontmost app, are discarded. A
+   different pid *is* the signal that something came from another process.
+3. **Dedup by frame**, since a 50pt grid lands on a large element repeatedly.
+4. **Provenance is recorded.** Every element carries a discovery method of
+   `"recursive"` or `"point_grid"` plus an `isRemote` flag, and the response
+   reports frame coverage before and after. Consumers can tell exact results
+   from sampled ones.
+
+Defaults: `gridStepSize = 50.0` points, full-screen region, `maxPoints = 0`
+(unlimited).
+
+### Why the experiment would have misled us
+
+`remoteContentOptions` defaults to `nil`, meaning **remote content is not
+fetched unless explicitly requested**, and the option is not plumbed through
+the proto or the Python CLI at all — `grep` for `remote_content` across
+`proto/` and `idb/` returns nothing.
+
+So `idb ui describe-all` on a web page would have shown no web content, and we
+would have concluded idb could not see it either. Reading the source was the
+right call.
+
+## Plan
+
+Option A, following idb's design.
+
+1. **Build the coverage grid during the existing tree walk.** Cheap, useful on
+   its own: the coverage ratio is a direct measure of how much of the screen
+   the tree explains, which is the diagnostic that would have made this whole
+   problem obvious months earlier.
+2. **Add a sweep over uncovered regions**, skipping filled cells, filtering by
+   pid, deduping by frame. Start at a 50pt step to match idb. At the measured
+   3.2 ms per probe, a full-screen 50pt grid on a 402x874 point device is
+   ~8x17 = 136 points worst case, or ~0.44 s, and far less once covered cells
+   are skipped.
+3. **Tag provenance** — `recursive` vs `point_grid`, and a coverage figure on
+   the response. Do not let sampled results masquerade as exact ones.
+4. **Expose it as opt-in**, not as part of every `get_tree`. A `--scan` flag on
+   the CLI and a query parameter on `/api/ax/tree`.
+5. **Independently, fix the inspector's hover preview** by caching hit-test
+   results as the pointer moves. Picking already works on web content; only the
+   instant preview is missing. Smallest useful change here and unblocked by
+   everything above.
 
 ## What not to do
 
-Do not make `get_tree` transparently sweep. It would turn a fast call into a
-half-second one, and it would silently return a flat, approximate list under
-the same shape as the exact hierarchical one it returns for native apps.
+Do not make `get_tree` sweep transparently. It would turn a fast call into a
+half-second one and silently return a flat, approximate list under the same
+shape as the exact hierarchy returned for native apps.
+
+Do not implement SimulatorBridge. See above.
+
+## Remaining unknown
+
+Whether a 50pt grid is right for phone-sized screens, and whether adaptive
+refinement (denser probing where returned frames are small) is worth it. idb
+ships a fixed step, which is evidence that fixed is good enough.
