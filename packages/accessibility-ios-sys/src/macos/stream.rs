@@ -35,7 +35,7 @@ impl SimVideoStream {
         let mut framebuffer = SimFramebuffer::new(udid)?;
         let force_keyframe = Arc::new(AtomicBool::new(false));
 
-        let mut encoder = H264Encoder::new(config, Arc::clone(&force_keyframe), sink);
+        let mut encoder = H264Encoder::new(config, Arc::clone(&force_keyframe), sink)?;
         framebuffer.set_sink(Some(Box::new(move |frame| {
             // `CVPixelBuffer` derefs to `CVImageBuffer`, which is what
             // VideoToolbox wants.

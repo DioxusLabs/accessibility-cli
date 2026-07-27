@@ -123,6 +123,18 @@ and every gesture just becomes an ordinary drag. The same edge must be
 supplied for every event in the gesture, and the edge is in *raw* framebuffer
 space, so it rotates with the device.
 
+## Reaching web content
+
+`get_tree` walks the frontmost app and so cannot see anything in another
+process; a Safari page reports five elements of chrome. Hit testing *does*
+cross that boundary, so `?scan=true` marks everything the tree walk explained
+on a coverage grid and then probes the cells left over. On a real page that
+takes 5 elements at 4% coverage to 15 at 50%, using 114 probes in under half a
+second.
+
+Swept elements are tagged `point_grid` rather than `recursive`: they are point
+samples with no parent, no children and no document order.
+
 ## Accessibility hit testing
 
 `objectAtPoint:` returns a platform element whose *own* translation must also
@@ -205,17 +217,33 @@ trades sharpness for bits on the assumption of a normal-sized preview.
 stretches to twenty when the device is idle at 5fps. `MaxKeyFrameIntervalDuration`
 is what actually bounds it in time; both are set.
 
-### Do not bother with a GPU frame copy
+### The frame copy is a pixel transfer, not a memcpy
 
-The per-frame framebuffer `memcpy` looks like an obvious optimization target
-and is not. Measured on a 1206x2622 surface with cache-cold sources:
+Three things must happen between the framebuffer and the encoder, and
+`VTPixelTransferSession` does all three in one hardware pass into a pooled
+buffer: copy off the recycled live surface, convert BGRA to NV12, and
+downscale.
 
-    CPU memcpy   0.377 ms/copy   33.5 GB/s
-    Metal blit   0.517 ms/copy   24.5 GB/s
+Note this does not contradict the earlier finding that a plain Metal blit was
+*slower* than `memcpy` (0.517 ms against 0.377 ms on a cache-cold 12.1 MB
+surface). That measured a bare copy doing one job against a purpose-built
+transfer doing three; the transfer also removes the BGRA-to-NV12 conversion
+that `VTCompressionSession` would otherwise do internally.
 
-A GPU blit is *slower*, because command buffer submission plus the
-`waitUntilCompleted` round trip costs more than the copy saves on unified
-memory. At 60fps the copy is ~23 ms/s, about 2% of one core.
+### Constant-quality rate control does not work here
+
+`kVTCompressionPropertyKey_Quality` is ignored when
+`EnableLowLatencyRateControl` is set. Measured: quality 1.0 gave 0.0221 bpp
+and quality 0.4 gave 0.0223 — the knob does nothing. Low latency is worth more
+to an interactive stream than constant quality, so the encoder targets a
+bitrate derived from the encode resolution instead.
+
+### Main display selection
+
+Pick the descriptor whose state reports `displayClass == 0`, falling back to
+the largest live surface. A booted iPhone exposes two framebuffer descriptors,
+classes 0 and 1; largest-area happens to pick correctly but is a heuristic
+standing in for a value the API actually reports.
 
 ## Browser video gotcha
 

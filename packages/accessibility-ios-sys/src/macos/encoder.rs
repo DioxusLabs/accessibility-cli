@@ -25,10 +25,10 @@ use objc2_core_media::{
     CMSampleBuffer, CMTime, CMVideoCodecType, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
     kCMTimeInvalid,
 };
-use objc2_core_video::CVImageBuffer;
+use objc2_core_video::{CVImageBuffer, CVPixelBuffer};
 use objc2_video_toolbox::{VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty};
 
-use super::pixel_buffer::cf_dict;
+use super::pixel_buffer::{PixelTransfer, cf_dict};
 
 /// `avc1` — H.264 in a `CMVideoCodecType`.
 const CODEC_H264: CMVideoCodecType = 0x6176_6331;
@@ -82,6 +82,12 @@ const DEFAULT_MAX_DIMENSION: u32 = 1280;
 pub struct EncoderConfig {
     pub fps: u32,
     /// Explicit bitrate, or `None` to derive one from the encode resolution.
+    ///
+    /// Constant-quality rate control was tried here and does not work: with
+    /// `EnableLowLatencyRateControl` the `Quality` property is ignored
+    /// outright, measured at 0.0221 bpp for quality 1.0 against 0.0223 for
+    /// quality 0.4. Low latency matters more to an interactive stream than
+    /// constant quality, so bitrate it is.
     pub bitrate: Option<u32>,
     /// Longest edge of the encoded video. The source is scaled down to fit.
     pub max_dimension: Option<u32>,
@@ -150,6 +156,8 @@ pub struct H264Encoder {
     force_keyframe: Arc<AtomicBool>,
     /// Whether the `avcC` record for the current session has been emitted.
     emitted_parameter_set: Arc<Mutex<bool>>,
+    /// Copies, converts and scales each frame before it is encoded.
+    transfer: PixelTransfer,
     sink: ChunkSink,
 }
 
@@ -158,8 +166,13 @@ pub struct H264Encoder {
 unsafe impl Send for H264Encoder {}
 
 impl H264Encoder {
-    pub fn new(config: EncoderConfig, force_keyframe: Arc<AtomicBool>, sink: ChunkSink) -> Self {
-        Self {
+    pub fn new(
+        config: EncoderConfig,
+        force_keyframe: Arc<AtomicBool>,
+        sink: ChunkSink,
+    ) -> Result<Self> {
+        Ok(Self {
+            transfer: PixelTransfer::new()?,
             session: None,
             config,
             source_dimensions: (0, 0),
@@ -168,7 +181,7 @@ impl H264Encoder {
             force_keyframe,
             emitted_parameter_set: Arc::new(Mutex::new(false)),
             sink,
-        }
+        })
     }
 
     /// Encode one frame, rebuilding the session if the source resized.
@@ -181,6 +194,17 @@ impl H264Encoder {
             self.dimensions = self.config.encode_size(width, height);
             self.rebuild_session()?;
         }
+
+        // One hardware pass does the copy off the live framebuffer, the BGRA
+        // to NV12 conversion, and the downscale. Synchronous, so by the time
+        // it returns the encoder owns pixels the simulator cannot overwrite.
+        let (target_width, target_height) = self.dimensions;
+        let source: &CVPixelBuffer = image;
+        let prepared =
+            self.transfer
+                .transfer(source, target_width as usize, target_height as usize)?;
+        let image: &CVImageBuffer = &prepared;
+
         let session = self.session.as_ref().expect("session built above");
 
         let force = self.force_keyframe.swap(false, Ordering::Relaxed);

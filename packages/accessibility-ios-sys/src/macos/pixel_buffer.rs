@@ -1,25 +1,23 @@
-//! Pooled deep copies of live framebuffer pixel buffers.
+//! Preparing captured frames for the encoder.
 //!
-//! SimulatorKit hands out a `CVPixelBuffer` that wraps its own framebuffer
-//! `IOSurface`, and it recycles that surface in place. Retaining the pixel
-//! buffer does not help, because the *surface* mutates underneath it. Since
-//! VideoToolbox encodes asynchronously, anything downstream must own its own
-//! copy or it will encode torn frames.
+//! Three things have to happen between SimulatorKit's framebuffer and
+//! VideoToolbox, and they are all the same operation:
 //!
-//! The copy is a straightforward row-wise `memcpy` into a size-keyed
-//! `CVPixelBufferPool`.
+//! 1. **Copy.** SimulatorKit recycles its framebuffer `IOSurface` in place, and
+//!    VideoToolbox encodes asynchronously, so the encoder must not be reading
+//!    the live surface.
+//! 2. **Convert.** The framebuffer is BGRA; H.264 encoders want NV12. Handing
+//!    BGRA to `VTCompressionSession` makes it convert internally anyway.
+//! 3. **Scale.** A phone framebuffer is far larger than anyone views it at.
 //!
-//! This looks like an obvious target for a GPU blit, and it isn't. Both
-//! surfaces are IOSurface-backed, so they can be wrapped as `MTLTexture`s and
-//! copied with a blit encoder — but that was measured at **0.517 ms/frame
-//! against 0.377 ms for the `memcpy`** on an iPhone 17 surface (1206x2622,
-//! 12.1 MB), with cache-cold sources. Command buffer submission plus the
-//! `waitUntilCompleted` round trip costs more than the copy saves, because
-//! unified memory already gives the CPU path ~34 GB/s.
+//! `VTPixelTransferSession` does all three in one hardware pass into a pooled
+//! buffer, which is why there is no CPU copy here any more. The previous
+//! implementation did a row-wise `memcpy` and left conversion and scaling to
+//! the encoder.
 //!
-//! At 60fps the `memcpy` is ~23 ms/s, or about 2% of one core. It is not worth
-//! optimizing, and the GPU version was slower and more complex. Measure before
-//! trying again.
+//! Note this does not contradict the earlier finding that a plain Metal blit
+//! was slower than `memcpy`: that measured a bare copy doing one job against a
+//! purpose-built transfer doing three.
 
 use std::ptr::NonNull;
 
@@ -28,12 +26,11 @@ use objc2_core_foundation::{
     CFDictionary, CFNumber, CFRetained, CFString, CFType, kCFAllocatorDefault,
 };
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
-    kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey,
-    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferPool, kCVPixelBufferHeightKey,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
+use objc2_video_toolbox::VTPixelTransferSession;
 
 /// Build an untyped `CFDictionary` from `CFString` keys to arbitrary CF values.
 pub(super) fn cf_dict(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
@@ -51,30 +48,47 @@ pub(super) fn cf_dict_u32(key: &CFString, value: u32) -> CFRetained<CFDictionary
     cf_dict(&[(key, number.as_ref())])
 }
 
-/// Reusable pool of BGRA pixel buffers, rebuilt whenever the source resizes.
-pub(super) struct Photocopier {
+/// Copies, converts and scales frames on the way to the encoder.
+pub(super) struct PixelTransfer {
+    session: CFRetained<VTPixelTransferSession>,
     pool: Option<CFRetained<CVPixelBufferPool>>,
+    /// Output size the current pool was built for.
     dimensions: (usize, usize),
 }
 
-// The pool is only ever touched behind the capture state's mutex, which
-// serializes the capture queue against the idle timer.
-unsafe impl Send for Photocopier {}
+// The session and pool are only touched behind the capture state's mutex,
+// which serializes the capture queue against the idle timer.
+unsafe impl Send for PixelTransfer {}
 
-impl Photocopier {
-    pub(super) fn new() -> Self {
-        Self {
+impl PixelTransfer {
+    pub(super) fn new() -> Result<Self> {
+        let mut out: *mut VTPixelTransferSession = std::ptr::null_mut();
+        let status =
+            unsafe { VTPixelTransferSession::create(kCFAllocatorDefault, NonNull::from(&mut out)) };
+        let session = NonNull::new(out)
+            .filter(|_| status == 0)
+            .map(|p| unsafe { CFRetained::from_raw(p) })
+            .ok_or_else(|| anyhow!("VTPixelTransferSessionCreate failed: {status}"))?;
+
+        Ok(Self {
+            session,
             pool: None,
             dimensions: (0, 0),
-        }
+        })
     }
 
-    /// Deep-copy `source` into a pooled buffer of the same size.
-    pub(super) fn copy(&mut self, source: &CVPixelBuffer) -> Result<CFRetained<CVPixelBuffer>> {
-        let width = CVPixelBufferGetWidth(source);
-        let height = CVPixelBufferGetHeight(source);
+    /// Produce an NV12 copy of `source` at the requested size.
+    ///
+    /// The returned buffer is independent of the source, so the caller may
+    /// hand it to an asynchronous encoder.
+    pub(super) fn transfer(
+        &mut self,
+        source: &CVPixelBuffer,
+        width: usize,
+        height: usize,
+    ) -> Result<CFRetained<CVPixelBuffer>> {
         if width == 0 || height == 0 {
-            return Err(anyhow!("Source pixel buffer has zero extent"));
+            return Err(anyhow!("Target size is empty"));
         }
 
         if self.pool.is_none() || self.dimensions != (width, height) {
@@ -96,46 +110,19 @@ impl Photocopier {
             .map(|p| unsafe { CFRetained::from_raw(p) })
             .ok_or_else(|| anyhow!("CVPixelBufferPoolCreatePixelBuffer failed: {status}"))?;
 
-        unsafe {
-            CVPixelBufferLockBaseAddress(source, CVPixelBufferLockFlags::ReadOnly);
-            CVPixelBufferLockBaseAddress(&destination, CVPixelBufferLockFlags::empty());
+        let status = unsafe { self.session.transfer_image(source, &destination) };
+        if status != 0 {
+            return Err(anyhow!(
+                "VTPixelTransferSessionTransferImage failed: {status}"
+            ));
         }
-
-        let result = (|| {
-            let src_base = CVPixelBufferGetBaseAddress(source);
-            let dst_base = CVPixelBufferGetBaseAddress(&destination);
-            if src_base.is_null() || dst_base.is_null() {
-                return Err(anyhow!("Pixel buffer base address unavailable"));
-            }
-
-            let src_stride = CVPixelBufferGetBytesPerRow(source);
-            let dst_stride = CVPixelBufferGetBytesPerRow(&destination);
-            let row_bytes = src_stride.min(dst_stride);
-
-            for row in 0..height {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (src_base as *const u8).add(row * src_stride),
-                        (dst_base as *mut u8).add(row * dst_stride),
-                        row_bytes,
-                    );
-                }
-            }
-            Ok(())
-        })();
-
-        unsafe {
-            CVPixelBufferUnlockBaseAddress(&destination, CVPixelBufferLockFlags::empty());
-            CVPixelBufferUnlockBaseAddress(source, CVPixelBufferLockFlags::ReadOnly);
-        }
-
-        result.map(|()| destination)
+        Ok(destination)
     }
 }
 
-/// Create an IOSurface-backed BGRA pool at the given size.
+/// Create an IOSurface-backed NV12 pool at the given size.
 fn build_pool(width: usize, height: usize) -> Result<CFRetained<CVPixelBufferPool>> {
-    let format = CFNumber::new_i32(kCVPixelFormatType_32BGRA as i32);
+    let format = CFNumber::new_i32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange as i32);
     let width_num = CFNumber::new_i32(width as i32);
     let height_num = CFNumber::new_i32(height as i32);
     // An empty IOSurface-properties dictionary is the documented way to ask for

@@ -63,10 +63,11 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(1000));
         let stats = stream.stats();
         println!(
-            "frames={} {}x{} keyframes={} deltas={} kb={}",
+            "frames={} {}x{} classes={:?} keyframes={} deltas={} kb={}",
             stats.frame_count,
             stats.width,
             stats.height,
+            stats.display_classes,
             keyframes.load(Ordering::Relaxed),
             deltas.load(Ordering::Relaxed),
             bytes.load(Ordering::Relaxed) / 1024,

@@ -90,6 +90,16 @@ pub(super) unsafe fn send_void_with_id(
     unsafe { imp(receiver, selector, argument) }
 }
 
+/// Send a zero-argument message returning an unsigned short.
+pub(super) unsafe fn send_u16(receiver: *mut AnyObject, selector: Sel) -> u16 {
+    if receiver.is_null() {
+        return 0;
+    }
+    type Imp = unsafe extern "C" fn(*mut AnyObject, Sel) -> u16;
+    let imp: Imp = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as *const c_void) };
+    unsafe { imp(receiver, selector) }
+}
+
 /// Whether `receiver` will handle `selector`, including via forwarding.
 pub(super) unsafe fn responds_to(receiver: *mut AnyObject, selector: Sel) -> bool {
     if receiver.is_null() {

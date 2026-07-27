@@ -42,9 +42,10 @@ use objc2_io_surface::IOSurfaceRef;
 
 use super::common::find_booted_device;
 use super::dynamic::{
-    responds_to, send_id, send_id_with_id, send_register_screen_callbacks, send_void_with_id,
+    responds_to, send_id, send_id_with_id, send_register_screen_callbacks, send_u16,
+    send_void_with_id,
 };
-use super::pixel_buffer::{Photocopier, cf_dict_u32};
+use super::pixel_buffer::cf_dict_u32;
 use super::void_block::VoidBlock;
 
 /// Port identifier for the simulator's main display framebuffer.
@@ -69,6 +70,9 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(200);
 const REWIRE_TICKS: u64 = 5;
 
 /// A frame handed to the sink, valid only for the duration of the call.
+///
+/// The pixel buffer wraps SimulatorKit's live framebuffer surface, which is
+/// recycled in place. Anything retaining it past the call must copy first.
 pub struct CapturedFrame<'a> {
     pub pixel_buffer: &'a CVPixelBuffer,
     pub width: u32,
@@ -79,13 +83,15 @@ pub struct CapturedFrame<'a> {
 /// Sink invoked on the capture queue for every accepted frame.
 pub type FrameSink = Box<dyn FnMut(CapturedFrame<'_>) + Send + 'static>;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FramebufferStats {
     pub frame_count: u64,
     pub width: u32,
     pub height: u32,
     pub descriptor_count: usize,
     pub rewire_count: u64,
+    /// `displayClass` of each registered descriptor, for diagnostics.
+    pub display_classes: Vec<Option<u16>>,
 }
 
 /// Wrapper making a raw Objective-C pointer movable across threads.
@@ -109,6 +115,9 @@ struct Registration {
     uuid: Retained<NSUUID>,
     /// Last `IOSurfaceGetSeed` observed, used to skip unchanged repaints.
     last_seed: Option<u32>,
+    /// `displayClass` from the descriptor's state. iOS reports the main
+    /// display as 0; anything else is a secondary display or plane.
+    display_class: Option<u16>,
 }
 
 /// State shared between the capture queue, the idle timer, and the owner.
@@ -124,7 +133,6 @@ struct CaptureState {
     /// Dropping them early is a use-after-free, not a clean failure, so they
     /// are held until the matching unregister call.
     blocks: Mutex<Vec<VoidBlock>>,
-    photocopier: Mutex<Photocopier>,
     sink: Mutex<Option<FrameSink>>,
     last_capture: Mutex<Instant>,
     frame_count: AtomicU64,
@@ -136,20 +144,35 @@ struct CaptureState {
 
 impl CaptureState {
     fn stats(&self) -> FramebufferStats {
+        // Lock once and finish with it. Two `lock()` calls inside one struct
+        // expression would deadlock: the temporary guard from the first lives
+        // until the end of the whole expression, so the second waits on it.
+        let registrations = self.registrations.lock().unwrap();
+        let descriptor_count = registrations.len();
+        let display_classes = registrations
+            .iter()
+            .map(|registration| registration.display_class)
+            .collect();
+        drop(registrations);
+
         FramebufferStats {
             frame_count: self.frame_count.load(Ordering::Relaxed),
             width: self.width.load(Ordering::Relaxed) as u32,
             height: self.height.load(Ordering::Relaxed) as u32,
-            descriptor_count: self.registrations.lock().unwrap().len(),
+            descriptor_count,
             rewire_count: self.rewire_count.load(Ordering::Relaxed),
+            display_classes,
         }
     }
 
-    /// Choose the descriptor whose live surface currently has the largest area.
+    /// Choose which descriptor to capture from.
     ///
-    /// Secondary planes share the framebuffer port identifier, so picking the
-    /// first match would frequently land on a tiny overlay instead of the
-    /// actual screen.
+    /// iOS reports the main display as `displayClass == 0`, so prefer that.
+    /// Several descriptors share the framebuffer port identifier — secondary
+    /// displays and planes — and the class is the value the API actually
+    /// provides for telling them apart. Largest live area remains the
+    /// fallback for descriptors that do not report a class, and for platforms
+    /// like tvOS that render on a non-zero class.
     fn pick_best_surface(&self) -> Option<(usize, CFRetained<IOSurfaceRef>)> {
         let registrations = self.registrations.lock().unwrap();
         let mut best: Option<(usize, CFRetained<IOSurfaceRef>, usize)> = None;
@@ -162,6 +185,9 @@ impl CaptureState {
             let area = surface.width() * surface.height();
             if area == 0 {
                 continue;
+            }
+            if registration.display_class == Some(0) {
+                return Some((index, surface));
             }
             if best
                 .as_ref()
@@ -210,25 +236,17 @@ impl CaptureState {
 
         *self.last_capture.lock().unwrap() = Instant::now();
 
-        // SimulatorKit recycles this IOSurface in place while VideoToolbox
-        // encodes asynchronously, so the surface must be deep-copied before it
-        // is handed downstream or we hand out torn frames.
-        let copy = {
-            let mut photocopier = self.photocopier.lock().unwrap();
-            match photocopier.copy(&live) {
-                Ok(copy) => copy,
-                Err(_) => return,
-            }
-        };
-
         self.frame_count.fetch_add(1, Ordering::Relaxed);
 
+        // Handed out live. SimulatorKit recycles this surface in place, so the
+        // sink must finish with it — or take its own copy — before returning;
+        // the encoder's pixel transfer is what does that.
         let mut sink = self.sink.lock().unwrap();
         if let Some(sink) = sink.as_mut() {
             sink(CapturedFrame {
-                pixel_buffer: &copy,
-                width: CVPixelBufferGetWidth(&copy) as u32,
-                height: CVPixelBufferGetHeight(&copy) as u32,
+                pixel_buffer: &live,
+                width: CVPixelBufferGetWidth(&live) as u32,
+                height: CVPixelBufferGetHeight(&live) as u32,
                 captured_at: Instant::now(),
             });
         }
@@ -287,6 +305,7 @@ impl CaptureState {
                 descriptor: ObjcPtr(descriptor),
                 uuid,
                 last_seed: None,
+                display_class: unsafe { display_class(descriptor) },
             });
         }
 
@@ -348,7 +367,6 @@ impl SimFramebuffer {
                 ),
                 registrations: Mutex::new(Vec::new()),
                 blocks: Mutex::new(Vec::new()),
-                photocopier: Mutex::new(Photocopier::new()),
                 sink: Mutex::new(None),
                 last_capture: Mutex::new(Instant::now()),
                 frame_count: AtomicU64::new(0),
@@ -526,6 +544,23 @@ unsafe fn framebuffer_descriptors(io: *mut AnyObject) -> Result<Vec<*mut AnyObje
     }
 
     Ok(descriptors)
+}
+
+/// Read `displayClass` from a descriptor's state, if it reports one.
+///
+/// The state object is another proxied private object, so both hops go
+/// through dynamic dispatch.
+unsafe fn display_class(descriptor: *mut AnyObject) -> Option<u16> {
+    let state_selector = sel!(state);
+    if !unsafe { responds_to(descriptor, state_selector) } {
+        return None;
+    }
+    let state = unsafe { send_id(descriptor, state_selector) };
+    let class_selector = sel!(displayClass);
+    if !unsafe { responds_to(state, class_selector) } {
+        return None;
+    }
+    Some(unsafe { send_u16(state, class_selector) })
 }
 
 /// `-[NSObject description]` as a Rust string, for non-NSString identifiers.
