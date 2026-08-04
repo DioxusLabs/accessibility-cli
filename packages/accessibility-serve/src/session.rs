@@ -53,6 +53,7 @@ pub struct StatsReport {
     pub uptime_secs: f64,
     pub frames: u64,
     pub keyframes: u64,
+    pub bytes: u64,
     pub fps: f64,
     pub mbps: f64,
     pub bits_per_pixel: f64,
@@ -179,6 +180,7 @@ impl SimSession {
             uptime_secs: (elapsed * 10.0).round() / 10.0,
             frames,
             keyframes: self.stats.keyframes.load(Ordering::Relaxed),
+            bytes,
             fps: (fps * 10.0).round() / 10.0,
             mbps: ((bytes as f64 * 8.0 / elapsed / 1e6) * 100.0).round() / 100.0,
             // The headline number: anything much under 0.1 will visibly
