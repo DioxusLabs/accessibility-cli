@@ -31,5 +31,5 @@ objc2-foundation.workspace = true
 objc2-io-surface.workspace = true
 objc2-video-toolbox.workspace = true
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+[build-dependencies]
 cc = "1"
