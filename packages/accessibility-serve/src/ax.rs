@@ -233,9 +233,9 @@ fn snapshot(
     // of the tree but neither can be pointed at, and leaving them in makes the
     // client's containment search pick them constantly.
     elements.retain(|element| {
-        element
-            .bounds
-            .is_some_and(|bounds| !bounds.is_backdrop() && bounds.width > 0.0 && bounds.height > 0.0)
+        element.bounds.is_some_and(|bounds| {
+            !bounds.is_backdrop() && bounds.width > 0.0 && bounds.height > 0.0
+        })
     });
 
     // Everything the tree walk explained, so the sweep can skip it.
@@ -345,7 +345,9 @@ fn sweep(
     let mut probes = 0usize;
 
     let columns = (app_bounds.size.width / SWEEP_STEP_POINTS).floor().max(1.0) as usize;
-    let rows = (app_bounds.size.height / SWEEP_STEP_POINTS).floor().max(1.0) as usize;
+    let rows = (app_bounds.size.height / SWEEP_STEP_POINTS)
+        .floor()
+        .max(1.0) as usize;
 
     for row in 0..rows {
         for column in 0..columns {
@@ -439,15 +441,47 @@ mod tests {
     #[test]
     fn full_screen_containers_are_backdrops() {
         // Every app has these; highlighting one paints over the whole device.
-        assert!(NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.is_backdrop());
-        assert!(NormalizedRect { x: 0.0, y: 0.0, width: 0.98, height: 0.96 }.is_backdrop());
+        assert!(
+            NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0
+            }
+            .is_backdrop()
+        );
+        assert!(
+            NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.98,
+                height: 0.96
+            }
+            .is_backdrop()
+        );
     }
 
     #[test]
     fn ordinary_controls_are_not_backdrops() {
         // A full-width settings row is large but perfectly pointable.
-        assert!(!NormalizedRect { x: 0.05, y: 0.45, width: 0.90, height: 0.06 }.is_backdrop());
+        assert!(
+            !NormalizedRect {
+                x: 0.05,
+                y: 0.45,
+                width: 0.90,
+                height: 0.06
+            }
+            .is_backdrop()
+        );
         // So is a tall sidebar.
-        assert!(!NormalizedRect { x: 0.0, y: 0.0, width: 0.25, height: 1.0 }.is_backdrop());
+        assert!(
+            !NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.25,
+                height: 1.0
+            }
+            .is_backdrop()
+        );
     }
 }

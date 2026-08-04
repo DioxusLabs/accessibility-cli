@@ -11,6 +11,7 @@ use super::{
 use crate::input::{Code, Modifiers, MouseButton, parse_key_code, parse_modifiers};
 
 /// Enum holding platform-specific accessibility reader implementations.
+#[allow(clippy::large_enum_variant)]
 enum AccessibilityReaderImpl {
     #[cfg(target_os = "macos")]
     MacOS(crate::platform::macos::MacOSAccessibility),

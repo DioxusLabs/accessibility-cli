@@ -21,11 +21,10 @@ use anyhow::{Context, Result, anyhow};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_av_foundation::{
-    AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor,
-    AVFileTypeMPEG4, AVMediaTypeVideo, AVVideoAllowFrameReorderingKey, AVVideoCodecKey,
-    AVVideoCodecTypeH264, AVVideoCompressionPropertiesKey, AVVideoHeightKey,
-    AVVideoMaxKeyFrameIntervalKey, AVVideoProfileLevelKey, AVVideoQualityKey,
-    AVVideoWidthKey,
+    AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVFileTypeMPEG4,
+    AVMediaTypeVideo, AVVideoAllowFrameReorderingKey, AVVideoCodecKey, AVVideoCodecTypeH264,
+    AVVideoCompressionPropertiesKey, AVVideoHeightKey, AVVideoMaxKeyFrameIntervalKey,
+    AVVideoProfileLevelKey, AVVideoQualityKey, AVVideoWidthKey,
 };
 use objc2_core_media::CMTime;
 use objc2_core_video::CVPixelBuffer;
@@ -102,14 +101,14 @@ impl Recorder {
         }
 
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        let file_type = unsafe { AVFileTypeMPEG4 }
-            .ok_or_else(|| anyhow!("AVFileTypeMPEG4 unavailable"))?;
+        let file_type =
+            unsafe { AVFileTypeMPEG4 }.ok_or_else(|| anyhow!("AVFileTypeMPEG4 unavailable"))?;
         let writer = unsafe { AVAssetWriter::assetWriterWithURL_fileType_error(&url, file_type) }
             .map_err(|error| anyhow!("AVAssetWriter creation failed: {error}"))?;
 
         let settings = video_settings(width, height, &config)?;
-        let media_type = unsafe { AVMediaTypeVideo }
-            .ok_or_else(|| anyhow!("AVMediaTypeVideo unavailable"))?;
+        let media_type =
+            unsafe { AVMediaTypeVideo }.ok_or_else(|| anyhow!("AVMediaTypeVideo unavailable"))?;
         let input = unsafe {
             AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(
                 media_type,
@@ -294,8 +293,8 @@ fn video_settings(
     )?;
 
     let settings: Retained<NSMutableDictionary<NSString, AnyObject>> = NSMutableDictionary::new();
-    let codec = unsafe { AVVideoCodecTypeH264 }
-        .ok_or_else(|| anyhow!("H.264 codec unavailable"))?;
+    let codec =
+        unsafe { AVVideoCodecTypeH264 }.ok_or_else(|| anyhow!("H.264 codec unavailable"))?;
     put(&settings, unsafe { AVVideoCodecKey }, codec.as_ref())?;
     put(
         &settings,
@@ -343,8 +342,7 @@ mod tests {
         assert_eq!(width, 882);
         assert_eq!(width % 2, 0, "H.264 chroma needs even dimensions");
         assert_eq!(height % 2, 0);
-        let aspect_error =
-            ((width as f64 / height as f64) - (1206.0 / 2622.0)).abs();
+        let aspect_error = ((width as f64 / height as f64) - (1206.0 / 2622.0)).abs();
         assert!(aspect_error < 0.002, "aspect drifted by {aspect_error}");
     }
 

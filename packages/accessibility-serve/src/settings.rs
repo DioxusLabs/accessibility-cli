@@ -101,8 +101,8 @@ pub fn read(udid: &str, key: SettingKey) -> Result<String> {
 pub fn write(udid: &str, key: SettingKey, value: &str) -> Result<String> {
     // `content_size` also accepts increment/decrement, which are not in the
     // reported value set but are the ergonomic way to drive it from a UI.
-    let stepping = matches!(key, SettingKey::ContentSize)
-        && matches!(value, "increment" | "decrement");
+    let stepping =
+        matches!(key, SettingKey::ContentSize) && matches!(value, "increment" | "decrement");
 
     if !stepping && !key.allowed_values().contains(&value) {
         return Err(anyhow!(

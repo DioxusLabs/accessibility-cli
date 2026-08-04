@@ -1960,9 +1960,9 @@ async fn run_serve_sim(args: &ServeSimArgs) -> anyhow::Result<()> {
                 "recording" => accessibility_core::video::Tuning::Recording {
                     quality: args.quality,
                 },
-                other => anyhow::bail!(
-                    "unknown tuning '{other}' (expected interactive or recording)"
-                ),
+                other => {
+                    anyhow::bail!("unknown tuning '{other}' (expected interactive or recording)")
+                }
             },
             max_dimension: (!args.native_resolution).then_some(args.max_dimension),
             keyframe_interval_secs: args.keyframe_interval,

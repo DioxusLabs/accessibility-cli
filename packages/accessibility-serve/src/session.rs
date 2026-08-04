@@ -115,7 +115,9 @@ impl SimSession {
                     *latest_parameter_set.lock().unwrap() = Some(frame.clone());
                 }
                 stats.frames.fetch_add(1, Ordering::Relaxed);
-                stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                stats
+                    .bytes
+                    .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                 if frame.kind == FrameKind::Keyframe {
                     stats.keyframes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -316,7 +318,8 @@ impl SimSession {
         self.ax
             .send(AxCommand::HitTest { x, y, reply: tx })
             .map_err(|_| anyhow!("accessibility worker stopped"))?;
-        rx.await.map_err(|_| anyhow!("accessibility worker stopped"))?
+        rx.await
+            .map_err(|_| anyhow!("accessibility worker stopped"))?
     }
 }
 

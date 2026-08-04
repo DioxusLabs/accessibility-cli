@@ -200,11 +200,7 @@ pub trait VideoCapture: Send + Sync {
     /// Independent of the live stream: a recording encodes separately so it
     /// can use settings — B-frames above all — that would break consumers of
     /// the live stream.
-    fn start_recording(
-        &self,
-        _path: &std::path::Path,
-        _config: &RecordingConfig,
-    ) -> Result<()> {
+    fn start_recording(&self, _path: &std::path::Path, _config: &RecordingConfig) -> Result<()> {
         anyhow::bail!("Recording is not supported on this platform")
     }
 
