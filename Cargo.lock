@@ -68,6 +68,7 @@ dependencies = [
  "serial_test",
  "slotmap",
  "tokio",
+ "tracing",
  "viuer",
 ]
 
@@ -128,7 +129,6 @@ name = "accessibility-serve"
 version = "0.1.0"
 dependencies = [
  "accessibility-core",
- "accessibility-ios-sys",
  "anyhow",
  "axum",
  "bytes",
