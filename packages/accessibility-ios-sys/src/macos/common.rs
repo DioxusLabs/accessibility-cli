@@ -8,6 +8,16 @@ use accesskit::Role;
 use euclid::{Point2D, Rect as EuclidRect, Size2D};
 use slotmap::{Key, KeyData, SlotMap};
 
+/// Identity of a currently booted simulator.
+///
+/// The UDID is the stable device identifier used to bind independent capture,
+/// input, and accessibility sessions to the same simulator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BootedSimulator {
+    pub udid: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScreenSpace;
 
@@ -490,6 +500,68 @@ pub(super) unsafe fn nsstring_to_string_static(ns_string: *mut AnyObject) -> Opt
     Some(CStr::from_ptr(cstr).to_string_lossy().to_string())
 }
 
+/// Enumerate all currently booted simulators.
+///
+/// Devices are returned in CoreSimulator's order. Each entry includes the
+/// stable UDID used by the rest of this crate and the user-visible device name.
+pub fn booted_simulators() -> Result<Vec<BootedSimulator>> {
+    crate::frameworks::load_coresimulator_framework()?;
+
+    unsafe {
+        let device_set = get_device_set()?;
+
+        // Resolve each device while the owning NSArray is still in scope. The
+        // objects returned by objectAtIndex: are unretained and must not be
+        // collected as raw pointers for later processing.
+        let devices: *mut AnyObject = msg_send![device_set, devices];
+        if devices.is_null() {
+            return Err(anyhow!("No devices found in SimDeviceSet"));
+        }
+
+        let count: usize = msg_send![devices, count];
+        let mut booted = Vec::new();
+        for i in 0..count {
+            let device: *mut AnyObject = msg_send![devices, objectAtIndex: i];
+            if device.is_null() {
+                continue;
+            }
+
+            // Check if booted (state == 3)
+            let state: i64 = msg_send![device, state];
+            if state != 3 {
+                continue;
+            }
+
+            // A stale or partially initialized SimDevice should not hide the
+            // rest of the catalog. Keep every valid entry in native order.
+            if let Ok(info) = booted_simulator_info(device) {
+                booted.push(info);
+            }
+        }
+        Ok(booted)
+    }
+}
+
+/// Read the stable identity fields from a SimDevice.
+///
+/// # Safety
+/// `device` must be a live SimDevice from the loaded CoreSimulator framework.
+unsafe fn booted_simulator_info(device: *mut AnyObject) -> Result<BootedSimulator> {
+    let device_udid: *mut AnyObject = msg_send![device, UDID];
+    if device_udid.is_null() {
+        return Err(anyhow!("Booted simulator has no UDID"));
+    }
+    let udid_string: *mut AnyObject = msg_send![device_udid, UUIDString];
+    let udid = nsstring_to_string_static(udid_string)
+        .ok_or_else(|| anyhow!("Failed to read booted simulator UDID"))?;
+
+    let name_string: *mut AnyObject = msg_send![device, name];
+    let name = nsstring_to_string_static(name_string)
+        .ok_or_else(|| anyhow!("Failed to read booted simulator name for {udid}"))?;
+
+    Ok(BootedSimulator { udid, name })
+}
+
 /// Find a booted simulator device by UDID or return the first booted one.
 ///
 /// # Safety
@@ -504,7 +576,6 @@ pub(super) unsafe fn find_booted_device(udid: Option<&str>) -> Result<*mut AnyOb
     }
 
     let count: usize = msg_send![devices, count];
-
     for i in 0..count {
         let device: *mut AnyObject = msg_send![devices, objectAtIndex: i];
         if device.is_null() {
@@ -514,27 +585,21 @@ pub(super) unsafe fn find_booted_device(udid: Option<&str>) -> Result<*mut AnyOb
         // Check if booted (state == 3)
         let state: i64 = msg_send![device, state];
         if state != 3 {
-            // Not booted
             continue;
         }
 
-        // Get UDID
-        let device_udid: *mut AnyObject = msg_send![device, UDID];
-        if device_udid.is_null() {
-            continue;
-        }
-
-        let udid_string: *mut AnyObject = msg_send![device_udid, UUIDString];
-        if udid_string.is_null() {
-            continue;
-        }
-
-        let udid_cstr: *const c_char = msg_send![udid_string, UTF8String];
-        let device_udid_str = CStr::from_ptr(udid_cstr).to_string_lossy();
-
-        // If we're looking for a specific UDID, check it
+        // If we're looking for a specific UDID, check it. Keep malformed
+        // entries skippable just as the original lookup did.
         if let Some(target_udid) = udid {
-            if device_udid_str == target_udid {
+            let device_udid: *mut AnyObject = msg_send![device, UDID];
+            if device_udid.is_null() {
+                continue;
+            }
+            let udid_string: *mut AnyObject = msg_send![device_udid, UUIDString];
+            let Some(device_udid) = nsstring_to_string_static(udid_string) else {
+                continue;
+            };
+            if device_udid == target_udid {
                 return Ok(device);
             }
         } else {

@@ -44,8 +44,9 @@ Modifiers are ordinary key events held around the target key, so shifted
 characters are Shift-down, key-down, key-up, Shift-up. There is no shift flag
 on the Indigo message.
 
-The character-to-key table lives in `accessibility-serve/src/keymap.rs` and is
-US-ASCII only; unmappable characters fail the whole string rather than typing
+The character-to-key table lives in
+`accessibility-core/src/platform/ios_simulator/keymap.rs` and is US-ASCII only;
+unmappable characters fail the whole string rather than typing
 a subtly wrong one.
 
 On Xcode 27 / CoreSimulator 1155.4+ an active `dtuhidd` silently disables

@@ -23,7 +23,22 @@ use crate::video::{
     Tuning, VideoCapture, VideoConfig,
 };
 
-pub use sys::{ButtonDirection, HardwareButton};
+pub mod ax;
+pub mod coverage;
+pub mod input;
+pub mod keymap;
+pub mod session;
+pub mod settings;
+
+pub use ax::{AxCommand, AxSnapshot, Discovery, ElementDetail, NormalizedRect, spawn_ax_worker};
+pub use input::{
+    HOME_INDICATOR_BAND, HardwareButton as InputHardwareButton, InputCommand, Orientation,
+    TouchEdge, TouchPhase, spawn_input_worker,
+};
+pub use keymap::{KeyStroke, keystroke_for, keystrokes_for};
+pub use session::{DeviceInfo, SimSession, StatsReport, StreamStats};
+pub use settings::{Setting, SettingKey};
+pub use sys::{BootedSimulator, ButtonDirection, HardwareButton, booted_simulators};
 
 /// Load all required private frameworks.
 pub fn load_frameworks() -> Result<()> {

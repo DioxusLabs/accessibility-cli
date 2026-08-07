@@ -67,8 +67,8 @@ mod stream;
 mod void_block;
 
 pub use common::{
-    ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point, Rect, ScreenSpace,
-    Screenshot, Size, TreeFilter, load_frameworks,
+    BootedSimulator, ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point,
+    Rect, ScreenSpace, Screenshot, Size, TreeFilter, booted_simulators, load_frameworks,
 };
 pub use encoder::{
     ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat, Tuning,

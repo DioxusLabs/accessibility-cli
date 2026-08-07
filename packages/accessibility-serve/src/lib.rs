@@ -6,23 +6,35 @@
 //! accessibility tree is exposed so the UI can inspect elements.
 
 pub mod avcc;
+#[cfg(target_os = "macos")]
 pub mod ax;
+#[cfg(target_os = "macos")]
 pub mod coverage;
+#[cfg(target_os = "macos")]
 pub mod http;
+#[cfg(target_os = "macos")]
 pub mod input;
+#[cfg(target_os = "macos")]
 pub mod keymap;
+#[cfg(target_os = "macos")]
 pub mod session;
+#[cfg(target_os = "macos")]
 pub mod settings;
+#[cfg(target_os = "macos")]
 pub mod webrtc_stream;
 
 use std::net::SocketAddr;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::Result;
 
 use accessibility_core::video::VideoConfig;
 
-pub use session::SimSession;
+#[cfg(target_os = "macos")]
+pub use accessibility_core::platform::ios_simulator::SimSession;
 
 /// Which transport the web UI should try first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,6 +93,7 @@ impl Default for ServeConfig {
 }
 
 /// Start capturing and serve until the process is interrupted.
+#[cfg(target_os = "macos")]
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let session = SimSession::start(config.udid.as_deref(), config.video)
         .context("failed to start simulator capture")?;
@@ -112,4 +125,10 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     axum::serve(listener, http::router(state))
         .await
         .context("server error")
+}
+
+/// iOS Simulator serving is only available on macOS.
+#[cfg(not(target_os = "macos"))]
+pub async fn serve(_config: ServeConfig) -> Result<()> {
+    anyhow::bail!("Serving an iOS Simulator requires macOS")
 }
