@@ -47,6 +47,7 @@ pub enum Transport {
     H264,
 }
 
+#[cfg(target_os = "macos")]
 impl Transport {
     fn as_str(self) -> &'static str {
         match self {
