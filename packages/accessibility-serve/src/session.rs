@@ -186,10 +186,10 @@ impl Session {
         }
     }
 
-    pub fn start_recording(&self, config: RecordingConfig) -> Result<std::path::PathBuf> {
+    pub fn start_recording(&self, _config: RecordingConfig) -> Result<std::path::PathBuf> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::Ios(session) => session.start_recording(config),
+            Self::Ios(session) => session.start_recording(_config),
             Self::Android(_) => {
                 anyhow::bail!("recording is not supported for Android Emulator streams")
             }

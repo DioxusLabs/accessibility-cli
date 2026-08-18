@@ -352,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn parses_discovery_file() {
         let directory = test_directory("parse");
         let path = directory.join("pid_1234.ini");
@@ -370,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn selects_one_emulator() {
         let directory = test_directory("select");
         std::fs::write(
