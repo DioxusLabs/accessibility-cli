@@ -12,4 +12,18 @@ categories = ["accessibility", "api-bindings", "os"]
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 keyboard-types.workspace = true
+memmap2 = "=0.9.8"
+prost = "=0.13.5"
+tokio.workspace = true
+tonic = { version = "=0.13.1", default-features = false, features = ["channel", "codegen", "prost"] }
+
+[dev-dependencies]
+rtp = "=0.14.0"
+serde_json.workspace = true
+webrtc.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored = "=3.2.0"
+tonic-build = { version = "=0.13.1", default-features = false, features = ["prost"] }

@@ -13,6 +13,17 @@ fn help_mentions_primary_command() {
 }
 
 #[test]
+fn serve_emulator_help_exposes_stream_options() {
+    let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
+    cmd.args(["serve-emulator", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--serial"))
+        .stdout(predicate::str::contains("--transport"))
+        .stdout(predicate::str::contains("--max-dimension"));
+}
+
+#[test]
 fn invalid_platform_fails_before_touching_accessibility_backend() {
     let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
     cmd.args(["--platform", "not-a-platform"])

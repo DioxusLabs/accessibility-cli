@@ -56,8 +56,15 @@ use crate::accessibility::{
     TreeFilter,
 };
 use crate::input::{Code, Modifiers, MouseButton};
+use crate::video::{FrameSink, ScreenGeometry, VideoCapture, VideoConfig};
 
+pub mod ax;
+pub mod input;
+pub mod session;
+pub mod video;
 pub use accessibility_android_sys::{AdbClient, AndroidKeyCode};
+pub use input::{HardwareButton, InputCommand, Orientation, TouchPhase, spawn_input_worker};
+pub use video::AndroidVideoCapture;
 
 /// Parse Android bounds string like "[0,0][1080,1920]" into a Rect.
 fn parse_bounds(bounds_str: &str) -> Option<Rect> {
@@ -828,6 +835,27 @@ impl AccessibilityReader for AndroidAccessibility {
     }
 
     fn supports_hit_test(&self) -> bool {
+        true
+    }
+
+    fn start_video_capture(
+        &self,
+        config: &VideoConfig,
+        sink: FrameSink,
+    ) -> Result<Box<dyn VideoCapture>> {
+        let (width, height) = self
+            .screen_size
+            .ok_or_else(|| anyhow!("Android screen size is unavailable"))?;
+        let capture = AndroidVideoCapture::start(
+            self.adb.clone(),
+            ScreenGeometry { width, height },
+            config,
+            sink,
+        )?;
+        Ok(Box::new(capture))
+    }
+
+    fn supports_video_capture(&self) -> bool {
         true
     }
 

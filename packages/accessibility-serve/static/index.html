@@ -255,9 +255,11 @@ const ROTATION = {
 
 const isLandscape = () =>
   orientation === "landscape_left" || orientation === "landscape_right";
+const isAndroid = () => config?.platform === "android_emulator";
 
 /** Upright display point (0..1) to raw framebuffer point. */
 function toRawPoint(x, y) {
+  if (isAndroid()) return { x, y };
   switch (orientation) {
     case "landscape_left": return { x: y, y: 1 - x };
     case "landscape_right": return { x: 1 - y, y: x };
@@ -280,12 +282,14 @@ const BOTTOM_EDGE_BY_ORIENTATION = {
 
 /** The raw edge for a display point, or "none" if it is not near one. */
 function edgeForDisplayPoint(y) {
+  if (isAndroid()) return "none";
   if (y < config.home_indicator_band) return "none";
   return BOTTOM_EDGE_BY_ORIENTATION[orientation] || "bottom";
 }
 
 /** Rotate a delta, which has direction but no origin. */
 function toRawDelta(dx, dy) {
+  if (isAndroid()) return { dx, dy };
   switch (orientation) {
     case "landscape_left": return { dx: dy, dy: -dx };
     case "landscape_right": return { dx: -dy, dy: dx };
@@ -327,10 +331,16 @@ function layout() {
   stage.style.height = `${uprightH * scale}px`;
 
   // The media keeps the framebuffer's own aspect and is rotated on top of it.
-  media.style.width = `${fbW * scale}px`;
-  media.style.height = `${fbH * scale}px`;
-  media.style.transform =
-    `translate(-50%, -50%) rotate(${ROTATION[orientation] || 0}deg)`;
+  if (isAndroid()) {
+    media.style.width = `${uprightW * scale}px`;
+    media.style.height = `${uprightH * scale}px`;
+    media.style.transform = "translate(-50%, -50%)";
+  } else {
+    media.style.width = `${fbW * scale}px`;
+    media.style.height = `${fbH * scale}px`;
+    media.style.transform =
+      `translate(-50%, -50%) rotate(${ROTATION[orientation] || 0}deg)`;
+  }
 }
 window.addEventListener("resize", () => config && layout());
 
@@ -494,12 +504,17 @@ const ROTATE_RIGHT = { portrait: "landscape_left", landscape_left: "portrait_ups
 
 async function rotate(map) {
   const next = map[orientation] || "portrait";
-  await fetch("/api/orientation", {
+  const response = await fetch("/api/orientation", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ orientation: next }),
   });
-  orientation = next;
+  if (!response.ok) {
+    setStatus(`rotation failed: ${await response.text()}`, "error");
+    return;
+  }
+  const result = await response.json();
+  orientation = result.orientation || next;
   layout();
   if (selected) drawSelection(selected);
 }
