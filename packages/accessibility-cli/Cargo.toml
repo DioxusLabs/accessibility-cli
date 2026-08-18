@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 accessibility-core.workspace = true
+accessibility-serve.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
@@ -23,6 +24,3 @@ serial_test.workspace = true
 [[bin]]
 name = "accessibility-cli"
 path = "src/main.rs"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-accessibility-serve.workspace = true

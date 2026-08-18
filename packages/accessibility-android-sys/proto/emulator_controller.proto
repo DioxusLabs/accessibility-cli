@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package android.emulation.control;
+
+import "google/protobuf/empty.proto";
+
+service EmulatorController {
+  rpc getStatus(google.protobuf.Empty) returns (EmulatorStatus) {}
+  rpc sendKey(KeyboardEvent) returns (google.protobuf.Empty) {}
+  rpc sendTouch(TouchEvent) returns (google.protobuf.Empty) {}
+  rpc sendMouse(MouseEvent) returns (google.protobuf.Empty) {}
+  rpc streamScreenshot(ImageFormat) returns (stream Image) {}
+}
+
+message EmulatorStatus {
+  string version = 1;
+  uint64 uptime = 2;
+  bool booted = 3;
+  uint64 heartbeat = 6;
+  map<string, string> guestConfig = 7;
+  map<string, string> platformConfig = 8;
+}
+
+message Touch {
+  int32 x = 1;
+  int32 y = 2;
+  int32 identifier = 3;
+  int32 pressure = 4;
+  int32 touch_major = 5;
+  int32 touch_minor = 6;
+  EventExpiration expiration = 7;
+  int32 orientation = 8;
+
+  enum EventExpiration {
+    EVENT_EXPIRATION_UNSPECIFIED = 0;
+    NEVER_EXPIRE = 1;
+  }
+}
+
+message TouchEvent {
+  repeated Touch touches = 1;
+  int32 display = 2;
+}
+
+message MouseEvent {
+  int32 x = 1;
+  int32 y = 2;
+  int32 buttons = 3;
+  int32 display = 4;
+}
+
+message WheelEvent {
+  int32 dx = 1;
+  int32 dy = 2;
+  int32 display = 3;
+}
+
+message KeyboardEvent {
+  KeyCodeType codeType = 1;
+  KeyEventType eventType = 2;
+  int32 keyCode = 3;
+  string key = 4;
+  string text = 5;
+
+  enum KeyCodeType {
+    Usb = 0;
+    Evdev = 1;
+    XKB = 2;
+    Win = 3;
+    Mac = 4;
+  }
+
+  enum KeyEventType {
+    keydown = 0;
+    keyup = 1;
+    keypress = 2;
+  }
+}
+
+message ImageTransport {
+  enum TransportChannel {
+    TRANSPORT_CHANNEL_UNSPECIFIED = 0;
+    MMAP = 1;
+  }
+
+  TransportChannel channel = 1;
+  string handle = 2;
+}
+
+message Rotation {
+  enum SkinRotation {
+    PORTRAIT = 0;
+    LANDSCAPE = 1;
+    REVERSE_PORTRAIT = 2;
+    REVERSE_LANDSCAPE = 3;
+  }
+
+  SkinRotation rotation = 1;
+  double xAxis = 2;
+  double yAxis = 3;
+  double zAxis = 4;
+}
+
+message ImageFormat {
+  enum ImgFormat {
+    PNG = 0;
+    RGBA8888 = 1;
+    RGB888 = 2;
+  }
+
+  ImgFormat format = 1;
+  Rotation rotation = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 display = 5;
+  ImageTransport transport = 6;
+}
+
+message Image {
+  ImageFormat format = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  bytes image = 4;
+  uint32 seq = 5;
+  uint64 timestampUs = 6;
+}
+
+message InputEvent {
+  oneof type {
+    KeyboardEvent key_event = 1;
+    TouchEvent touch_event = 2;
+    MouseEvent mouse_event = 3;
+    WheelEvent wheel_event = 6;
+  }
+}

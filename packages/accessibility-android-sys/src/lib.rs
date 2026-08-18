@@ -1,5 +1,7 @@
 //! Low-level ADB wrappers used by accessibility-cli's Android backend.
 
+pub mod emulator;
+
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -453,6 +455,38 @@ impl AdbClient {
         }
     }
 
+    pub fn discover(serial: Option<&str>) -> Self {
+        for root in [
+            std::env::var_os("ANDROID_SDK_ROOT"),
+            std::env::var_os("ANDROID_HOME"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let path = std::path::PathBuf::from(root)
+                .join("platform-tools")
+                .join(adb_binary_name());
+            if path.is_file() {
+                return Self::with_adb_path(serial, &path.to_string_lossy());
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::PathBuf::from(home);
+            let roots = if cfg!(target_os = "macos") {
+                vec![home.join("Library/Android/sdk"), home.join("Android/Sdk")]
+            } else {
+                vec![home.join("Android/Sdk")]
+            };
+            for root in roots {
+                let path = root.join("platform-tools").join(adb_binary_name());
+                if path.is_file() {
+                    return Self::with_adb_path(serial, &path.to_string_lossy());
+                }
+            }
+        }
+        Self::new(serial)
+    }
+
     /// Create a new ADB client with a custom ADB path.
     pub fn with_adb_path(serial: Option<&str>, adb_path: &str) -> Self {
         Self {
@@ -537,44 +571,64 @@ impl AdbClient {
 
     /// Check if ADB is available and a device is connected.
     pub fn check_connection(&self) -> Result<()> {
-        let version_result = Command::new(&self.adb_path).arg("version").output();
-
-        match version_result {
-            Ok(output) if output.status.success() => {}
-            Ok(_) => bail!("ADB binary found but returned error"),
-            Err(e) => bail!(
-                "ADB binary not found at '{}': {}. Install Android SDK Platform Tools.",
-                self.adb_path,
-                e
-            ),
-        }
-
-        let devices = self.command(&["devices"])?;
-        let device_count = devices
-            .lines()
-            .skip(1)
-            .filter(|line| {
-                let trimmed = line.trim();
-                !trimmed.is_empty() && trimmed.contains('\t')
-            })
-            .count();
-
-        if device_count == 0 {
+        let devices = self.connected_devices()?;
+        if devices.is_empty() {
             bail!("No Android devices connected. Connect a device or start an emulator.");
         }
-
-        if let Some(ref serial) = self.serial {
-            let found = devices.lines().skip(1).any(|line| line.starts_with(serial));
-            if !found {
-                bail!(
-                    "Device '{}' not found. Available devices:\n{}",
-                    serial,
-                    devices
-                );
-            }
+        if let Some(serial) = &self.serial
+            && !devices.contains(serial)
+        {
+            bail!(
+                "Device '{}' is not connected. Available devices: {}",
+                serial,
+                devices.join(", ")
+            );
         }
-
         Ok(())
+    }
+
+    pub fn connected_devices(&self) -> Result<Vec<String>> {
+        let output = Command::new(&self.adb_path)
+            .arg("devices")
+            .output()
+            .with_context(|| {
+                format!(
+                    "ADB binary not found at '{}'. Install Android SDK Platform Tools.",
+                    self.adb_path
+                )
+            })?;
+        Self::check_output(&output, "devices")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (serial, state) = line.split_once('\t')?;
+                (state.split_whitespace().next() == Some("device")).then(|| serial.to_string())
+            })
+            .collect())
+    }
+
+    pub fn resolved_serial(&self) -> Result<String> {
+        let devices = self.connected_devices()?;
+        if let Some(serial) = &self.serial {
+            if devices.contains(serial) {
+                return Ok(serial.clone());
+            }
+            bail!(
+                "Device '{}' is not connected. Available devices: {}",
+                serial,
+                devices.join(", ")
+            );
+        }
+        match devices.as_slice() {
+            [serial] => Ok(serial.clone()),
+            [] => bail!("No Android devices connected. Connect a device or start an emulator."),
+            _ => bail!(
+                "Multiple Android devices are connected; specify one of: {}",
+                devices.join(", ")
+            ),
+        }
     }
 
     /// Get the screen size in pixels.
@@ -753,6 +807,14 @@ impl AdbClient {
         }
 
         bail!("Could not determine current activity");
+    }
+}
+
+fn adb_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "adb.exe"
+    } else {
+        "adb"
     }
 }
 

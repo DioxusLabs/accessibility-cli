@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package android.emulation.control.v2;
+
+service Rtc {
+  rpc RequestRtcStream(RtcStreamRequest) returns (RtcStreamResponse) {}
+  rpc SendJsepMessage(SendJsepMessageRequest) returns (SendJsepMessageResponse) {}
+  rpc ReceiveJsepMessageStream(ReceiveJsepMessageRequest) returns (stream ReceiveJsepMessageResponse) {}
+}
+
+message RtcStreamRequest {}
+
+message RtcStreamResponse {
+  Id id = 1;
+}
+
+message SendJsepMessageRequest {
+  JsepMsg jsep_msg = 1;
+}
+
+message SendJsepMessageResponse {}
+
+message ReceiveJsepMessageRequest {
+  Id id = 1;
+}
+
+message ReceiveJsepMessageResponse {
+  JsepMsg jsep_msg = 1;
+}
+
+message Id {
+  string guid = 1;
+}
+
+message JsepMsg {
+  Id id = 1;
+  string message = 2;
+}

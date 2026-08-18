@@ -1852,6 +1852,10 @@ pub enum Command {
     /// Serve the iOS Simulator in a browser: live video, input, and element
     /// inspection.
     ServeSim(ServeSimArgs),
+    #[command(
+        about = "Serve an Android Emulator in a browser with live video, input, and element inspection"
+    )]
+    ServeEmulator(ServeEmulatorArgs),
 }
 
 #[derive(clap::Args)]
@@ -1912,6 +1916,45 @@ pub struct ServeSimArgs {
     pub ice_servers: Vec<String>,
 }
 
+#[derive(clap::Args)]
+pub struct ServeEmulatorArgs {
+    #[arg(
+        long,
+        help = "Emulator serial from adb devices; defaults to the only connected device"
+    )]
+    pub serial: Option<String>,
+    #[arg(long, default_value_t = 3200, help = "Port to listen on")]
+    pub port: u16,
+    #[arg(long, default_value = "127.0.0.1", help = "Address to bind")]
+    pub bind: std::net::IpAddr,
+    #[arg(
+        long,
+        default_value = "webrtc",
+        help = "Preferred transport: webrtc or h264"
+    )]
+    pub transport: String,
+    #[arg(
+        long,
+        default_value_t = 60,
+        help = "Frame rate used to derive the bitrate"
+    )]
+    pub fps: u32,
+    #[arg(long, help = "screenrecord bitrate in bits per second")]
+    pub bitrate: Option<u32>,
+    #[arg(long, default_value_t = 1280, help = "Longest encoded edge")]
+    pub max_dimension: u32,
+    #[arg(long, help = "Capture at native display resolution")]
+    pub native_resolution: bool,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Requested keyframe recovery interval"
+    )]
+    pub keyframe_interval: u32,
+    #[arg(long = "ice-server", help = "ICE server URL, repeatable")]
+    pub ice_servers: Vec<String>,
+}
+
 /// Run the CLI using process arguments.
 pub fn run() {
     let cli = Cli::parse();
@@ -1934,6 +1977,7 @@ pub fn run() {
 async fn run_command(command: &Command) {
     let result = match command {
         Command::ServeSim(args) => run_serve_sim(args).await,
+        Command::ServeEmulator(args) => run_serve_emulator(args).await,
     };
     if let Err(error) = result {
         eprintln!("Error: {error:#}");
@@ -1979,6 +2023,30 @@ async fn run_serve_sim(args: &ServeSimArgs) -> anyhow::Result<()> {
 #[cfg(not(target_os = "macos"))]
 async fn run_serve_sim(_args: &ServeSimArgs) -> anyhow::Result<()> {
     anyhow::bail!("serve-sim requires macOS with Xcode and a booted iOS Simulator")
+}
+
+async fn run_serve_emulator(args: &ServeEmulatorArgs) -> anyhow::Result<()> {
+    use accessibility_core::video::{NalFormat, Tuning, VideoConfig};
+    use accessibility_serve::{ServeEmulatorConfig, Transport, serve_emulator};
+
+    let transport: Transport = args.transport.parse()?;
+    serve_emulator(ServeEmulatorConfig {
+        serial: args.serial.clone(),
+        address: std::net::SocketAddr::new(args.bind, args.port),
+        transport,
+        video: VideoConfig {
+            fps: args.fps,
+            tuning: Tuning::Interactive {
+                bitrate: args.bitrate,
+            },
+            max_dimension: (!args.native_resolution).then_some(args.max_dimension),
+            keyframe_interval_secs: args.keyframe_interval,
+            nal_format: NalFormat::AnnexB,
+            ..Default::default()
+        },
+        ice_servers: args.ice_servers.clone(),
+    })
+    .await
 }
 
 /// Build a TreeFilter from CommonArgs

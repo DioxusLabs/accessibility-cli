@@ -28,7 +28,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use accessibility_core::video::FrameKind;
 
-use crate::session::SimSession;
+use crate::session::Session;
 
 pub struct WebRtcEngine {
     api: API,
@@ -65,7 +65,7 @@ impl WebRtcEngine {
     }
 
     /// Answer a browser offer, wiring a fresh track to the capture stream.
-    pub async fn answer(&self, session: Arc<SimSession>, offer_sdp: String) -> Result<String> {
+    pub async fn answer(&self, session: Session, offer_sdp: String) -> Result<String> {
         let peer = Arc::new(self.api.new_peer_connection(self.config.clone()).await?);
 
         let track = Arc::new(TrackLocalStaticSample::new(
@@ -74,7 +74,7 @@ impl WebRtcEngine {
                 ..Default::default()
             },
             "video".to_owned(),
-            format!("sim-{}", session.device_info().udid),
+            format!("sim-{}", session.device_info().id),
         ));
 
         let sender = peer
@@ -84,7 +84,7 @@ impl WebRtcEngine {
         // Sender RTCP has to be drained or feedback never gets processed. PLI
         // and FIR both mean "I cannot decode, send me a fresh IDR".
         {
-            let session = Arc::clone(&session);
+            let session = session.clone();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 1500];
                 while let Ok((packets, _)) = sender.read(&mut buffer).await {
@@ -100,7 +100,7 @@ impl WebRtcEngine {
             });
         }
 
-        let forwarder = spawn_forwarder(Arc::clone(&session), Arc::clone(&track));
+        let forwarder = spawn_forwarder(session.clone(), Arc::clone(&track));
 
         // Tear the forwarding task down when the viewer goes away, otherwise
         // every reconnect would leak a subscriber on the broadcast channel.
@@ -137,7 +137,7 @@ impl WebRtcEngine {
 
 /// Pump encoded frames from the capture broadcast onto a viewer's track.
 fn spawn_forwarder(
-    session: Arc<SimSession>,
+    session: Session,
     track: Arc<TrackLocalStaticSample>,
 ) -> tokio::task::JoinHandle<()> {
     let mut frames = session.subscribe();
