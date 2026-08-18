@@ -14,7 +14,7 @@ categories = ["accessibility", "api-bindings", "os"]
 anyhow.workspace = true
 bytes.workspace = true
 keyboard-types.workspace = true
-memmap2 = "=0.9.8"
+memmap2 = "=0.9.10"
 prost = "=0.13.5"
 tokio.workspace = true
 tonic = { version = "=0.13.1", default-features = false, features = ["channel", "codegen", "prost"] }
