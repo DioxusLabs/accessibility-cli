@@ -11,6 +11,8 @@ use super::*;
 /// Function pointer types for Indigo message creation (loaded from SimulatorKit via dlsym).
 type IndigoMessageForButtonFn =
     unsafe extern "C" fn(source: i32, action: i32, target: i32) -> *mut c_void;
+type IndigoMessageForHIDArbitraryFn =
+    unsafe extern "C" fn(target: u32, page: u32, usage: u32, action: u32) -> *mut c_void;
 /// `IndigoHIDMessageForMouseNSEvent(CGPoint*, CGPoint*, IndigoHIDTarget,
 ///  NSEventType, NSSize, IndigoHIDEdge)`
 ///
@@ -81,6 +83,7 @@ pub struct SimulatorHID {
     screen_scale: f64,
     // Function pointers for message creation
     msg_for_button: IndigoMessageForButtonFn,
+    msg_for_hid_arbitrary: Option<IndigoMessageForHIDArbitraryFn>,
     msg_for_touch: IndigoMessageForTouchFn,
     msg_for_keyboard: IndigoMessageForKeyboardFn,
 }
@@ -102,6 +105,11 @@ impl SimulatorHID {
                 return Err(anyhow!("Failed to find IndigoHIDMessageForButton"));
             }
             std::mem::transmute(sym)
+        };
+
+        let msg_for_hid_arbitrary = unsafe {
+            let sym = libc::dlsym(handle, c"IndigoHIDMessageForHIDArbitrary".as_ptr());
+            (!sym.is_null()).then(|| std::mem::transmute(sym))
         };
 
         let msg_for_touch: IndigoMessageForTouchFn = unsafe {
@@ -176,6 +184,7 @@ impl SimulatorHID {
             screen_size,
             screen_scale,
             msg_for_button,
+            msg_for_hid_arbitrary,
             msg_for_touch,
             msg_for_keyboard,
         })
@@ -383,6 +392,22 @@ impl SimulatorHID {
         Ok(())
     }
 
+    pub fn supports_hid_arbitrary(&self) -> bool {
+        self.msg_for_hid_arbitrary.is_some()
+    }
+
+    pub fn press_hid_button(&self, page: u32, usage: u32, hold_ms: u64) -> Result<()> {
+        self.send_hid_button(page, usage, ButtonDirection::Down)?;
+
+        std::thread::sleep(std::time::Duration::from_millis(if hold_ms > 0 {
+            hold_ms
+        } else {
+            50
+        }));
+
+        self.send_hid_button(page, usage, ButtonDirection::Up)
+    }
+
     /// Send a keyboard key press.
     ///
     /// # Arguments
@@ -488,6 +513,23 @@ impl SimulatorHID {
 
         if message.is_null() {
             return Err(anyhow!("Failed to create button message"));
+        }
+
+        self.send_message(message, true)
+    }
+
+    fn send_hid_button(&self, page: u32, usage: u32, direction: ButtonDirection) -> Result<()> {
+        const HID_ARBITRARY_BUTTON_TARGET: u32 = 0x32;
+
+        let msg_for_hid_arbitrary = self
+            .msg_for_hid_arbitrary
+            .ok_or_else(|| anyhow!("IndigoHIDMessageForHIDArbitrary is unavailable"))?;
+        let message = unsafe {
+            msg_for_hid_arbitrary(HID_ARBITRARY_BUTTON_TARGET, page, usage, direction as u32)
+        };
+
+        if message.is_null() {
+            return Err(anyhow!("Failed to create arbitrary HID message"));
         }
 
         self.send_message(message, true)

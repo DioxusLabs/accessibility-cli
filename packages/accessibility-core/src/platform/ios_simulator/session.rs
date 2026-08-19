@@ -21,7 +21,9 @@ use crate::video::{
 
 use super::SimulatorVideoCapture;
 use super::ax::{AxCommand, AxSnapshot, ElementDetail, spawn_ax_worker};
-use super::input::{InputCommand, Orientation, spawn_input_worker};
+use super::input::{
+    InputCapabilities, InputCommand, Orientation, spawn_input_worker_with_capabilities,
+};
 use super::settings::{self, Setting, SettingKey};
 
 /// How many encoded frames to buffer per subscriber.
@@ -93,6 +95,7 @@ pub struct SimSession {
     stats: Arc<StreamStats>,
     started: Instant,
     input: std::sync::mpsc::Sender<InputCommand>,
+    input_capabilities: InputCapabilities,
     ax: mpsc::UnboundedSender<AxCommand>,
     /// Last orientation we asked for.
     ///
@@ -130,7 +133,7 @@ impl SimSession {
         };
 
         let (capture, resolved_udid) = start_capture(udid, &config, sink)?;
-        let input = spawn_input_worker(&resolved_udid)?;
+        let (input, input_capabilities) = spawn_input_worker_with_capabilities(&resolved_udid)?;
         let ax = spawn_ax_worker(&resolved_udid)?;
 
         Ok(Arc::new(Self {
@@ -141,6 +144,7 @@ impl SimSession {
             stats,
             started: Instant::now(),
             input,
+            input_capabilities,
             ax,
             orientation: std::sync::Mutex::new(Orientation::Portrait),
         }))
@@ -216,6 +220,10 @@ impl SimSession {
             height: geometry.height,
             orientation: self.orientation(),
         }
+    }
+
+    pub fn input_capabilities(&self) -> InputCapabilities {
+        self.input_capabilities
     }
 
     pub fn orientation(&self) -> Orientation {

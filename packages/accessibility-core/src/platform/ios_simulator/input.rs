@@ -59,6 +59,9 @@ pub enum TouchEdge {
 pub enum HardwareButton {
     Home,
     Lock,
+    VolumeUp,
+    VolumeDown,
+    Mute,
     Siri,
     SideButton,
     ApplePay,
@@ -151,12 +154,26 @@ impl ScrollGesture {
 /// HID sends block on a dispatch queue round trip. It wakes periodically even
 /// when idle so a scroll gesture can be lifted after the wheel stops.
 pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
+    Ok(spawn_input_worker_with_capabilities(udid)?.0)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputCapabilities {
+    pub arbitrary_hid: bool,
+}
+
+pub fn spawn_input_worker_with_capabilities(
+    udid: &str,
+) -> Result<(Sender<InputCommand>, InputCapabilities)> {
     use accessibility_ios_sys::{
         HardwareButton as SysButton, Orientation as SysOrientation, SimulatorHID,
         TouchEdge as SysEdge, TouchPhase as SysPhase,
     };
 
     let hid = SimulatorHID::for_device(Some(udid))?;
+    let capabilities = InputCapabilities {
+        arbitrary_hid: hid.supports_hid_arbitrary(),
+    };
     let (tx, rx) = mpsc::channel::<InputCommand>();
 
     std::thread::Builder::new()
@@ -191,14 +208,31 @@ pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
                                 hid.touch_normalized_edge(x, y, phase, edge)
                             }
                             InputCommand::Button { button } => {
-                                let button = match button {
-                                    HardwareButton::Home => SysButton::Home,
-                                    HardwareButton::Lock => SysButton::Lock,
-                                    HardwareButton::Siri => SysButton::Siri,
-                                    HardwareButton::SideButton => SysButton::SideButton,
-                                    HardwareButton::ApplePay => SysButton::ApplePay,
-                                };
-                                hid.press_button(button, 0)
+                                const CONSUMER_PAGE: u32 = 0x0c;
+                                const CONSUMER_MUTE: u32 = 0xe2;
+                                const CONSUMER_VOLUME_UP: u32 = 0xe9;
+                                const CONSUMER_VOLUME_DOWN: u32 = 0xea;
+
+                                match button {
+                                    HardwareButton::Home => hid.press_button(SysButton::Home, 0),
+                                    HardwareButton::Lock => hid.press_button(SysButton::Lock, 0),
+                                    HardwareButton::VolumeUp => {
+                                        hid.press_hid_button(CONSUMER_PAGE, CONSUMER_VOLUME_UP, 0)
+                                    }
+                                    HardwareButton::VolumeDown => {
+                                        hid.press_hid_button(CONSUMER_PAGE, CONSUMER_VOLUME_DOWN, 0)
+                                    }
+                                    HardwareButton::Mute => {
+                                        hid.press_hid_button(CONSUMER_PAGE, CONSUMER_MUTE, 0)
+                                    }
+                                    HardwareButton::Siri => hid.press_button(SysButton::Siri, 0),
+                                    HardwareButton::SideButton => {
+                                        hid.press_button(SysButton::SideButton, 0)
+                                    }
+                                    HardwareButton::ApplePay => {
+                                        hid.press_button(SysButton::ApplePay, 0)
+                                    }
+                                }
                             }
                             InputCommand::Key {
                                 key_code,
@@ -245,7 +279,7 @@ pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
             }
         })?;
 
-    Ok(tx)
+    Ok((tx, capabilities))
 }
 
 /// Expand text into key presses and send them.

@@ -32,8 +32,8 @@ pub mod settings;
 
 pub use ax::{AxCommand, AxSnapshot, Discovery, ElementDetail, NormalizedRect, spawn_ax_worker};
 pub use input::{
-    HOME_INDICATOR_BAND, HardwareButton as InputHardwareButton, InputCommand, Orientation,
-    TouchEdge, TouchPhase, spawn_input_worker,
+    HOME_INDICATOR_BAND, HardwareButton as InputHardwareButton, InputCapabilities, InputCommand,
+    Orientation, TouchEdge, TouchPhase, spawn_input_worker, spawn_input_worker_with_capabilities,
 };
 pub use keymap::{KeyStroke, keystroke_for, keystrokes_for};
 pub use session::{DeviceInfo, SimSession, StatsReport, StreamStats};
