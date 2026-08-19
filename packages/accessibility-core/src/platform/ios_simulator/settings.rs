@@ -10,8 +10,17 @@
 //! libAccessibility setters. That is a meaningfully larger piece of work and
 //! is deliberately not attempted here.
 
+use std::{
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+const SIMCTL_TIMEOUT: Duration = Duration::from_secs(2);
+const SIMCTL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Content size categories, smallest to largest.
 ///
@@ -117,12 +126,40 @@ pub fn write(udid: &str, key: SettingKey, value: &str) -> Result<String> {
 }
 
 fn simctl(args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("xcrun")
+    let mut child = Command::new("xcrun")
         .arg("simctl")
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("failed to run xcrun simctl")?;
 
+    let deadline = Instant::now() + SIMCTL_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .context("failed to wait for xcrun simctl")?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().context("failed to terminate xcrun simctl")?;
+            child
+                .wait()
+                .context("failed to reap timed out xcrun simctl")?;
+            return Err(anyhow!(
+                "simctl {} timed out after {} seconds",
+                args.join(" "),
+                SIMCTL_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(SIMCTL_POLL_INTERVAL);
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to collect xcrun simctl output")?;
     if !output.status.success() {
         return Err(anyhow!(
             "simctl {} failed: {}",
