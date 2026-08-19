@@ -114,24 +114,7 @@ impl RawFrameStream {
             if width == 0 || height == 0 {
                 continue;
             }
-            let expected = rgba_len(width, height)?;
-            let mut pixels = if let Some(mapping) = &self.mapping {
-                let source = mapping
-                    .get(..expected)
-                    .ok_or_else(|| anyhow!("emulator frame exceeds its memory mapping"))?;
-                copy_bottom_up_rgba(source, width, height)
-            } else {
-                if image.image.len() != expected {
-                    bail!(
-                        "RGBA frame is {} bytes, expected {expected} for {width}x{height}",
-                        image.image.len()
-                    );
-                }
-                image.image
-            };
-            if self.mapping.is_none() {
-                flip_vertical_rgba(&mut pixels, width, height);
-            }
+            let pixels = top_down_rgba(self.mapping.as_deref(), image.image, width, height)?;
             return Ok(Some(RawFrame {
                 pixels,
                 width,
@@ -162,6 +145,31 @@ fn rgba_len(width: u32, height: u32) -> Result<usize> {
         .context("Android frame dimensions overflow")
 }
 
+/// Normalizes a frame to top-down RGBA. MMAP frames arrive bottom-up and are
+/// flipped; gRPC frames already arrive top-down and pass through unchanged.
+fn top_down_rgba(
+    mapping: Option<&[u8]>,
+    image: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let expected = rgba_len(width, height)?;
+    if let Some(mapping) = mapping {
+        let source = mapping
+            .get(..expected)
+            .ok_or_else(|| anyhow!("emulator frame exceeds its memory mapping"))?;
+        Ok(copy_bottom_up_rgba(source, width, height))
+    } else {
+        if image.len() != expected {
+            bail!(
+                "RGBA frame is {} bytes, expected {expected} for {width}x{height}",
+                image.len()
+            );
+        }
+        Ok(image)
+    }
+}
+
 fn copy_bottom_up_rgba(source: &[u8], width: u32, height: u32) -> Vec<u8> {
     let stride = width as usize * 4;
     let mut pixels = vec![0; source.len()];
@@ -172,15 +180,6 @@ fn copy_bottom_up_rgba(source: &[u8], width: u32, height: u32) -> Vec<u8> {
             .copy_from_slice(&source[source_start..source_start + stride]);
     }
     pixels
-}
-
-fn flip_vertical_rgba(pixels: &mut [u8], width: u32, height: u32) {
-    let stride = width as usize * 4;
-    for row in 0..height as usize / 2 {
-        let opposite = height as usize - 1 - row;
-        let (before, after) = pixels.split_at_mut(opposite * stride);
-        before[row * stride..(row + 1) * stride].swap_with_slice(&mut after[..stride]);
-    }
 }
 
 fn mapping_path() -> PathBuf {
@@ -210,17 +209,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flips_bottom_up_rgba() {
-        let mut pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        flip_vertical_rgba(&mut pixels, 1, 2);
-        assert_eq!(pixels, vec![5, 6, 7, 8, 1, 2, 3, 4]);
-    }
-
-    #[test]
     fn copies_bottom_up_rgba() {
         assert_eq!(
             copy_bottom_up_rgba(&[1, 2, 3, 4, 5, 6, 7, 8], 1, 2),
             vec![5, 6, 7, 8, 1, 2, 3, 4]
+        );
+    }
+
+    /// A 2x3 frame with a distinct value per row; any vertical inversion
+    /// reorders the rows and fails the comparison.
+    fn rows_2x3(top_to_bottom: [u8; 3]) -> Vec<u8> {
+        top_to_bottom
+            .iter()
+            .flat_map(|&row| std::iter::repeat_n(row, 8))
+            .collect()
+    }
+
+    #[test]
+    fn grpc_frames_pass_through_top_down() {
+        let top_down = rows_2x3([1, 2, 3]);
+        assert_eq!(
+            top_down_rgba(None, top_down.clone(), 2, 3).unwrap(),
+            top_down
+        );
+    }
+
+    #[test]
+    fn mmap_frames_are_flipped_to_top_down() {
+        let bottom_up = rows_2x3([3, 2, 1]);
+        assert_eq!(
+            top_down_rgba(Some(&bottom_up), Vec::new(), 2, 3).unwrap(),
+            rows_2x3([1, 2, 3])
         );
     }
 }
