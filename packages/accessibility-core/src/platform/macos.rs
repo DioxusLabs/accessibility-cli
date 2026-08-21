@@ -1793,31 +1793,36 @@ impl AccessibilityReader for MacOSAccessibility {
         true
     }
 
-    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
-        let pid = match target {
-            Target::Pid(pid) => Some(*pid),
-            Target::System => None,
-            _ => bail!("macOS screenshot requires Target::Pid or Target::System"),
-        };
+    fn capture_screen(
+        &self,
+        target: &Target,
+    ) -> impl std::future::Future<Output = Result<Screenshot>> {
+        async move {
+            let pid = match target {
+                Target::Pid(pid) => Some(*pid),
+                Target::System => None,
+                _ => bail!("macOS screenshot requires Target::Pid or Target::System"),
+            };
 
-        if let Some(pid) = pid
-            && let Ok(Some(screenshot)) = Self::capture_window_for_pid(pid)
-        {
-            return Ok(screenshot);
-        }
-
-        let screenshot = Self::capture_main_display()?;
-
-        if let Some(pid) = pid
-            && let Some(window_bounds) = Self::get_window_bounds_for_pid(pid)
-        {
-            let screen_bounds = Self::main_display_bounds();
-            if let Ok(cropped) = screenshot.crop(&window_bounds, &screen_bounds) {
-                return Ok(cropped);
+            if let Some(pid) = pid
+                && let Ok(Some(screenshot)) = Self::capture_window_for_pid(pid)
+            {
+                return Ok(screenshot);
             }
-        }
 
-        Ok(screenshot)
+            let screenshot = Self::capture_main_display()?;
+
+            if let Some(pid) = pid
+                && let Some(window_bounds) = Self::get_window_bounds_for_pid(pid)
+            {
+                let screen_bounds = Self::main_display_bounds();
+                if let Ok(cropped) = screenshot.crop(&window_bounds, &screen_bounds) {
+                    return Ok(cropped);
+                }
+            }
+
+            Ok(screenshot)
+        }
     }
 
     async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {

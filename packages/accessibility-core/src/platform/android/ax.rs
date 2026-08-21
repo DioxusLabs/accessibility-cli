@@ -84,9 +84,9 @@ pub enum AxCommand {
     },
 }
 
-pub fn spawn_ax_worker(serial: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
+pub async fn spawn_ax_worker(serial: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
     let adb = super::AdbClient::discover(Some(serial));
-    let mut reader = AndroidAccessibility::with_adb_path(Some(serial), &adb.adb_path)?;
+    let mut reader = AndroidAccessibility::with_adb_path(Some(serial), &adb.adb_path).await?;
     let target = Target::Android(AndroidTarget::Serial(serial.to_string()));
     let (commands, mut command_rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()

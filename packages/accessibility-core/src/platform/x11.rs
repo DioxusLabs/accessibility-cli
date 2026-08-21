@@ -1063,18 +1063,24 @@ impl AccessibilityReader for LinuxAccessibility {
 
     // Platform adapter methods (merged from LinuxAdapter)
 
-    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
-        let pid = match target {
-            Target::Pid(pid) => Some(*pid),
-            Target::System => None,
-            _ => bail!("Linux screenshot requires Target::Pid or Target::System"),
-        };
-        if let Some(pid) = pid
-            && let Ok(screenshot) = self.capture_window(pid)
-        {
-            return Ok(screenshot);
+    #[allow(clippy::manual_async_fn)]
+    fn capture_screen(
+        &self,
+        target: &Target,
+    ) -> impl std::future::Future<Output = Result<Screenshot>> {
+        async move {
+            let pid = match target {
+                Target::Pid(pid) => Some(*pid),
+                Target::System => None,
+                _ => bail!("Linux screenshot requires Target::Pid or Target::System"),
+            };
+            if let Some(pid) = pid
+                && let Ok(screenshot) = self.capture_window(pid)
+            {
+                return Ok(screenshot);
+            }
+            LinuxAccessibility::capture_screen(self)
         }
-        LinuxAccessibility::capture_screen(self)
     }
 
     async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {

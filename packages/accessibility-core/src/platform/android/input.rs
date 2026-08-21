@@ -89,11 +89,11 @@ pub enum InputCommand {
     },
 }
 
-pub fn spawn_input_worker(
+pub async fn spawn_input_worker(
     serial: &str,
     geometry: ScreenGeometry,
 ) -> Result<UnboundedSender<InputCommand>> {
-    let discovery = discover_emulator(Some(serial))?;
+    let discovery = discover_emulator(Some(serial)).await?;
     let adb = AdbClient::discover(Some(serial));
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -122,11 +122,11 @@ pub fn spawn_input_worker(
                 while let Some(command) = command_rx.recv().await {
                     let command = match command {
                         InputCommand::Rotate { orientation } => {
-                            let _ = set_device_orientation(&adb, orientation);
+                            let _ = set_device_orientation(&adb, orientation).await;
                             continue;
                         }
                         InputCommand::Button { button } => {
-                            apply_hardware_button(&adb, button);
+                            apply_hardware_button(&adb, button).await;
                             continue;
                         }
                         command => command,
@@ -236,26 +236,28 @@ fn normalized_coordinate(value: f64, dimension: u32) -> i32 {
     (value.clamp(0.0, 1.0) * dimension.saturating_sub(1) as f64).round() as i32
 }
 
-fn apply_hardware_button(adb: &AdbClient, button: HardwareButton) {
+async fn apply_hardware_button(adb: &AdbClient, button: HardwareButton) {
     let key = match button {
         HardwareButton::Home => AndroidKeyCode::Home,
         HardwareButton::Back => AndroidKeyCode::Back,
         HardwareButton::Lock => AndroidKeyCode::Power,
         HardwareButton::AppSwitch => AndroidKeyCode::AppSwitch,
     };
-    let _ = adb.key_event(key as u32);
+    let _ = adb.key_event(key as u32).await;
 }
 
-pub fn set_device_orientation(adb: &AdbClient, orientation: Orientation) -> Result<()> {
-    adb.shell(&["wm", "fixed-to-user-rotation", "enabled"])?;
+pub async fn set_device_orientation(adb: &AdbClient, orientation: Orientation) -> Result<()> {
+    adb.shell(&["wm", "fixed-to-user-rotation", "enabled"])
+        .await?;
     let target = orientation.android_rotation();
-    adb.shell(&["wm", "user-rotation", "lock", &target.to_string()])?;
+    adb.shell(&["wm", "user-rotation", "lock", &target.to_string()])
+        .await?;
     for _ in 0..20 {
-        let output = adb.shell(&["dumpsys", "display"])?;
+        let output = adb.shell(&["dumpsys", "display"]).await?;
         if display_rotation(&output) == Some(target) {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     bail!("Android display did not reach rotation {target}")
 }

@@ -296,8 +296,11 @@ impl AccessibilityReader for IOSSimulatorAccessibility {
         IOSSimulatorAccessibility::snapshot_version(self)
     }
 
-    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
-        IOSSimulatorAccessibility::capture_screen(self)
+    fn capture_screen(
+        &self,
+        _target: &Target,
+    ) -> impl std::future::Future<Output = Result<Screenshot>> {
+        async move { IOSSimulatorAccessibility::capture_screen(self) }
     }
 
     fn get_screen_bounds(

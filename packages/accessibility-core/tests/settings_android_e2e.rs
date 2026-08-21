@@ -31,21 +31,22 @@ struct DeviceGuard {
 }
 
 impl DeviceGuard {
-    fn new() -> Result<Self> {
+    async fn new() -> Result<Self> {
         let adb = AdbClient::new(None);
         adb.command(&["wait-for-device"])
+            .await
             .context("Failed waiting for Android device")?;
-        adb.check_connection()?;
-        wait_for_boot(&adb)?;
-        stabilize_device(&adb);
+        adb.check_connection().await?;
+        wait_for_boot(&adb).await?;
+        stabilize_device(&adb).await;
         Ok(Self { adb })
     }
 }
 
-fn wait_for_boot(adb: &AdbClient) -> Result<()> {
+async fn wait_for_boot(adb: &AdbClient) -> Result<()> {
     let start = Instant::now();
     loop {
-        if let Ok(output) = adb.shell(&["getprop", "sys.boot_completed"])
+        if let Ok(output) = adb.shell(&["getprop", "sys.boot_completed"]).await
             && output.trim() == "1"
         {
             return Ok(());
@@ -58,34 +59,38 @@ fn wait_for_boot(adb: &AdbClient) -> Result<()> {
             );
         }
 
-        std::thread::sleep(Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-fn stabilize_device(adb: &AdbClient) {
-    let _ = adb.shell(&["input", "keyevent", "224"]);
-    let _ = adb.shell(&["wm", "dismiss-keyguard"]);
+async fn stabilize_device(adb: &AdbClient) {
+    let _ = adb.shell(&["input", "keyevent", "224"]).await;
+    let _ = adb.shell(&["wm", "dismiss-keyguard"]).await;
 
     for setting in [
         "window_animation_scale",
         "transition_animation_scale",
         "animator_duration_scale",
     ] {
-        let _ = adb.shell(&["settings", "put", "global", setting, "0"]);
+        let _ = adb
+            .shell(&["settings", "put", "global", setting, "0"])
+            .await;
     }
 }
 
-fn launch_settings(adb: &AdbClient) -> Result<()> {
-    let launcher_result = adb.launch_app(SETTINGS_PACKAGE, None);
-    let settings_result = adb.shell(&[
-        "am",
-        "start",
-        "-W",
-        "-a",
-        SETTINGS_ACTION,
-        "-p",
-        SETTINGS_PACKAGE,
-    ]);
+async fn launch_settings(adb: &AdbClient) -> Result<()> {
+    let launcher_result = adb.launch_app(SETTINGS_PACKAGE, None).await;
+    let settings_result = adb
+        .shell(&[
+            "am",
+            "start",
+            "-W",
+            "-a",
+            SETTINGS_ACTION,
+            "-p",
+            SETTINGS_PACKAGE,
+        ])
+        .await;
 
     match (launcher_result, settings_result) {
         (Ok(()), _) | (_, Ok(_)) => {}
@@ -99,11 +104,11 @@ fn launch_settings(adb: &AdbClient) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_settings_process(adb: &AdbClient, timeout: Duration) -> Result<()> {
+async fn wait_for_settings_process(adb: &AdbClient, timeout: Duration) -> Result<()> {
     let start = Instant::now();
 
     loop {
-        let observation = match adb.shell(&["pidof", SETTINGS_PACKAGE]) {
+        let observation = match adb.shell(&["pidof", SETTINGS_PACKAGE]).await {
             Ok(pid) => {
                 let pid = pid.trim();
                 if !pid.is_empty() {
@@ -111,7 +116,7 @@ fn wait_for_settings_process(adb: &AdbClient, timeout: Duration) -> Result<()> {
                 }
                 "pidof returned no Settings process".to_string()
             }
-            Err(pidof_error) => match adb.shell(&["ps", "-A"]) {
+            Err(pidof_error) => match adb.shell(&["ps", "-A"]).await {
                 Ok(processes) => {
                     if processes
                         .lines()
@@ -133,7 +138,7 @@ fn wait_for_settings_process(adb: &AdbClient, timeout: Duration) -> Result<()> {
             );
         }
 
-        std::thread::sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -144,8 +149,9 @@ struct AndroidSettingsGuard {
 
 impl AndroidSettingsGuard {
     async fn launch() -> Result<Self> {
-        let device = DeviceGuard::new()?;
+        let device = DeviceGuard::new().await?;
         let mut accessibility = AndroidAccessibility::new(None)
+            .await
             .context("Failed to create Android accessibility reader")?;
 
         reset_settings(&mut accessibility).await?;
@@ -172,7 +178,12 @@ impl AndroidSettingsGuard {
 
 impl Drop for AndroidSettingsGuard {
     fn drop(&mut self) {
-        let _ = self.device.adb.stop_app(SETTINGS_PACKAGE);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let adb = self.device.adb.clone();
+            handle.spawn(async move {
+                let _ = adb.stop_app(SETTINGS_PACKAGE).await;
+            });
+        }
     }
 }
 
@@ -185,13 +196,13 @@ impl Deref for AndroidSettingsGuard {
 }
 
 async fn reset_settings(accessibility: &mut AndroidAccessibility) -> Result<()> {
-    let _ = accessibility.adb().stop_app(SETTINGS_PACKAGE);
+    let _ = accessibility.adb().stop_app(SETTINGS_PACKAGE).await;
     let _ = accessibility.wake_up().await;
     let _ = accessibility.press_home().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    launch_settings(accessibility.adb())?;
-    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT)?;
+    launch_settings(accessibility.adb()).await?;
+    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     Ok(())
 }
@@ -231,7 +242,7 @@ async fn wait_for_settings_tree(
         }
 
         if start.elapsed() >= next_relaunch {
-            let _ = launch_settings(adb);
+            let _ = launch_settings(adb).await;
             next_relaunch = start.elapsed() + SETTINGS_RELAUNCH_INTERVAL;
         }
 
@@ -252,9 +263,10 @@ fn count_role(element: &Element, role: Role) -> usize {
 #[serial]
 #[ignore = "Requires Android device/emulator with ADB"]
 async fn test_android_device_input_smoke() -> Result<()> {
-    let device = DeviceGuard::new()?;
-    let mut accessibility =
-        AndroidAccessibility::new(None).context("Failed to create Android accessibility reader")?;
+    let device = DeviceGuard::new().await?;
+    let mut accessibility = AndroidAccessibility::new(None)
+        .await
+        .context("Failed to create Android accessibility reader")?;
 
     accessibility.wake_up().await?;
     accessibility.press_home().await?;
@@ -266,12 +278,13 @@ async fn test_android_device_input_smoke() -> Result<()> {
 
     let (width, height) = accessibility
         .refresh_screen_size()
+        .await
         .context("Failed to get Android screen size")?;
     assert!(width > 0);
     assert!(height > 0);
 
-    launch_settings(accessibility.adb())?;
-    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT)?;
+    launch_settings(accessibility.adb()).await?;
+    wait_for_settings_process(accessibility.adb(), SETTINGS_PROCESS_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let center_x = width as f64 / 2.0;
@@ -285,7 +298,7 @@ async fn test_android_device_input_smoke() -> Result<()> {
         .swipe((center_x, end_y), (center_x, start_y), 300)
         .await?;
 
-    let _ = device.adb.stop_app(SETTINGS_PACKAGE);
+    let _ = device.adb.stop_app(SETTINGS_PACKAGE).await;
     Ok(())
 }
 

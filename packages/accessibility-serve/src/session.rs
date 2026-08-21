@@ -136,29 +136,35 @@ impl Session {
         }
     }
 
-    pub fn send_input_json(&self, payload: &str) -> Result<()> {
+    pub async fn send_input_json(&self, payload: &str) -> Result<()> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Ios(session) => {
                 session.send_input(serde_json::from_str::<ios_input::InputCommand>(payload)?);
             }
             Self::Android(session) => {
-                session.send_input(serde_json::from_str::<android_input::InputCommand>(
-                    payload,
-                )?);
+                session
+                    .send_input(serde_json::from_str::<android_input::InputCommand>(
+                        payload,
+                    )?)
+                    .await;
             }
         }
         Ok(())
     }
 
-    pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+    pub async fn set_orientation(&self, orientation: Orientation) -> Result<()> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Ios(session) => {
                 session.set_orientation(to_ios_orientation(orientation));
                 Ok(())
             }
-            Self::Android(session) => session.set_orientation(to_android_orientation(orientation)),
+            Self::Android(session) => {
+                session
+                    .set_orientation(to_android_orientation(orientation))
+                    .await
+            }
         }
     }
 

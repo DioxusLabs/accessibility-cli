@@ -195,7 +195,7 @@ async fn set_orientation(
     State(state): State<AppState>,
     Json(request): Json<OrientationRequest>,
 ) -> Response {
-    match state.session.set_orientation(request.orientation) {
+    match state.session.set_orientation(request.orientation).await {
         Ok(()) => Json(serde_json::json!({ "orientation": request.orientation })).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
@@ -336,7 +336,7 @@ async fn pump_input(state: AppState, mut socket: WebSocket) {
             _ => continue,
         };
 
-        if let Err(error) = state.session.send_input_json(&payload) {
+        if let Err(error) = state.session.send_input_json(&payload).await {
             tracing::debug!("ignoring malformed input event: {error}");
         }
     }

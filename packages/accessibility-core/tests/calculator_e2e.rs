@@ -506,6 +506,7 @@ async fn test_screen_screenshot() {
 
     let screenshot = accessibility
         .capture_screen(&Target::System)
+        .await
         .expect("Failed to capture screen");
 
     // Screen should have reasonable dimensions (at least 800x600)

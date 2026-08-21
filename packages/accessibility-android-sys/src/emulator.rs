@@ -38,9 +38,9 @@ pub struct EmulatorDiscovery {
 }
 
 impl EmulatorDiscovery {
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let contents = std::fs::read_to_string(path).with_context(|| {
+        let contents = tokio::fs::read_to_string(path).await.with_context(|| {
             format!("failed to read emulator discovery file {}", path.display())
         })?;
         let properties = parse_properties(&contents);
@@ -246,17 +246,17 @@ impl EmulatorGrpcClient {
     }
 }
 
-pub fn discover_emulator(selector: Option<&str>) -> Result<EmulatorDiscovery> {
-    discover_emulator_in(&discovery_directories(), selector)
+pub async fn discover_emulator(selector: Option<&str>) -> Result<EmulatorDiscovery> {
+    discover_emulator_in(&discovery_directories(), selector).await
 }
 
-pub fn discover_emulator_in(
+pub async fn discover_emulator_in(
     directories: &[PathBuf],
     selector: Option<&str>,
 ) -> Result<EmulatorDiscovery> {
     let mut paths = BTreeSet::new();
     for directory in directories {
-        let entries = match std::fs::read_dir(directory) {
+        let mut entries = match tokio::fs::read_dir(directory).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -268,8 +268,8 @@ pub fn discover_emulator_in(
                 });
             }
         };
-        for entry in entries {
-            let path = entry?.path();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -279,10 +279,12 @@ pub fn discover_emulator_in(
         }
     }
 
-    let mut discoveries = paths
-        .into_iter()
-        .filter_map(|path| EmulatorDiscovery::from_file(path).ok())
-        .collect::<Vec<_>>();
+    let mut discoveries = Vec::new();
+    for path in paths {
+        if let Ok(discovery) = EmulatorDiscovery::from_file(path).await {
+            discoveries.push(discovery);
+        }
+    }
     if let Some(selector) = selector {
         discoveries.retain(|discovery| discovery.matches(selector));
     }
@@ -351,9 +353,9 @@ mod tests {
         path
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    fn parses_discovery_file() {
+    async fn parses_discovery_file() {
         let directory = test_directory("parse");
         let path = directory.join("pid_1234.ini");
         std::fs::write(
@@ -361,7 +363,7 @@ mod tests {
             "grpc.port = 8554\ngrpc.token = secret\navd.name = Pixel_8\nport.serial = 5554\n",
         )
         .unwrap();
-        let discovery = EmulatorDiscovery::from_file(&path).unwrap();
+        let discovery = EmulatorDiscovery::from_file(&path).await.unwrap();
         assert_eq!(discovery.pid, Some(1234));
         assert_eq!(discovery.grpc_port, 8554);
         assert_eq!(discovery.grpc_token.as_deref(), Some("secret"));
@@ -370,9 +372,9 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    fn selects_one_emulator() {
+    async fn selects_one_emulator() {
         let directory = test_directory("select");
         std::fs::write(
             directory.join("pid_1.ini"),
@@ -384,10 +386,15 @@ mod tests {
             "grpc.port=8555\navd.name=tablet\n",
         )
         .unwrap();
-        let discovery =
-            discover_emulator_in(std::slice::from_ref(&directory), Some("tablet")).unwrap();
+        let discovery = discover_emulator_in(std::slice::from_ref(&directory), Some("tablet"))
+            .await
+            .unwrap();
         assert_eq!(discovery.grpc_port, 8555);
-        assert!(discover_emulator_in(std::slice::from_ref(&directory), None).is_err());
+        assert!(
+            discover_emulator_in(std::slice::from_ref(&directory), None)
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

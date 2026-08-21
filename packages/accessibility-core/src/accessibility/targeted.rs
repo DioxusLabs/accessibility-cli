@@ -76,6 +76,23 @@ macro_rules! dispatch_mut_async {
     };
 }
 
+/// Macro to dispatch immutable async method calls to the inner reader implementation.
+macro_rules! dispatch_async {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match &$self.inner {
+            #[cfg(target_os = "macos")]
+            AccessibilityReaderImpl::MacOS(r) => AccessibilityReader::$method(r $(, $arg)*).await,
+            #[cfg(target_os = "macos")]
+            AccessibilityReaderImpl::IOSSimulator(r) => AccessibilityReader::$method(r $(, $arg)*).await,
+            #[cfg(target_os = "windows")]
+            AccessibilityReaderImpl::Windows(r) => AccessibilityReader::$method(r $(, $arg)*).await,
+            #[cfg(target_os = "linux")]
+            AccessibilityReaderImpl::Linux(r) => AccessibilityReader::$method(r $(, $arg)*).await,
+            AccessibilityReaderImpl::Android(r) => AccessibilityReader::$method(r $(, $arg)*).await,
+        }
+    };
+}
+
 /// Wrapper that stores a target and provides convenience methods.
 ///
 /// This wrapper holds an underlying `AccessibilityReader` implementation and
@@ -94,7 +111,7 @@ macro_rules! dispatch_mut_async {
 ///
 /// // No need to pass pid on every call
 /// let tree = reader.get_tree(&TreeFilter::default())?;
-/// let screenshot = reader.capture_screen()?;
+/// let screenshot = reader.capture_screen().await?;
 /// reader.keystroke(Code::Enter, Modifiers::empty())?;
 /// ```
 pub struct TargetedAccessibility {
@@ -252,10 +269,10 @@ impl TargetedAccessibility {
     }
 
     /// Create a new Android accessibility reader.
-    pub fn new_android(target: AndroidTarget) -> Result<Self> {
+    pub async fn new_android(target: AndroidTarget) -> Result<Self> {
         Ok(Self {
             inner: AccessibilityReaderImpl::Android(
-                crate::platform::android::AndroidAccessibility::new(target.serial())?,
+                crate::platform::android::AndroidAccessibility::new(target.serial()).await?,
             ),
             target: Target::Android(target),
         })
@@ -279,8 +296,8 @@ impl TargetedAccessibility {
     /// Capture a screenshot of the target window.
     ///
     /// Uses the stored target automatically.
-    pub fn capture_screen(&self) -> Result<Screenshot> {
-        dispatch!(self, capture_screen, &self.target)
+    pub async fn capture_screen(&self) -> Result<Screenshot> {
+        dispatch_async!(self, capture_screen, &self.target)
     }
 
     /// Get the bounds of the target window.

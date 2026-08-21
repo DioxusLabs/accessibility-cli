@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! Rust (AndroidAccessibility)
-//!     ↓ std::process::Command
+//!     ↓ tokio::process::Command
 //! adb shell / adb exec-out
 //!     ↓
 //! Android Device/Emulator
@@ -32,7 +32,7 @@
 //! use accessibility_core::accessibility::{AccessibilityReader, TreeFilter};
 //!
 //! // Connect to the default device
-//! let mut reader = AndroidAccessibility::new(None)?;
+//! let mut reader = AndroidAccessibility::new(None).await?;
 //!
 //! // Get the UI tree
 //! let tree = reader.get_tree(&Target::Android(AndroidTarget::DefaultDevice), &TreeFilter::default()).await?;
@@ -501,17 +501,17 @@ impl AndroidAccessibility {
     /// # Example
     /// ```ignore
     /// // Connect to default device
-    /// let reader = AndroidAccessibility::new(None)?;
+    /// let reader = AndroidAccessibility::new(None).await?;
     ///
     /// // Connect to specific device
-    /// let reader = AndroidAccessibility::new(Some("emulator-5554"))?;
+    /// let reader = AndroidAccessibility::new(Some("emulator-5554")).await?;
     /// ```
-    pub fn new(serial: Option<&str>) -> Result<Self> {
+    pub async fn new(serial: Option<&str>) -> Result<Self> {
         let adb = AdbClient::new(serial);
-        adb.check_connection()?;
+        adb.check_connection().await?;
 
         // Get initial screen size
-        let screen_size = adb.get_screen_size().ok();
+        let screen_size = adb.get_screen_size().await.ok();
 
         Ok(Self {
             adb,
@@ -523,11 +523,11 @@ impl AndroidAccessibility {
     }
 
     /// Create a new Android accessibility reader with a custom ADB path.
-    pub fn with_adb_path(serial: Option<&str>, adb_path: &str) -> Result<Self> {
+    pub async fn with_adb_path(serial: Option<&str>, adb_path: &str) -> Result<Self> {
         let adb = AdbClient::with_adb_path(serial, adb_path);
-        adb.check_connection()?;
+        adb.check_connection().await?;
 
-        let screen_size = adb.get_screen_size().ok();
+        let screen_size = adb.get_screen_size().await.ok();
 
         Ok(Self {
             adb,
@@ -549,8 +549,8 @@ impl AndroidAccessibility {
     }
 
     /// Refresh the cached screen size.
-    pub fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
-        let size = self.adb.get_screen_size()?;
+    pub async fn refresh_screen_size(&mut self) -> Result<(u32, u32)> {
+        let size = self.adb.get_screen_size().await?;
         self.screen_size = Some(size);
         Ok(size)
     }
@@ -575,7 +575,7 @@ impl AccessibilityReader for AndroidAccessibility {
             self.element_bounds.clear();
 
             // Dump UI hierarchy
-            let xml = self.adb.dump_ui()?;
+            let xml = self.adb.dump_ui().await?;
 
             // Parse XML into node tree
             let root_node = parse_ui_xml(&xml)?;
@@ -622,7 +622,7 @@ impl AccessibilityReader for AndroidAccessibility {
                     let center = self
                         .get_element_center(id)
                         .ok_or_else(|| anyhow!("Element {} not found or has no bounds", id))?;
-                    self.adb.tap(center.x, center.y)?;
+                    self.adb.tap(center.x, center.y).await?;
                     Ok(())
                 }
                 Action::Focus => {
@@ -630,7 +630,7 @@ impl AccessibilityReader for AndroidAccessibility {
                     let center = self
                         .get_element_center(id)
                         .ok_or_else(|| anyhow!("Element {} not found or has no bounds", id))?;
-                    self.adb.tap(center.x, center.y)?;
+                    self.adb.tap(center.x, center.y).await?;
                     Ok(())
                 }
                 Action::ScrollIntoView => {
@@ -640,7 +640,8 @@ impl AccessibilityReader for AndroidAccessibility {
                         let start_y = size.1 as f64 * 0.7;
                         let end_y = size.1 as f64 * 0.3;
                         self.adb
-                            .swipe((center_x, start_y), (center_x, end_y), 300)?;
+                            .swipe((center_x, start_y), (center_x, end_y), 300)
+                            .await?;
                     }
                     Ok(())
                 }
@@ -657,19 +658,19 @@ impl AccessibilityReader for AndroidAccessibility {
             let center = self
                 .get_element_center(id)
                 .ok_or_else(|| anyhow!("Element {} not found or has no bounds", id))?;
-            self.adb.tap(center.x, center.y)?;
+            self.adb.tap(center.x, center.y).await?;
 
             // Small delay to ensure focus
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             // Clear existing text (select all and delete)
-            self.adb.key_event(AndroidKeyCode::CtrlLeft as u32)?;
-            self.adb.key_event(AndroidKeyCode::A as u32)?;
-            self.adb.key_event(AndroidKeyCode::Del as u32)?;
+            self.adb.key_event(AndroidKeyCode::CtrlLeft as u32).await?;
+            self.adb.key_event(AndroidKeyCode::A as u32).await?;
+            self.adb.key_event(AndroidKeyCode::Del as u32).await?;
 
             // Type the new value
             if !value.is_empty() {
-                self.adb.input_text(value)?;
+                self.adb.input_text(value).await?;
             }
 
             Ok(())
@@ -709,25 +710,27 @@ impl AccessibilityReader for AndroidAccessibility {
         self.cache.version()
     }
 
-    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
-        let data = self.adb.screenshot()?;
+    fn capture_screen(&self, _target: &Target) -> impl Future<Output = Result<Screenshot>> {
+        async move {
+            let data = self.adb.screenshot().await?;
 
-        // Get image dimensions from PNG header
-        let (width, height) = if data.len() > 24 {
-            // PNG header: 8 bytes signature, then IHDR chunk
-            // IHDR starts at byte 8, width at 16, height at 20 (both big-endian u32)
-            let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
-            let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
-            (width, height)
-        } else {
-            self.screen_size.unwrap_or_default()
-        };
+            // Get image dimensions from PNG header
+            let (width, height) = if data.len() > 24 {
+                // PNG header: 8 bytes signature, then IHDR chunk
+                // IHDR starts at byte 8, width at 16, height at 20 (both big-endian u32)
+                let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+                let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+                (width, height)
+            } else {
+                self.screen_size.unwrap_or_default()
+            };
 
-        Ok(Screenshot {
-            data,
-            width,
-            height,
-        })
+            Ok(Screenshot {
+                data,
+                width,
+                height,
+            })
+        }
     }
 
     fn get_screen_bounds(&self, _target: &Target) -> impl Future<Output = Result<Rect>> {
@@ -755,21 +758,21 @@ impl AccessibilityReader for AndroidAccessibility {
         async move {
             // Press modifiers
             if modifiers.contains(Modifiers::SHIFT) {
-                self.adb.key_event(AndroidKeyCode::ShiftLeft as u32)?;
+                self.adb.key_event(AndroidKeyCode::ShiftLeft as u32).await?;
             }
             if modifiers.contains(Modifiers::CONTROL) {
-                self.adb.key_event(AndroidKeyCode::CtrlLeft as u32)?;
+                self.adb.key_event(AndroidKeyCode::CtrlLeft as u32).await?;
             }
             if modifiers.contains(Modifiers::ALT) {
-                self.adb.key_event(AndroidKeyCode::AltLeft as u32)?;
+                self.adb.key_event(AndroidKeyCode::AltLeft as u32).await?;
             }
             if modifiers.contains(Modifiers::META) {
-                self.adb.key_event(AndroidKeyCode::MetaLeft as u32)?;
+                self.adb.key_event(AndroidKeyCode::MetaLeft as u32).await?;
             }
 
             // Press main key
             if let Some(keycode) = AndroidKeyCode::from_code(key) {
-                self.adb.key_event(keycode as u32)?;
+                self.adb.key_event(keycode as u32).await?;
             } else {
                 bail!("Unsupported key code: {:?}", key);
             }
@@ -780,7 +783,7 @@ impl AccessibilityReader for AndroidAccessibility {
 
     fn type_raw(&mut self, _target: &Target, text: &str) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.input_text(text)?;
+            self.adb.input_text(text).await?;
             Ok(())
         }
     }
@@ -794,7 +797,7 @@ impl AccessibilityReader for AndroidAccessibility {
     ) -> impl Future<Output = Result<()>> {
         async move {
             // Android only supports single tap (no right-click)
-            self.adb.tap(x, y)?;
+            self.adb.tap(x, y).await?;
             Ok(())
         }
     }
@@ -821,7 +824,9 @@ impl AccessibilityReader for AndroidAccessibility {
             let end_x = center_x + delta_x * swipe_distance / 2.0;
             let end_y = center_y - delta_y * swipe_distance / 2.0;
 
-            self.adb.swipe((start_x, start_y), (end_x, end_y), 100)?;
+            self.adb
+                .swipe((start_x, start_y), (end_x, end_y), 100)
+                .await?;
             Ok(())
         }
     }
@@ -990,84 +995,88 @@ pub trait AndroidExtensions {
 impl AndroidExtensions for AndroidAccessibility {
     fn press_back(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Back as u32)?;
+            self.adb.key_event(AndroidKeyCode::Back as u32).await?;
             Ok(())
         }
     }
 
     fn press_home(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Home as u32)?;
+            self.adb.key_event(AndroidKeyCode::Home as u32).await?;
             Ok(())
         }
     }
 
     fn press_recent_apps(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::AppSwitch as u32)?;
+            self.adb.key_event(AndroidKeyCode::AppSwitch as u32).await?;
             Ok(())
         }
     }
 
     fn press_menu(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Menu as u32)?;
+            self.adb.key_event(AndroidKeyCode::Menu as u32).await?;
             Ok(())
         }
     }
 
     fn volume_up(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::VolumeUp as u32)?;
+            self.adb.key_event(AndroidKeyCode::VolumeUp as u32).await?;
             Ok(())
         }
     }
 
     fn volume_down(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::VolumeDown as u32)?;
+            self.adb
+                .key_event(AndroidKeyCode::VolumeDown as u32)
+                .await?;
             Ok(())
         }
     }
 
     fn volume_mute(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::VolumeMute as u32)?;
+            self.adb
+                .key_event(AndroidKeyCode::VolumeMute as u32)
+                .await?;
             Ok(())
         }
     }
 
     fn press_power(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Power as u32)?;
+            self.adb.key_event(AndroidKeyCode::Power as u32).await?;
             Ok(())
         }
     }
 
     fn wake_up(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Wakeup as u32)?;
+            self.adb.key_event(AndroidKeyCode::Wakeup as u32).await?;
             Ok(())
         }
     }
 
     fn sleep(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.key_event(AndroidKeyCode::Sleep as u32)?;
+            self.adb.key_event(AndroidKeyCode::Sleep as u32).await?;
             Ok(())
         }
     }
 
     fn launch_app(&mut self, package: &str) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.launch_app(package, None)?;
+            self.adb.launch_app(package, None).await?;
             Ok(())
         }
     }
 
     fn stop_app(&mut self, package: &str) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.stop_app(package)?;
+            self.adb.stop_app(package).await?;
             Ok(())
         }
     }
@@ -1079,7 +1088,7 @@ impl AndroidExtensions for AndroidAccessibility {
         duration_ms: u64,
     ) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.swipe(start, end, duration_ms)?;
+            self.adb.swipe(start, end, duration_ms).await?;
             Ok(())
         }
     }
@@ -1087,26 +1096,29 @@ impl AndroidExtensions for AndroidAccessibility {
     fn long_press(&mut self, x: f64, y: f64, duration_ms: u64) -> impl Future<Output = Result<()>> {
         async move {
             // Long press is a swipe with same start and end
-            self.adb.swipe((x, y), (x, y), duration_ms)?;
+            self.adb.swipe((x, y), (x, y), duration_ms).await?;
             Ok(())
         }
     }
 
     fn get_current_activity(&self) -> impl Future<Output = Result<String>> {
-        async move { self.adb.get_current_activity() }
+        async move { self.adb.get_current_activity().await }
     }
 
     fn open_notifications(&mut self) -> impl Future<Output = Result<()>> {
         async move {
             self.adb
-                .shell(&["cmd", "statusbar", "expand-notifications"])?;
+                .shell(&["cmd", "statusbar", "expand-notifications"])
+                .await?;
             Ok(())
         }
     }
 
     fn open_quick_settings(&mut self) -> impl Future<Output = Result<()>> {
         async move {
-            self.adb.shell(&["cmd", "statusbar", "expand-settings"])?;
+            self.adb
+                .shell(&["cmd", "statusbar", "expand-settings"])
+                .await?;
             Ok(())
         }
     }

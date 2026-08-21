@@ -157,6 +157,7 @@ impl App {
             },
             Platform::Android => match &config.target {
                 Target::Android(target) => TargetedAccessibility::new_android(target.clone())
+                    .await
                     .map_err(|e| Error::ConnectionFailed {
                         message: format!("Failed to create Android adapter: {}", e),
                     }),
@@ -286,6 +287,7 @@ impl App {
         let inner = self.inner.lock().await;
         inner
             .capture_screen()
+            .await
             .map_err(|e: anyhow::Error| Error::ScreenshotFailed {
                 message: e.to_string(),
             })

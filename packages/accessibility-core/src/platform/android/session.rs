@@ -63,14 +63,14 @@ pub struct EmulatorSession {
 }
 
 impl EmulatorSession {
-    pub fn start(serial: Option<&str>, config: VideoConfig) -> Result<Arc<Self>> {
+    pub async fn start(serial: Option<&str>, config: VideoConfig) -> Result<Arc<Self>> {
         let adb = AdbClient::discover(serial);
-        let serial = adb.resolved_serial()?;
+        let serial = adb.resolved_serial().await?;
         if !serial.starts_with("emulator-") {
             bail!("Android Emulator streaming requires an emulator serial, got '{serial}'");
         }
         let adb = AdbClient::discover(Some(&serial));
-        let (width, height) = adb.get_screen_size()?;
+        let (width, height) = adb.get_screen_size().await?;
         let geometry = ScreenGeometry { width, height };
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let stats = Arc::new(StreamStats::default());
@@ -89,8 +89,8 @@ impl EmulatorSession {
             })
         };
         let capture = AndroidVideoCapture::start(adb.clone(), geometry, &config, sink)?;
-        let input = spawn_input_worker(&serial, geometry)?;
-        let ax = spawn_ax_worker(&serial)?;
+        let input = spawn_input_worker(&serial, geometry).await?;
+        let ax = spawn_ax_worker(&serial).await?;
         Ok(Arc::new(Self {
             serial,
             adb,
@@ -133,16 +133,16 @@ impl EmulatorSession {
         *self.orientation.lock().unwrap()
     }
 
-    pub fn set_orientation(&self, orientation: Orientation) -> Result<()> {
-        set_device_orientation(&self.adb, orientation)?;
+    pub async fn set_orientation(&self, orientation: Orientation) -> Result<()> {
+        set_device_orientation(&self.adb, orientation).await?;
         self.capture.set_landscape(orientation.is_landscape())?;
         *self.orientation.lock().unwrap() = orientation;
         Ok(())
     }
 
-    pub fn send_input(&self, command: InputCommand) {
+    pub async fn send_input(&self, command: InputCommand) {
         if let InputCommand::Rotate { orientation } = command {
-            let _ = self.set_orientation(orientation);
+            let _ = self.set_orientation(orientation).await;
             return;
         }
         let _ = self.input.send(command);
