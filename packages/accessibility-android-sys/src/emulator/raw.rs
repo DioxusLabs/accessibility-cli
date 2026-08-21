@@ -48,7 +48,7 @@ impl RawFrameStream {
         if config.width == 0 || config.height == 0 {
             bail!("raw Android capture requires non-zero dimensions");
         }
-        let discovery = discover_emulator(selector)?;
+        let discovery = discover_emulator(selector).await?;
         Self::start_with_discovery(discovery, config).await
     }
 

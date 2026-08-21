@@ -189,13 +189,18 @@ impl AccessibilityReader for WindowsAccessibility {
         self.cache.version()
     }
 
-    fn capture_screen(&self, target: &Target) -> Result<Screenshot> {
-        let screenshot = match target {
-            Target::Pid(pid) => self.inner.capture_screen_for_pid(*pid),
-            Target::System => self.inner.capture_screen(),
-            _ => bail!("Windows screenshot requires Target::Pid or Target::System"),
-        };
-        screenshot.map(from_sys_screenshot)
+    fn capture_screen(
+        &self,
+        target: &Target,
+    ) -> impl std::future::Future<Output = Result<Screenshot>> {
+        async move {
+            let screenshot = match target {
+                Target::Pid(pid) => self.inner.capture_screen_for_pid(*pid),
+                Target::System => self.inner.capture_screen(),
+                _ => bail!("Windows screenshot requires Target::Pid or Target::System"),
+            };
+            screenshot.map(from_sys_screenshot)
+        }
     }
 
     async fn get_screen_bounds(&self, target: &Target) -> Result<Rect> {

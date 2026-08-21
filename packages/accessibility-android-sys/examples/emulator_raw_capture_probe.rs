@@ -17,7 +17,7 @@ const PROBE_DURATION: Duration = Duration::from_secs(5);
 #[tokio::main]
 async fn main() -> Result<()> {
     let selector = std::env::args().nth(1);
-    let discovery = discover_emulator(selector.as_deref())?;
+    let discovery = discover_emulator(selector.as_deref()).await?;
     let serial = discovery
         .properties
         .get("port.serial")
@@ -32,18 +32,20 @@ async fn main() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stimulus_stop = Arc::clone(&stop);
     let stimulus_serial = serial.clone();
-    let stimulus = std::thread::spawn(move || {
+    let stimulus = tokio::spawn(async move {
         let adb = AdbClient::discover(Some(&stimulus_serial));
-        let Ok((width, height)) = adb.get_screen_size() else {
+        let Ok((width, height)) = adb.get_screen_size().await else {
             return;
         };
         while !stimulus_stop.load(Ordering::Relaxed) {
-            let _ = adb.swipe(
-                (width as f64 * 0.5, height as f64 * 0.75),
-                (width as f64 * 0.5, height as f64 * 0.25),
-                250,
-            );
-            std::thread::sleep(Duration::from_millis(150));
+            let _ = adb
+                .swipe(
+                    (width as f64 * 0.5, height as f64 * 0.75),
+                    (width as f64 * 0.5, height as f64 * 0.25),
+                    250,
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     });
 
@@ -52,7 +54,7 @@ async fn main() -> Result<()> {
     let mmap = probe_mmap(client).await?;
     print_report("mmap", &mmap);
     stop.store(true, Ordering::Relaxed);
-    let _ = stimulus.join();
+    let _ = stimulus.await;
     println!("probe passed");
     Ok(())
 }

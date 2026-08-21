@@ -133,6 +133,7 @@ pub async fn serve(_config: ServeConfig) -> Result<()> {
 
 pub async fn serve_emulator(config: ServeEmulatorConfig) -> Result<()> {
     let session = session::EmulatorSession::start(config.serial.as_deref(), config.video)
+        .await
         .context("failed to start Android Emulator capture")?;
     let session = session::Session::android(session);
     session.seed_orientation().await;

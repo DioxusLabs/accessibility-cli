@@ -31,7 +31,7 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 #[tokio::main]
 async fn main() -> Result<()> {
     let selector = std::env::args().nth(1);
-    let discovery = discover_emulator(selector.as_deref())?;
+    let discovery = discover_emulator(selector.as_deref()).await?;
     println!("discovery : {}", discovery.path.display());
     println!("endpoint  : {}", discovery.endpoint());
 

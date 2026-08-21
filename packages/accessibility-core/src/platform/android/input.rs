@@ -1,5 +1,3 @@
-use std::sync::mpsc;
-
 use accessibility_android_sys::emulator::protocol::controller::input_event;
 use accessibility_android_sys::emulator::protocol::controller::keyboard_event::{
     KeyCodeType, KeyEventType,
@@ -11,7 +9,7 @@ use accessibility_android_sys::emulator::{EmulatorGrpcClient, discover_emulator}
 use accessibility_android_sys::{AdbClient, AndroidKeyCode};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 use crate::video::ScreenGeometry;
 
@@ -89,58 +87,44 @@ pub enum InputCommand {
     },
 }
 
-pub fn spawn_input_worker(
+pub async fn spawn_input_worker(
     serial: &str,
     geometry: ScreenGeometry,
 ) -> Result<UnboundedSender<InputCommand>> {
-    let discovery = discover_emulator(Some(serial))?;
+    let discovery = discover_emulator(Some(serial)).await?;
     let adb = AdbClient::discover(Some(serial));
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("android-emulator-input".into())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error.to_string()));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut client = match EmulatorGrpcClient::connect(discovery).await {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let _ = ready_tx.send(Ok(()));
+        while let Some(command) = command_rx.recv().await {
+            let command = match command {
+                InputCommand::Rotate { orientation } => {
+                    let _ = set_device_orientation(&adb, orientation).await;
+                    continue;
+                }
+                InputCommand::Button { button } => {
+                    apply_hardware_button(&adb, button).await;
+                    continue;
+                }
+                command => command,
+            };
+            for event in to_events(command, geometry) {
+                if let Err(error) = client.send_input(event).await {
+                    eprintln!("Android Emulator input failed: {error:#}");
                     return;
                 }
-            };
-            runtime.block_on(async move {
-                let mut client = match EmulatorGrpcClient::connect(discovery).await {
-                    Ok(client) => client,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                let _ = ready_tx.send(Ok(()));
-                while let Some(command) = command_rx.recv().await {
-                    let command = match command {
-                        InputCommand::Rotate { orientation } => {
-                            let _ = set_device_orientation(&adb, orientation);
-                            continue;
-                        }
-                        InputCommand::Button { button } => {
-                            apply_hardware_button(&adb, button);
-                            continue;
-                        }
-                        command => command,
-                    };
-                    for event in to_events(command, geometry) {
-                        if let Err(error) = client.send_input(event).await {
-                            eprintln!("Android Emulator input failed: {error:#}");
-                            return;
-                        }
-                    }
-                }
-            });
-        })?;
-    match ready_rx.recv() {
+            }
+        }
+    });
+    match ready_rx.await {
         Ok(Ok(())) => Ok(commands),
         Ok(Err(error)) => Err(anyhow!(error)),
         Err(_) => Err(anyhow!(
@@ -236,26 +220,28 @@ fn normalized_coordinate(value: f64, dimension: u32) -> i32 {
     (value.clamp(0.0, 1.0) * dimension.saturating_sub(1) as f64).round() as i32
 }
 
-fn apply_hardware_button(adb: &AdbClient, button: HardwareButton) {
+async fn apply_hardware_button(adb: &AdbClient, button: HardwareButton) {
     let key = match button {
         HardwareButton::Home => AndroidKeyCode::Home,
         HardwareButton::Back => AndroidKeyCode::Back,
         HardwareButton::Lock => AndroidKeyCode::Power,
         HardwareButton::AppSwitch => AndroidKeyCode::AppSwitch,
     };
-    let _ = adb.key_event(key as u32);
+    let _ = adb.key_event(key as u32).await;
 }
 
-pub fn set_device_orientation(adb: &AdbClient, orientation: Orientation) -> Result<()> {
-    adb.shell(&["wm", "fixed-to-user-rotation", "enabled"])?;
+pub async fn set_device_orientation(adb: &AdbClient, orientation: Orientation) -> Result<()> {
+    adb.shell(&["wm", "fixed-to-user-rotation", "enabled"])
+        .await?;
     let target = orientation.android_rotation();
-    adb.shell(&["wm", "user-rotation", "lock", &target.to_string()])?;
+    adb.shell(&["wm", "user-rotation", "lock", &target.to_string()])
+        .await?;
     for _ in 0..20 {
-        let output = adb.shell(&["dumpsys", "display"])?;
+        let output = adb.shell(&["dumpsys", "display"]).await?;
         if display_rotation(&output) == Some(target) {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     bail!("Android display did not reach rotation {target}")
 }

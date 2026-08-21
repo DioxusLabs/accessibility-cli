@@ -79,7 +79,7 @@ fn screenshot_path() -> std::path::PathBuf {
 /// Handle screenshot-screen command.
 async fn handle_screenshot_screen(adapter: &TargetedAccessibility, args: &CommonArgs) {
     println!("Capturing full screen screenshot...");
-    match adapter.capture_screen() {
+    match adapter.capture_screen().await {
         Ok(screenshot) => {
             if args.overlay {
                 match adapter.get_screen_bounds().await {
@@ -109,7 +109,7 @@ async fn handle_screenshot_screen(adapter: &TargetedAccessibility, args: &Common
                         eprintln!("Failed to get screen bounds: {}", e);
                         // Save raw screenshot without overlay as fallback
                         let filename = screenshot_path();
-                        if let Err(e) = std::fs::write(&filename, &screenshot.data) {
+                        if let Err(e) = tokio::fs::write(&filename, &screenshot.data).await {
                             eprintln!("Failed to save screenshot to {}: {}", filename.display(), e);
                             std::process::exit(1);
                         }
@@ -123,7 +123,7 @@ async fn handle_screenshot_screen(adapter: &TargetedAccessibility, args: &Common
                 }
             } else {
                 let filename = screenshot_path();
-                if let Err(e) = std::fs::write(&filename, &screenshot.data) {
+                if let Err(e) = tokio::fs::write(&filename, &screenshot.data).await {
                     eprintln!("Failed to write {}: {}", filename.display(), e);
                     std::process::exit(1);
                 }
@@ -190,7 +190,7 @@ async fn handle_annotate(
     }
 
     // Capture screenshot
-    let screenshot = match adapter.capture_screen() {
+    let screenshot = match adapter.capture_screen().await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to capture screenshot: {}", e);
@@ -836,7 +836,7 @@ async fn handle_screenshot_elements(
             std::process::exit(1);
         }
     };
-    let screenshot = match adapter.capture_screen() {
+    let screenshot = match adapter.capture_screen().await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to capture screen: {}", e);
@@ -876,7 +876,7 @@ async fn handle_screenshot_elements(
             match screenshot.crop(bounds, &screen_bounds) {
                 Ok(cropped) => {
                     let filename = screenshot_path();
-                    if let Err(e) = std::fs::write(&filename, &cropped.data) {
+                    if let Err(e) = tokio::fs::write(&filename, &cropped.data).await {
                         eprintln!("Failed to write {}: {}", filename.display(), e);
                         std::process::exit(1);
                     }
@@ -2274,7 +2274,7 @@ pub async fn run_cli(cli: &Cli) {
         // Android works on all host platforms via ADB
         PlatformType::Android => {
             // Create raw AndroidAccessibility for Android-specific commands
-            let mut android_adapter = match AndroidAccessibility::new(cli.serial.as_deref()) {
+            let mut android_adapter = match AndroidAccessibility::new(cli.serial.as_deref()).await {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Android adapter: {}", e);
@@ -2307,7 +2307,7 @@ pub async fn run_cli(cli: &Cli) {
                 Some(serial) => AndroidTarget::Serial(serial.to_owned()),
                 None => AndroidTarget::DefaultDevice,
             };
-            let mut adapter = match TargetedAccessibility::new_android(android_target) {
+            let mut adapter = match TargetedAccessibility::new_android(android_target).await {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("Failed to create Android adapter: {}", e);
@@ -2570,7 +2570,7 @@ async fn handle_android_specific(adapter: &mut AndroidAccessibility, cli: &Cli) 
     // Handle ADB tap
     if let Some((x, y)) = cli.adb.adb_tap {
         println!("Tapping at ({}, {})...", x, y);
-        match adapter.adb().tap(x, y) {
+        match adapter.adb().tap(x, y).await {
             Ok(()) => println!("Tap successful!"),
             Err(e) => {
                 eprintln!("Tap failed: {}", e);

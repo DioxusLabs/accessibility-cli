@@ -1,8 +1,9 @@
 //! Low-level ADB wrappers used by accessibility-cli's Android backend.
 
 pub mod emulator;
+mod transport;
 
-use std::process::{Command, Output};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,7 @@ use keyboard_types::Code;
 
 const UI_DUMP_ATTEMPTS: usize = 3;
 const UI_DUMP_RETRY_DELAY: Duration = Duration::from_millis(500);
+pub const DEFAULT_ADB_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Android key codes for `input keyevent` command.
 ///
@@ -435,14 +437,14 @@ pub struct AdbClient {
     pub serial: Option<String>,
     /// Path to the ADB binary.
     pub adb_path: String,
+    /// Maximum time to wait for an ADB command.
+    pub timeout: Duration,
+    server_addr: SocketAddr,
 }
 
 impl Default for AdbClient {
     fn default() -> Self {
-        Self {
-            serial: None,
-            adb_path: "adb".to_string(),
-        }
+        Self::new(None)
     }
 }
 
@@ -452,6 +454,8 @@ impl AdbClient {
         Self {
             serial: serial.map(String::from),
             adb_path: "adb".to_string(),
+            timeout: DEFAULT_ADB_TIMEOUT,
+            server_addr: server_addr_from_environment(),
         }
     }
 
@@ -492,86 +496,111 @@ impl AdbClient {
         Self {
             serial: serial.map(String::from),
             adb_path: adb_path.to_string(),
+            timeout: DEFAULT_ADB_TIMEOUT,
+            server_addr: server_addr_from_environment(),
         }
     }
 
-    /// Build base ADB command with optional device serial.
-    fn base_command(&self) -> Command {
-        let mut cmd = Command::new(&self.adb_path);
-        if let Some(ref serial) = self.serial {
-            cmd.arg("-s").arg(serial);
-        }
-        cmd
+    /// Set the maximum time to wait for an ADB command.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the ADB server address.
+    pub fn with_server_addr(mut self, server_addr: SocketAddr) -> Self {
+        self.server_addr = server_addr;
+        self
+    }
+
+    async fn run<T>(
+        &self,
+        kind: &str,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(self.timeout, operation)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "adb {kind} request timed out after {}s (adb server: {})",
+                    self.timeout.as_secs_f64(),
+                    self.server_addr
+                )
+            })?
+    }
+
+    /// Create the socket transport for this client.
+    fn transport(&self) -> transport::AdbTransport {
+        transport::AdbTransport::new(self.server_addr, &self.adb_path)
     }
 
     /// Execute an ADB shell command.
-    pub fn shell(&self, args: &[&str]) -> Result<String> {
-        let mut cmd = self.base_command();
-        cmd.arg("shell").args(args);
-
-        let output = cmd
-            .output()
-            .context("Failed to execute adb shell command")?;
-
-        Self::check_output(&output, "shell")?;
+    ///
+    /// The shell-v2 exit status is propagated: a non-zero device command
+    /// returns an error, unlike the previous `adb shell` process path.
+    pub async fn shell(&self, args: &[&str]) -> Result<String> {
+        let transport = self.transport();
+        let output = self
+            .run("shell", transport.shell(self.serial.as_deref(), args))
+            .await?;
+        Self::check_shell_output(&output)?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Execute an ADB shell command and return raw bytes.
-    pub fn shell_raw(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = self.base_command();
-        cmd.arg("shell").args(args);
-
-        let output = cmd
-            .output()
-            .context("Failed to execute adb shell command")?;
-
-        Self::check_output(&output, "shell")?;
+    ///
+    /// The shell-v2 exit status is propagated: a non-zero device command
+    /// returns an error, unlike the previous `adb shell` process path.
+    pub async fn shell_raw(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let transport = self.transport();
+        let output = self
+            .run("shell", transport.shell(self.serial.as_deref(), args))
+            .await?;
+        Self::check_shell_output(&output)?;
         Ok(output.stdout)
     }
 
-    /// Execute `adb exec-out` for efficient binary output.
-    pub fn exec_out(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = self.base_command();
-        cmd.arg("exec-out").args(args);
-
-        let output = cmd
-            .output()
-            .context("Failed to execute adb exec-out command")?;
-
-        Self::check_output(&output, "exec-out")?;
-        Ok(output.stdout)
+    /// Execute a device command and return its binary output.
+    ///
+    /// The underlying `exec:` service provides no exit status; this method
+    /// returns bytes until the server closes the stream.
+    pub async fn exec_out(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let transport = self.transport();
+        self.run("exec", transport.exec(self.serial.as_deref(), args))
+            .await
     }
 
-    /// Execute a general ADB command (not shell).
-    pub fn command(&self, args: &[&str]) -> Result<String> {
-        let mut cmd = self.base_command();
-        cmd.args(args);
-
-        let output = cmd.output().context("Failed to execute adb command")?;
-
-        Self::check_output(&output, "adb")?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    /// Query the ADB server version.
+    pub async fn server_version(&self) -> Result<String> {
+        let transport = self.transport();
+        let output = self
+            .run("host:version", transport.host_query("host:version"))
+            .await?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
-    fn check_output(output: &Output, cmd_type: &str) -> Result<()> {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "ADB {} command failed (exit code {}): stdout={}, stderr={}",
-                cmd_type,
-                output.status.code().unwrap_or(-1),
-                stdout.trim(),
-                stderr.trim()
-            );
-        }
-        Ok(())
+    /// Query the feature list reported by the ADB server.
+    pub async fn server_features(&self) -> Result<String> {
+        let transport = self.transport();
+        let output = self
+            .run("host:features", transport.host_query("host:features"))
+            .await?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    /// Wait until the selected device is available.
+    pub async fn wait_for_device(&self) -> Result<()> {
+        let transport = self.transport();
+        self.run(
+            "wait-for-device",
+            transport.wait_for_device(self.serial.as_deref()),
+        )
+        .await
     }
 
     /// Check if ADB is available and a device is connected.
-    pub fn check_connection(&self) -> Result<()> {
-        let devices = self.connected_devices()?;
+    pub async fn check_connection(&self) -> Result<()> {
+        let devices = self.connected_devices().await?;
         if devices.is_empty() {
             bail!("No Android devices connected. Connect a device or start an emulator.");
         }
@@ -587,21 +616,14 @@ impl AdbClient {
         Ok(())
     }
 
-    pub fn connected_devices(&self) -> Result<Vec<String>> {
-        let output = Command::new(&self.adb_path)
-            .arg("devices")
-            .output()
-            .with_context(|| {
-                format!(
-                    "ADB binary not found at '{}'. Install Android SDK Platform Tools.",
-                    self.adb_path
-                )
-            })?;
-        Self::check_output(&output, "devices")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    pub async fn connected_devices(&self) -> Result<Vec<String>> {
+        let transport = self.transport();
+        let output = self
+            .run("host:devices", transport.host_query("host:devices"))
+            .await?;
+        let stdout = String::from_utf8_lossy(&output);
         Ok(stdout
             .lines()
-            .skip(1)
             .filter_map(|line| {
                 let (serial, state) = line.split_once('\t')?;
                 (state.split_whitespace().next() == Some("device")).then(|| serial.to_string())
@@ -609,8 +631,20 @@ impl AdbClient {
             .collect())
     }
 
-    pub fn resolved_serial(&self) -> Result<String> {
-        let devices = self.connected_devices()?;
+    fn check_shell_output(output: &transport::ShellOutput) -> Result<()> {
+        if output.exit_code != 0 {
+            bail!(
+                "ADB shell command failed (exit code {}): stdout={}, stderr={}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn resolved_serial(&self) -> Result<String> {
+        let devices = self.connected_devices().await?;
         if let Some(serial) = &self.serial {
             if devices.contains(serial) {
                 return Ok(serial.clone());
@@ -632,8 +666,8 @@ impl AdbClient {
     }
 
     /// Get the screen size in pixels.
-    pub fn get_screen_size(&self) -> Result<(u32, u32)> {
-        let output = self.shell(&["wm", "size"])?;
+    pub async fn get_screen_size(&self) -> Result<(u32, u32)> {
+        let output = self.shell(&["wm", "size"]).await?;
         for line in output.lines() {
             if let Some(size_str) = line.strip_prefix("Physical size:") {
                 let size_str = size_str.trim();
@@ -653,23 +687,24 @@ impl AdbClient {
     }
 
     /// Capture a screenshot as PNG bytes.
-    pub fn screenshot(&self) -> Result<Vec<u8>> {
-        self.exec_out(&["screencap", "-p"])
+    pub async fn screenshot(&self) -> Result<Vec<u8>> {
+        self.exec_out(&["screencap", "-p"]).await
     }
 
     /// Tap at screen coordinates.
-    pub fn tap(&self, x: f64, y: f64) -> Result<()> {
+    pub async fn tap(&self, x: f64, y: f64) -> Result<()> {
         self.shell(&[
             "input",
             "tap",
             &x.round().to_string(),
             &y.round().to_string(),
-        ])?;
+        ])
+        .await?;
         Ok(())
     }
 
     /// Swipe from one point to another.
-    pub fn swipe(&self, start: (f64, f64), end: (f64, f64), duration_ms: u64) -> Result<()> {
+    pub async fn swipe(&self, start: (f64, f64), end: (f64, f64), duration_ms: u64) -> Result<()> {
         self.shell(&[
             "input",
             "swipe",
@@ -678,34 +713,36 @@ impl AdbClient {
             &end.0.round().to_string(),
             &end.1.round().to_string(),
             &duration_ms.to_string(),
-        ])?;
+        ])
+        .await?;
         Ok(())
     }
 
     /// Send a key event.
-    pub fn key_event(&self, keycode: u32) -> Result<()> {
-        self.shell(&["input", "keyevent", &keycode.to_string()])?;
+    pub async fn key_event(&self, keycode: u32) -> Result<()> {
+        self.shell(&["input", "keyevent", &keycode.to_string()])
+            .await?;
         Ok(())
     }
 
     /// Send text input.
-    pub fn input_text(&self, text: &str) -> Result<()> {
+    pub async fn input_text(&self, text: &str) -> Result<()> {
         let escaped = escape_shell_text(text);
-        self.shell(&["input", "text", &escaped])?;
+        self.shell(&["input", "text", &escaped]).await?;
         Ok(())
     }
 
     /// Dump the UI hierarchy as XML.
-    pub fn dump_ui(&self) -> Result<String> {
+    pub async fn dump_ui(&self) -> Result<String> {
         let mut last_error = None;
 
         for attempt in 1..=UI_DUMP_ATTEMPTS {
-            match self.dump_ui_once() {
+            match self.dump_ui_once().await {
                 Ok(xml) => return Ok(xml),
                 Err(error) => {
                     last_error = Some(error);
                     if attempt < UI_DUMP_ATTEMPTS {
-                        std::thread::sleep(UI_DUMP_RETRY_DELAY);
+                        tokio::time::sleep(UI_DUMP_RETRY_DELAY).await;
                     }
                 }
             }
@@ -716,13 +753,13 @@ impl AdbClient {
         ))
     }
 
-    fn dump_ui_once(&self) -> Result<String> {
-        let result = self.shell(&["uiautomator", "dump", "/dev/tty"]);
+    async fn dump_ui_once(&self) -> Result<String> {
+        let result = self.shell(&["uiautomator", "dump", "/dev/tty"]).await;
 
         match result {
             Ok(output) => match extract_ui_xml(&output) {
                 Some(xml) => Ok(xml),
-                None => self.dump_ui_via_file().with_context(|| {
+                None => self.dump_ui_via_file().await.with_context(|| {
                     format!(
                         "direct uiautomator dump did not contain XML: {}",
                         truncate_for_error(&output)
@@ -731,27 +768,28 @@ impl AdbClient {
             },
             Err(error) => self
                 .dump_ui_via_file()
+                .await
                 .with_context(|| format!("direct uiautomator dump failed: {error}")),
         }
     }
 
-    fn dump_ui_via_file(&self) -> Result<String> {
+    async fn dump_ui_via_file(&self) -> Result<String> {
         let tmp_path = "/data/local/tmp/window_dump.xml";
 
-        let _ = self.shell(&["rm", "-f", tmp_path]);
-        let dump_output = self.shell(&["uiautomator", "dump", tmp_path])?;
+        let _ = self.shell(&["rm", "-f", tmp_path]).await;
+        let dump_output = self.shell(&["uiautomator", "dump", tmp_path]).await?;
         if let Some(xml) = extract_ui_xml(&dump_output) {
-            let _ = self.shell(&["rm", "-f", tmp_path]);
+            let _ = self.shell(&["rm", "-f", tmp_path]).await;
             return Ok(xml);
         }
 
-        let xml = self.shell(&["cat", tmp_path]).with_context(|| {
+        let xml = self.shell(&["cat", tmp_path]).await.with_context(|| {
             format!(
                 "uiautomator dump did not create readable file at {tmp_path}; dump output: {}",
                 truncate_for_error(&dump_output)
             )
         })?;
-        let _ = self.shell(&["rm", "-f", tmp_path]);
+        let _ = self.shell(&["rm", "-f", tmp_path]).await;
 
         if let Some(xml) = extract_ui_xml(&xml) {
             Ok(xml)
@@ -761,11 +799,11 @@ impl AdbClient {
     }
 
     /// Launch an app by package name and optional activity.
-    pub fn launch_app(&self, package: &str, activity: Option<&str>) -> Result<()> {
+    pub async fn launch_app(&self, package: &str, activity: Option<&str>) -> Result<()> {
         match activity {
             Some(act) => {
                 let component = format!("{}/{}", package, act);
-                self.shell(&["am", "start", "-n", &component])?;
+                self.shell(&["am", "start", "-n", &component]).await?;
             }
             None => {
                 self.shell(&[
@@ -775,21 +813,22 @@ impl AdbClient {
                     "-c",
                     "android.intent.category.LAUNCHER",
                     "1",
-                ])?;
+                ])
+                .await?;
             }
         }
         Ok(())
     }
 
     /// Force stop an app.
-    pub fn stop_app(&self, package: &str) -> Result<()> {
-        self.shell(&["am", "force-stop", package])?;
+    pub async fn stop_app(&self, package: &str) -> Result<()> {
+        self.shell(&["am", "force-stop", package]).await?;
         Ok(())
     }
 
     /// Get the current foreground activity.
-    pub fn get_current_activity(&self) -> Result<String> {
-        let output = self.shell(&["dumpsys", "activity", "activities"])?;
+    pub async fn get_current_activity(&self) -> Result<String> {
+        let output = self.shell(&["dumpsys", "activity", "activities"]).await?;
 
         for line in output.lines() {
             let trimmed = line.trim();
@@ -799,7 +838,7 @@ impl AdbClient {
             }
         }
 
-        let output = self.shell(&["dumpsys", "window", "windows"])?;
+        let output = self.shell(&["dumpsys", "window", "windows"]).await?;
         for line in output.lines() {
             if line.contains("mCurrentFocus") || line.contains("mFocusedApp") {
                 return Ok(line.trim().to_string());
@@ -816,6 +855,14 @@ fn adb_binary_name() -> &'static str {
     } else {
         "adb"
     }
+}
+
+fn server_addr_from_environment() -> SocketAddr {
+    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(transport::DEFAULT_SERVER_ADDR.port());
+    SocketAddr::new(transport::DEFAULT_SERVER_ADDR.ip(), port)
 }
 
 /// Escape text for ADB shell input command.
@@ -920,5 +967,17 @@ mod tests {
             AndroidKeyCode::from_code(Code::F1),
             Some(AndroidKeyCode::F1)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn missing_adb_binary_has_install_context() {
+        let adb = AdbClient::with_adb_path(None, "/no/such/adb")
+            .with_server_addr(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let error = adb.connected_devices().await.unwrap_err();
+        assert!(error.to_string().contains(
+            "ADB binary not found at '/no/such/adb'. Install Android SDK Platform Tools."
+        ));
     }
 }

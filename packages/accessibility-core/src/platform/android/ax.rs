@@ -84,35 +84,29 @@ pub enum AxCommand {
     },
 }
 
-pub fn spawn_ax_worker(serial: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
+pub async fn spawn_ax_worker(serial: &str) -> Result<mpsc::UnboundedSender<AxCommand>> {
     let adb = super::AdbClient::discover(Some(serial));
-    let mut reader = AndroidAccessibility::with_adb_path(Some(serial), &adb.adb_path)?;
+    let mut reader = AndroidAccessibility::with_adb_path(Some(serial), &adb.adb_path).await?;
     let target = Target::Android(AndroidTarget::Serial(serial.to_string()));
     let (commands, mut command_rx) = mpsc::unbounded_channel();
-    std::thread::Builder::new()
-        .name("android-emulator-ax".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let Ok(runtime) = runtime else { return };
-            let mut screen = None;
-            while let Some(command) = command_rx.blocking_recv() {
-                match command {
-                    AxCommand::Snapshot { scan, reply } => {
-                        let result = runtime.block_on(snapshot(&mut reader, &target, scan));
-                        if let Ok((_, bounds)) = &result {
-                            screen = Some(*bounds);
-                        }
-                        let _ = reply.send(result.map(|(snapshot, _)| snapshot));
+    tokio::spawn(async move {
+        let mut screen = None;
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                AxCommand::Snapshot { scan, reply } => {
+                    let result = snapshot(&mut reader, &target, scan).await;
+                    if let Ok((_, bounds)) = &result {
+                        screen = Some(*bounds);
                     }
-                    AxCommand::HitTest { x, y, reply } => {
-                        let result = runtime.block_on(hit_test(&mut reader, screen.as_ref(), x, y));
-                        let _ = reply.send(result);
-                    }
+                    let _ = reply.send(result.map(|(snapshot, _)| snapshot));
+                }
+                AxCommand::HitTest { x, y, reply } => {
+                    let result = hit_test(&mut reader, screen.as_ref(), x, y).await;
+                    let _ = reply.send(result);
                 }
             }
-        })?;
+        }
+    });
     Ok(commands)
 }
 

@@ -11,26 +11,29 @@ use anyhow::{Context, Result, bail};
 const IDLE_FLUSH: Duration = Duration::from_millis(75);
 const PROBE_DURATION: Duration = Duration::from_secs(5);
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let serial = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "emulator-5554".to_string());
     let adb = AdbClient::discover(Some(&serial));
-    adb.check_connection()?;
-    let (width, height) = adb.get_screen_size()?;
+    adb.check_connection().await?;
+    let (width, height) = adb.get_screen_size().await?;
     let config = ScreenRecordConfig::for_max_dimension(width, height, Some(1280), 5_000_000);
     println!("device    : {serial}");
     println!("source    : {width}x{height}");
     println!("encoded   : {}x{}", config.width, config.height);
 
     let stimulus = adb.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(1));
-        let _ = stimulus.swipe(
-            (width as f64 * 0.5, height as f64 * 0.75),
-            (width as f64 * 0.5, height as f64 * 0.25),
-            800,
-        );
+    let stimulus = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = stimulus
+            .swipe(
+                (width as f64 * 0.5, height as f64 * 0.75),
+                (width as f64 * 0.5, height as f64 * 0.25),
+                800,
+            )
+            .await;
     });
 
     let started = Instant::now();
@@ -67,6 +70,7 @@ fn main() -> Result<()> {
         restart.elapsed().as_secs_f64() * 1000.0
     );
     println!("entry NALs: {:?}", nal_types(&first.data));
+    let _ = stimulus.await;
     println!("probe passed");
     Ok(())
 }

@@ -12,12 +12,15 @@ use anyhow::{Context, Result};
 async fn main() -> Result<()> {
     let requested_serial = std::env::args().nth(1);
     let adb = AdbClient::discover(requested_serial.as_deref());
-    let serial = adb.resolved_serial()?;
-    let _ = adb.stop_app("com.google.android.settings.intelligence");
-    let _ = adb.stop_app("com.android.settings");
-    adb.launch_app("com.android.settings", Some(".Settings"))?;
+    let serial = adb.resolved_serial().await?;
+    let _ = adb
+        .stop_app("com.google.android.settings.intelligence")
+        .await;
+    let _ = adb.stop_app("com.android.settings").await;
+    adb.launch_app("com.android.settings", Some(".Settings"))
+        .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let session = EmulatorSession::start(Some(&serial), VideoConfig::default())?;
+    let session = EmulatorSession::start(Some(&serial), VideoConfig::default()).await?;
     session.seed_orientation().await;
     let device = session.device_info();
     println!("device     : {}", device.serial);
@@ -42,16 +45,20 @@ async fn main() -> Result<()> {
     let tap_x = bounds.x + bounds.width / 2.0;
     let tap_y = bounds.y + bounds.height / 2.0;
     println!("tap        : {}", tappable.selector);
-    session.send_input(InputCommand::Touch {
-        phase: TouchPhase::Begin,
-        x: tap_x,
-        y: tap_y,
-    });
-    session.send_input(InputCommand::Touch {
-        phase: TouchPhase::End,
-        x: tap_x,
-        y: tap_y,
-    });
+    session
+        .send_input(InputCommand::Touch {
+            phase: TouchPhase::Begin,
+            x: tap_x,
+            y: tap_y,
+        })
+        .await;
+    session
+        .send_input(InputCommand::Touch {
+            phase: TouchPhase::End,
+            x: tap_x,
+            y: tap_y,
+        })
+        .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
     let tapped = session.ax_snapshot(false).await?;
     if tapped
@@ -63,9 +70,11 @@ async fn main() -> Result<()> {
         anyhow::bail!("gRPC touch input did not change the Settings tree");
     }
 
-    session.send_input(InputCommand::Button {
-        button: HardwareButton::Home,
-    });
+    session
+        .send_input(InputCommand::Button {
+            button: HardwareButton::Home,
+        })
+        .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let home = session.ax_snapshot(false).await?;
     if home.app_name == tapped.app_name {
@@ -98,7 +107,7 @@ async fn main() -> Result<()> {
     println!("received   : {received} frames, {keyframes} key, {bytes} bytes");
     println!("session    : {:.1} fps, {:.2} Mbps", stats.fps, stats.mbps);
 
-    session.set_orientation(Orientation::LandscapeRight)?;
+    session.set_orientation(Orientation::LandscapeRight).await?;
     let landscape = session.ax_snapshot(false).await?;
     let landscape_stats = session.stats();
     if !landscape.is_landscape || landscape_stats.encoded_width <= landscape_stats.encoded_height {
@@ -108,7 +117,7 @@ async fn main() -> Result<()> {
         "landscape  : {}x{}",
         landscape_stats.encoded_width, landscape_stats.encoded_height
     );
-    session.set_orientation(Orientation::Portrait)?;
+    session.set_orientation(Orientation::Portrait).await?;
     let portrait = session.ax_snapshot(false).await?;
     let portrait_stats = session.stats();
     if portrait.is_landscape || portrait_stats.encoded_width >= portrait_stats.encoded_height {

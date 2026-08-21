@@ -94,8 +94,11 @@ pub trait AccessibilityReader {
     // Platform adapter methods (merged from PlatformAdapter trait)
 
     /// Capture a screenshot for a target.
-    fn capture_screen(&self, _target: &Target) -> Result<Screenshot> {
-        anyhow::bail!("Screenshot not supported on this platform")
+    fn capture_screen(
+        &self,
+        _target: &Target,
+    ) -> impl std::future::Future<Output = Result<Screenshot>> {
+        async { anyhow::bail!("Screenshot not supported on this platform") }
     }
 
     /// Get bounds for coordinate conversion.
