@@ -11,6 +11,8 @@ pub mod raw;
 pub mod screenrecord;
 
 pub mod protocol {
+    #![allow(clippy::result_large_err)]
+
     pub mod controller {
         tonic::include_proto!("android.emulation.control");
     }
