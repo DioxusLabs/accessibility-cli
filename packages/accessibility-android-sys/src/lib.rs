@@ -529,9 +529,17 @@ impl AdbClient {
             })?
     }
 
+    /// Create the socket transport for this client.
+    fn transport(&self) -> transport::AdbTransport {
+        transport::AdbTransport::new(self.server_addr, &self.adb_path)
+    }
+
     /// Execute an ADB shell command.
+    ///
+    /// The shell-v2 exit status is propagated: a non-zero device command
+    /// returns an error, unlike the previous `adb shell` process path.
     pub async fn shell(&self, args: &[&str]) -> Result<String> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         let output = self
             .run("shell", transport.shell(self.serial.as_deref(), args))
             .await?;
@@ -540,8 +548,11 @@ impl AdbClient {
     }
 
     /// Execute an ADB shell command and return raw bytes.
+    ///
+    /// The shell-v2 exit status is propagated: a non-zero device command
+    /// returns an error, unlike the previous `adb shell` process path.
     pub async fn shell_raw(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         let output = self
             .run("shell", transport.shell(self.serial.as_deref(), args))
             .await?;
@@ -554,14 +565,14 @@ impl AdbClient {
     /// The underlying `exec:` service provides no exit status; this method
     /// returns bytes until the server closes the stream.
     pub async fn exec_out(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         self.run("exec", transport.exec(self.serial.as_deref(), args))
             .await
     }
 
     /// Query the ADB server version.
     pub async fn server_version(&self) -> Result<String> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         let output = self
             .run("host:version", transport.host_query("host:version"))
             .await?;
@@ -570,7 +581,7 @@ impl AdbClient {
 
     /// Query the feature list reported by the ADB server.
     pub async fn server_features(&self) -> Result<String> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         let output = self
             .run("host:features", transport.host_query("host:features"))
             .await?;
@@ -579,7 +590,7 @@ impl AdbClient {
 
     /// Wait until the selected device is available.
     pub async fn wait_for_device(&self) -> Result<()> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         self.run(
             "wait-for-device",
             transport.wait_for_device(self.serial.as_deref()),
@@ -606,7 +617,7 @@ impl AdbClient {
     }
 
     pub async fn connected_devices(&self) -> Result<Vec<String>> {
-        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let transport = self.transport();
         let output = self
             .run("host:devices", transport.host_query("host:devices"))
             .await?;

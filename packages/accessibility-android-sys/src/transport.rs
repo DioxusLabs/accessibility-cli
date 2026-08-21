@@ -34,7 +34,7 @@ impl AdbTransport {
 
     pub(crate) async fn wait_for_device(&self, serial: Option<&str>) -> Result<()> {
         let service = match serial {
-            Some(serial) => service_with_parts("host-serial:", serial, ":wait-for-any-device")?,
+            Some(serial) => format!("host-serial:{serial}:wait-for-any-device"),
             None => "host:wait-for-any-device".to_string(),
         };
         let mut stream = self.connect().await?;
@@ -43,7 +43,7 @@ impl AdbTransport {
     }
 
     pub(crate) async fn shell(&self, serial: Option<&str>, args: &[&str]) -> Result<ShellOutput> {
-        let service = service_from_args("shell,v2,raw:", args)?;
+        let service = format!("shell,v2,raw:{}", args.join(" "));
         let mut stream = self.switch_to_device(serial).await?;
         write_service(&mut stream, &service).await?;
         read_status(&mut stream)
@@ -53,7 +53,7 @@ impl AdbTransport {
     }
 
     pub(crate) async fn exec(&self, serial: Option<&str>, args: &[&str]) -> Result<Vec<u8>> {
-        let service = service_from_args("exec:", args)?;
+        let service = format!("exec:{}", args.join(" "));
         let mut stream = self.switch_to_device(serial).await?;
         write_service(&mut stream, &service).await?;
         read_status(&mut stream).await?;
@@ -104,7 +104,7 @@ impl AdbTransport {
 
     async fn switch_to_device(&self, serial: Option<&str>) -> Result<TcpStream> {
         let service = match serial {
-            Some(serial) => service_with_suffix("host:tport:serial:", serial)?,
+            Some(serial) => format!("host:tport:serial:{serial}"),
             None => "host:tport:any".to_string(),
         };
         let mut stream = self.connect().await?;
@@ -164,51 +164,6 @@ async fn write_service(stream: &mut TcpStream, service: &str) -> Result<()> {
     Ok(())
 }
 
-fn service_from_args(prefix: &str, args: &[&str]) -> Result<String> {
-    let command_length = args
-        .iter()
-        .map(|argument| argument.len())
-        .sum::<usize>()
-        .checked_add(args.len().saturating_sub(1))
-        .ok_or_else(|| anyhow::anyhow!("ADB service string is too long"))?;
-    let length = prefix
-        .len()
-        .checked_add(command_length)
-        .ok_or_else(|| anyhow::anyhow!("ADB service string is too long"))?;
-    if length > MAX_SERVICE_LENGTH {
-        bail!("ADB service string exceeds {MAX_SERVICE_LENGTH} bytes");
-    }
-    let mut service = String::with_capacity(length);
-    service.push_str(prefix);
-    for (index, argument) in args.iter().enumerate() {
-        if index != 0 {
-            service.push(' ');
-        }
-        service.push_str(argument);
-    }
-    Ok(service)
-}
-
-fn service_with_suffix(prefix: &str, suffix: &str) -> Result<String> {
-    service_with_parts(prefix, suffix, "")
-}
-
-fn service_with_parts(prefix: &str, middle: &str, suffix: &str) -> Result<String> {
-    let length = prefix
-        .len()
-        .checked_add(middle.len())
-        .and_then(|length| length.checked_add(suffix.len()))
-        .ok_or_else(|| anyhow::anyhow!("ADB service string is too long"))?;
-    if length > MAX_SERVICE_LENGTH {
-        bail!("ADB service string exceeds {MAX_SERVICE_LENGTH} bytes");
-    }
-    let mut service = String::with_capacity(length);
-    service.push_str(prefix);
-    service.push_str(middle);
-    service.push_str(suffix);
-    Ok(service)
-}
-
 async fn read_status(stream: &mut TcpStream) -> Result<()> {
     let mut status = [0; 4];
     stream
@@ -255,41 +210,44 @@ async fn read_shell_output(stream: &mut TcpStream) -> Result<ShellOutput> {
         if length > MAX_PACKET_LENGTH {
             bail!("shell-v2 packet length {length} exceeds maximum {MAX_PACKET_LENGTH}");
         }
-        if packet_id == ShellPacketId::Exit {
-            if length != 1 {
-                bail!("shell-v2 exit packet must contain one byte");
-            }
-            let mut exit_code = [0];
-            stream.read_exact(&mut exit_code).await?;
-            output.exit_code = exit_code[0];
-            let mut trailing = [0];
-            if stream.read(&mut trailing).await? != 0 {
-                bail!("shell-v2 stream has data after the exit packet");
-            }
-            return Ok(output);
-        }
-        if matches!(
-            packet_id,
-            ShellPacketId::Stdin
-                | ShellPacketId::CloseStdin
-                | ShellPacketId::WindowSizeChange
-                | ShellPacketId::Invalid
-        ) {
-            bail!("unexpected shell-v2 packet id {}", packet_id as u8);
-        }
-        let mut payload = vec![0; length];
-        stream.read_exact(&mut payload).await?;
-        let accumulated = output.stdout.len() + output.stderr.len();
-        if length > MAX_OUTPUT_LENGTH.saturating_sub(accumulated) {
-            bail!("shell-v2 output exceeds maximum {MAX_OUTPUT_LENGTH} bytes");
-        }
         match packet_id {
-            ShellPacketId::Stdout => output.stdout.extend(payload),
-            ShellPacketId::Stderr => output.stderr.extend(payload),
-            ShellPacketId::Invalid | ShellPacketId::Exit => unreachable!(),
-            ShellPacketId::Stdin | ShellPacketId::CloseStdin | ShellPacketId::WindowSizeChange => {
-                unreachable!()
+            ShellPacketId::Stdout => {
+                if length
+                    > MAX_OUTPUT_LENGTH.saturating_sub(output.stdout.len() + output.stderr.len())
+                {
+                    bail!("shell-v2 output exceeds maximum {MAX_OUTPUT_LENGTH} bytes");
+                }
+                let mut payload = vec![0; length];
+                stream.read_exact(&mut payload).await?;
+                output.stdout.extend(payload);
             }
+            ShellPacketId::Stderr => {
+                if length
+                    > MAX_OUTPUT_LENGTH.saturating_sub(output.stdout.len() + output.stderr.len())
+                {
+                    bail!("shell-v2 output exceeds maximum {MAX_OUTPUT_LENGTH} bytes");
+                }
+                let mut payload = vec![0; length];
+                stream.read_exact(&mut payload).await?;
+                output.stderr.extend(payload);
+            }
+            ShellPacketId::Exit => {
+                if length != 1 {
+                    bail!("shell-v2 exit packet must contain one byte");
+                }
+                let mut exit_code = [0];
+                stream.read_exact(&mut exit_code).await?;
+                output.exit_code = exit_code[0];
+                let mut trailing = [0];
+                if stream.read(&mut trailing).await? != 0 {
+                    bail!("shell-v2 stream has data after the exit packet");
+                }
+                return Ok(output);
+            }
+            ShellPacketId::Stdin
+            | ShellPacketId::CloseStdin
+            | ShellPacketId::WindowSizeChange
+            | ShellPacketId::Invalid => bail!("unexpected shell-v2 packet id {}", packet_id as u8),
         }
     }
 }
@@ -324,10 +282,7 @@ async fn read_hex_length<R: AsyncRead + Unpin>(reader: &mut R, kind: &str) -> Re
 }
 
 fn is_bootstrap_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-    )
+    error.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
 /// The default local ADB server endpoint.
@@ -340,7 +295,7 @@ const MAX_SERVICE_LENGTH: usize = 1024;
 const MAX_PACKET_LENGTH: usize = 1024 * 1024;
 
 /// The maximum output accumulated from one shell or exec request.
-pub(crate) const MAX_OUTPUT_LENGTH: usize = 64 * 1024 * 1024;
+const MAX_OUTPUT_LENGTH: usize = 64 * 1024 * 1024;
 
 const IO_BUFFER_LENGTH: usize = 8192;
 
@@ -497,6 +452,19 @@ mod tests {
         });
         let adb = AdbClient::new(None).with_server_addr(address);
         assert!(adb.connected_devices().await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_eof_before_exit_is_an_error() {
+        let (listener, address) = bind_listener().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            switch_to_shell(&mut stream, "host:tport:any", "echo").await;
+            write_shell_packet(&mut stream, 1, b"partial output").await;
+        });
+        let adb = AdbClient::new(None).with_server_addr(address);
+        assert!(adb.shell_raw(&["echo"]).await.is_err());
         server.await.unwrap();
     }
 
