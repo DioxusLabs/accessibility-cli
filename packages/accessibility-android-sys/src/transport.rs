@@ -355,6 +355,9 @@ mod tests {
         stream.write_all(b"OKAY").await.unwrap();
     }
 
+    // Miri's default isolation does not support socket syscalls; these tests
+    // still run under the normal test harness.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn host_devices_filters_non_devices() {
         let (listener, address) = bind_listener().await;
@@ -372,6 +375,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn transport_switch_reads_tid_and_shell_request() {
         let (listener, address) = bind_listener().await;
@@ -385,6 +389,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn shell_collects_split_stdout_stderr_and_exit() {
         let (listener, address) = bind_listener().await;
@@ -402,6 +407,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn nonzero_shell_exit_includes_stderr() {
         let (listener, address) = bind_listener().await;
@@ -418,6 +424,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn fail_response_surfaces_server_message() {
         let (listener, address) = bind_listener().await;
@@ -432,6 +439,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn truncated_status_and_payload_error() {
         let (listener, address) = bind_listener().await;
@@ -455,6 +463,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn shell_eof_before_exit_is_an_error() {
         let (listener, address) = bind_listener().await;
@@ -468,6 +477,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn oversized_and_unknown_shell_packets_are_rejected() {
         let (listener, address) = bind_listener().await;
@@ -495,6 +505,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn exec_preserves_binary_output() {
         let (listener, address) = bind_listener().await;
@@ -512,6 +523,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn refused_server_reports_missing_server_and_binary() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -525,6 +537,7 @@ mod tests {
         assert!(error.contains("ADB binary not found"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn request_timeout_drops_stalled_socket() {
         let (listener, address) = bind_listener().await;
