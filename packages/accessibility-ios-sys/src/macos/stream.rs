@@ -38,6 +38,7 @@ impl SimVideoStream {
     /// use is a bounded channel that drops on overflow.
     pub fn start(udid: Option<&str>, config: EncoderConfig, sink: ChunkSink) -> Result<Self> {
         let mut framebuffer = SimFramebuffer::new(udid)?;
+        framebuffer.set_active_frame_rate(config.fps);
         let force_keyframe = Arc::new(AtomicBool::new(false));
 
         let mut encoder = H264Encoder::new(config, Arc::clone(&force_keyframe), sink)?;
@@ -48,7 +49,12 @@ impl SimVideoStream {
             // `CVPixelBuffer` derefs to `CVImageBuffer`, which is what
             // VideoToolbox wants.
             let image: &CVImageBuffer = frame.pixel_buffer;
-            if let Err(error) = encoder.encode(image, frame.width as i32, frame.height as i32) {
+            if let Err(error) = encoder.encode(
+                image,
+                frame.width as i32,
+                frame.height as i32,
+                frame.captured_at,
+            ) {
                 eprintln!("[capture] encode failed: {error}");
             }
 
@@ -109,6 +115,10 @@ impl SimVideoStream {
     /// the raw stream endpoints.
     pub fn request_keyframe(&self) {
         self.force_keyframe.store(true, Ordering::Relaxed);
+    }
+
+    pub fn note_interaction(&self) {
+        self.framebuffer.note_interaction();
     }
 
     /// Begin recording to `path`. Fails if one is already running.

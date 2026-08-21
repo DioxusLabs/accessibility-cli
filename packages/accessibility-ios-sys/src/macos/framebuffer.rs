@@ -24,7 +24,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -62,12 +62,14 @@ const FRAMEBUFFER_PORT_ID: &str = "com.apple.framebuffer.display";
 /// re-emits keeps both honest.
 const IDLE_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Ticks between re-wire attempts while no frame has ever been captured.
-///
+/// Keep polling briefly after input stops so animations and inertial scrolling
+/// do not fall back to the idle cadence between input events.
+const INTERACTION_HOLD: Duration = Duration::from_secs(1);
+
 /// Descriptors are sometimes created lazily, so a registration that happened
 /// too early silently yields nothing. Rebuilding the port graph roughly once a
 /// second recovers from that.
-const REWIRE_TICKS: u64 = 5;
+const REWIRE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A frame handed to the sink, valid only for the duration of the call.
 ///
@@ -135,6 +137,9 @@ struct CaptureState {
     blocks: Mutex<Vec<VoidBlock>>,
     sink: Mutex<Option<FrameSink>>,
     last_capture: Mutex<Instant>,
+    active_until: Mutex<Instant>,
+    activity: Condvar,
+    active_interval_micros: AtomicU64,
     frame_count: AtomicU64,
     rewire_count: AtomicU64,
     width: AtomicUsize,
@@ -234,7 +239,8 @@ impl CaptureState {
             return;
         };
 
-        *self.last_capture.lock().unwrap() = Instant::now();
+        let captured_at = Instant::now();
+        *self.last_capture.lock().unwrap() = captured_at;
 
         self.frame_count.fetch_add(1, Ordering::Relaxed);
 
@@ -247,7 +253,7 @@ impl CaptureState {
                 pixel_buffer: &live,
                 width: CVPixelBufferGetWidth(&live) as u32,
                 height: CVPixelBufferGetHeight(&live) as u32,
-                captured_at: Instant::now(),
+                captured_at,
             });
         }
     }
@@ -369,6 +375,9 @@ impl SimFramebuffer {
                 blocks: Mutex::new(Vec::new()),
                 sink: Mutex::new(None),
                 last_capture: Mutex::new(Instant::now()),
+                active_until: Mutex::new(Instant::now()),
+                activity: Condvar::new(),
+                active_interval_micros: AtomicU64::new(1_000_000 / 60),
                 frame_count: AtomicU64::new(0),
                 rewire_count: AtomicU64::new(0),
                 width: AtomicUsize::new(0),
@@ -392,6 +401,17 @@ impl SimFramebuffer {
         *self.state.sink.lock().unwrap() = sink;
     }
 
+    pub fn set_active_frame_rate(&self, fps: u32) {
+        self.state
+            .active_interval_micros
+            .store(1_000_000 / u64::from(fps.max(1)), Ordering::Relaxed);
+    }
+
+    pub fn note_interaction(&self) {
+        *self.state.active_until.lock().unwrap() = Instant::now() + INTERACTION_HOLD;
+        self.state.activity.notify_one();
+    }
+
     /// Begin capturing. Calling twice rebuilds the pipeline.
     pub fn start(&mut self) -> Result<()> {
         self.state.running.store(true, Ordering::Relaxed);
@@ -407,24 +427,37 @@ impl SimFramebuffer {
         }
         let state = Arc::clone(&self.state);
         self.idle_thread = Some(std::thread::spawn(move || {
-            let mut tick: u64 = 0;
+            let mut next_rewire = Instant::now() + REWIRE_INTERVAL;
             while state.running.load(Ordering::Relaxed) {
-                std::thread::sleep(IDLE_INTERVAL);
+                let active_until = state.active_until.lock().unwrap();
+                let active = *active_until > Instant::now();
+                let interval = if active {
+                    Duration::from_micros(state.active_interval_micros.load(Ordering::Relaxed))
+                } else {
+                    IDLE_INTERVAL
+                };
+                let (active_until, _) =
+                    state.activity.wait_timeout(active_until, interval).unwrap();
+                drop(active_until);
                 if !state.running.load(Ordering::Relaxed) {
                     break;
                 }
-                tick += 1;
 
+                let active = *state.active_until.lock().unwrap() > Instant::now();
+                let interval = if active {
+                    Duration::from_micros(state.active_interval_micros.load(Ordering::Relaxed))
+                } else {
+                    IDLE_INTERVAL
+                };
                 let idle_for = state.last_capture.lock().unwrap().elapsed();
-                if idle_for >= IDLE_INTERVAL {
+                if idle_for >= interval {
                     state.capture(true);
                 }
 
                 // Self-heal only until the first frame ever lands. After that
                 // a silent pipeline means an idle screen, not a broken graph.
-                if state.frame_count.load(Ordering::Relaxed) == 0
-                    && tick.is_multiple_of(REWIRE_TICKS)
-                {
+                if state.frame_count.load(Ordering::Relaxed) == 0 && Instant::now() >= next_rewire {
+                    next_rewire = Instant::now() + REWIRE_INTERVAL;
                     state.rewire_count.fetch_add(1, Ordering::Relaxed);
                     // Descriptors are sometimes created lazily, so a
                     // registration that happened too early yields nothing.
@@ -437,6 +470,7 @@ impl SimFramebuffer {
 
     pub fn stop(&mut self) {
         self.state.running.store(false, Ordering::Relaxed);
+        self.state.activity.notify_one();
         if let Some(handle) = self.idle_thread.take() {
             let _ = handle.join();
         }

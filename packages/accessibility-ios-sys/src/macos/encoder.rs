@@ -14,6 +14,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use block2::RcBlock;
@@ -58,6 +59,7 @@ pub enum ChunkKind {
 pub struct EncodedChunk {
     pub data: Bytes,
     pub kind: ChunkKind,
+    pub captured_at: Instant,
 }
 
 /// Bits per pixel per frame to aim for when no explicit bitrate is given.
@@ -214,7 +216,13 @@ impl H264Encoder {
     ///
     /// `width`/`height` describe the *source*; the session may be smaller if
     /// the config caps the long edge, in which case VideoToolbox scales.
-    pub fn encode(&mut self, image: &CVImageBuffer, width: i32, height: i32) -> Result<()> {
+    pub fn encode(
+        &mut self,
+        image: &CVImageBuffer,
+        width: i32,
+        height: i32,
+        captured_at: Instant,
+    ) -> Result<()> {
         if self.session.is_none() || self.source_dimensions != (width, height) {
             self.source_dimensions = (width, height);
             self.dimensions = self.config.encode_size(width, height);
@@ -255,7 +263,7 @@ impl H264Encoder {
                     return;
                 }
                 let sample = unsafe { &*sample };
-                for chunk in package_sample(sample, nal_format, &emitted) {
+                for chunk in package_sample(sample, nal_format, &emitted, captured_at) {
                     sink(chunk);
                 }
             },
@@ -395,6 +403,7 @@ fn package_sample(
     sample: &CMSampleBuffer,
     format: NalFormat,
     emitted_parameter_set: &Mutex<bool>,
+    captured_at: Instant,
 ) -> Vec<EncodedChunk> {
     let is_keyframe = sample_is_keyframe(sample);
     let Some(avcc) = sample_bytes(sample) else {
@@ -418,6 +427,7 @@ fn package_sample(
                     chunks.push(EncodedChunk {
                         data: Bytes::from(build_avcc_record(sps, pps)),
                         kind: ChunkKind::ParameterSet,
+                        captured_at,
                     });
                 }
             }
@@ -428,6 +438,7 @@ fn package_sample(
                 } else {
                     ChunkKind::Delta
                 },
+                captured_at,
             });
         }
         NalFormat::AnnexB => {
@@ -448,6 +459,7 @@ fn package_sample(
                 } else {
                     ChunkKind::Delta
                 },
+                captured_at,
             });
         }
     }

@@ -365,6 +365,7 @@ impl SimulatorVideoCapture {
                     sys::ChunkKind::Keyframe => FrameKind::Keyframe,
                     sys::ChunkKind::Delta => FrameKind::Delta,
                 },
+                captured_at: chunk.captured_at,
             });
         });
 
@@ -393,6 +394,10 @@ impl VideoCapture for SimulatorVideoCapture {
 
     fn request_keyframe(&self) {
         self.inner.request_keyframe();
+    }
+
+    fn note_interaction(&self) {
+        self.inner.note_interaction();
     }
 
     fn start_recording(&self, path: &std::path::Path, config: &RecordingConfig) -> Result<()> {

@@ -275,6 +275,7 @@ impl SimSession {
         if let InputCommand::Rotate { orientation } = command {
             *self.orientation.lock().unwrap() = orientation;
         }
+        self.capture.note_interaction();
         let _ = self.input.send(command);
     }
 
