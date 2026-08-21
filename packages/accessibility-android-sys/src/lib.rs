@@ -624,7 +624,6 @@ impl AdbClient {
         let stdout = String::from_utf8_lossy(&output);
         Ok(stdout
             .lines()
-            .skip(1)
             .filter_map(|line| {
                 let (serial, state) = line.split_once('\t')?;
                 (state.split_whitespace().next() == Some("device")).then(|| serial.to_string())

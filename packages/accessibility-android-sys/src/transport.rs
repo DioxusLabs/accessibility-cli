@@ -366,12 +366,26 @@ mod tests {
             assert_eq!(read_service(&mut stream).await, "host:devices");
             write_host_response(
                 &mut stream,
-                b"List of devices attached\nphone\tdevice\noffline\toffline\nunauthorized\tunauthorized\n",
+                b"phone\tdevice\noffline\toffline\nunauthorized\tunauthorized\n",
             )
             .await;
         });
         let adb = AdbClient::new(Some("ignored")).with_server_addr(address);
         assert_eq!(adb.connected_devices().await.unwrap(), ["phone"]);
+        server.await.unwrap();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn host_devices_parses_single_device_payload() {
+        let (listener, address) = bind_listener().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_service(&mut stream).await, "host:devices");
+            write_host_response(&mut stream, b"emulator-5554\tdevice\n").await;
+        });
+        let adb = AdbClient::new(None).with_server_addr(address);
+        assert_eq!(adb.connected_devices().await.unwrap(), ["emulator-5554"]);
         server.await.unwrap();
     }
 
