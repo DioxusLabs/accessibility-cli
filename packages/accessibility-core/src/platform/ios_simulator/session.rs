@@ -21,9 +21,7 @@ use crate::video::{
 
 use super::SimulatorVideoCapture;
 use super::ax::{AxCommand, AxSnapshot, ElementDetail, spawn_ax_worker};
-use super::input::{
-    InputCapabilities, InputCommand, Orientation, spawn_input_worker_with_capabilities,
-};
+use super::input::{InputCapabilities, InputCommand, Orientation, spawn_input_worker};
 use super::settings::{self, Setting, SettingKey};
 
 /// How many encoded frames to buffer per subscriber.
@@ -133,7 +131,7 @@ impl SimSession {
         };
 
         let (capture, resolved_udid) = start_capture(udid, &config, sink)?;
-        let (input, input_capabilities) = spawn_input_worker_with_capabilities(&resolved_udid)?;
+        let (input, input_capabilities) = spawn_input_worker(&resolved_udid)?;
         let ax = spawn_ax_worker(&resolved_udid)?;
 
         Ok(Arc::new(Self {

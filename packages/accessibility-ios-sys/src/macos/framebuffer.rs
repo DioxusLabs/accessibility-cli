@@ -66,6 +66,9 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(200);
 /// do not fall back to the idle cadence between input events.
 const INTERACTION_HOLD: Duration = Duration::from_secs(1);
 
+/// How long to wait between re-wire attempts while no frame has ever been
+/// captured.
+///
 /// Descriptors are sometimes created lazily, so a registration that happened
 /// too early silently yields nothing. Rebuilding the port graph roughly once a
 /// second recovers from that.
@@ -258,6 +261,17 @@ impl CaptureState {
         }
     }
 
+    /// How long the idle thread should wait between forced re-emits: the
+    /// configured capture cadence while interaction is still recent, the idle
+    /// heartbeat once it has lapsed.
+    fn tick_interval(&self, active_until: Instant) -> Duration {
+        if active_until > Instant::now() {
+            Duration::from_micros(self.active_interval_micros.load(Ordering::Relaxed))
+        } else {
+            IDLE_INTERVAL
+        }
+    }
+
     /// Walk the IO port graph and register screen callbacks on every
     /// framebuffer descriptor, replacing any existing registration.
     fn wire_up(self: &Arc<Self>) -> Result<()> {
@@ -430,12 +444,7 @@ impl SimFramebuffer {
             let mut next_rewire = Instant::now() + REWIRE_INTERVAL;
             while state.running.load(Ordering::Relaxed) {
                 let active_until = state.active_until.lock().unwrap();
-                let active = *active_until > Instant::now();
-                let interval = if active {
-                    Duration::from_micros(state.active_interval_micros.load(Ordering::Relaxed))
-                } else {
-                    IDLE_INTERVAL
-                };
+                let interval = state.tick_interval(*active_until);
                 let (active_until, _) =
                     state.activity.wait_timeout(active_until, interval).unwrap();
                 drop(active_until);
@@ -443,12 +452,9 @@ impl SimFramebuffer {
                     break;
                 }
 
-                let active = *state.active_until.lock().unwrap() > Instant::now();
-                let interval = if active {
-                    Duration::from_micros(state.active_interval_micros.load(Ordering::Relaxed))
-                } else {
-                    IDLE_INTERVAL
-                };
+                // Re-read after the wait: an interaction may have arrived while
+                // the thread was parked, which shortens the interval.
+                let interval = state.tick_interval(*state.active_until.lock().unwrap());
                 let idle_for = state.last_capture.lock().unwrap().elapsed();
                 if idle_for >= interval {
                     state.capture(true);

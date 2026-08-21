@@ -148,23 +148,22 @@ impl ScrollGesture {
     }
 }
 
-/// Start the HID worker thread and return its command channel.
+/// What the simulator's HID interface supports on this host.
 ///
-/// The worker owns the `SimulatorHID` because it is not `Sync`, and because
-/// HID sends block on a dispatch queue round trip. It wakes periodically even
-/// when idle so a scroll gesture can be lifted after the wheel stops.
-pub fn spawn_input_worker(udid: &str) -> Result<Sender<InputCommand>> {
-    Ok(spawn_input_worker_with_capabilities(udid)?.0)
-}
-
+/// `IndigoHIDMessageForHIDArbitrary` is resolved at runtime, so buttons that
+/// ride on it (volume, mute) are unavailable on Xcode versions without it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InputCapabilities {
     pub arbitrary_hid: bool,
 }
 
-pub fn spawn_input_worker_with_capabilities(
-    udid: &str,
-) -> Result<(Sender<InputCommand>, InputCapabilities)> {
+/// Start the HID worker thread and return its command channel plus the
+/// capabilities the worker's `SimulatorHID` resolved.
+///
+/// The worker owns the `SimulatorHID` because it is not `Sync`, and because
+/// HID sends block on a dispatch queue round trip. It wakes periodically even
+/// when idle so a scroll gesture can be lifted after the wheel stops.
+pub fn spawn_input_worker(udid: &str) -> Result<(Sender<InputCommand>, InputCapabilities)> {
     use accessibility_ios_sys::{
         HardwareButton as SysButton, Orientation as SysOrientation, SimulatorHID,
         TouchEdge as SysEdge, TouchPhase as SysPhase,
