@@ -7,14 +7,14 @@
 //!
 //! This module provides accessibility support for Android devices and emulators through
 //! the Android Debug Bridge (ADB). Unlike other platforms that use native accessibility APIs,
-//! Android support works via shell commands executed through ADB.
+//! Android support works through the ADB server smartsocket protocol.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Rust (AndroidAccessibility)
-//!     ↓ tokio::process::Command
-//! adb shell / adb exec-out
+//!     ↓ TCP smartsocket
+//! ADB server
 //!     ↓
 //! Android Device/Emulator
 //! ```

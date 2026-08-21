@@ -33,7 +33,7 @@ struct DeviceGuard {
 impl DeviceGuard {
     async fn new() -> Result<Self> {
         let adb = AdbClient::new(None);
-        adb.command(&["wait-for-device"])
+        adb.wait_for_device()
             .await
             .context("Failed waiting for Android device")?;
         adb.check_connection().await?;

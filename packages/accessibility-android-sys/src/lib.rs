@@ -1,13 +1,13 @@
 //! Low-level ADB wrappers used by accessibility-cli's Android backend.
 
 pub mod emulator;
+mod transport;
 
-use std::process::{Output, Stdio};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use keyboard_types::Code;
-use tokio::process::Command;
 
 const UI_DUMP_ATTEMPTS: usize = 3;
 const UI_DUMP_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -439,15 +439,12 @@ pub struct AdbClient {
     pub adb_path: String,
     /// Maximum time to wait for an ADB command.
     pub timeout: Duration,
+    server_addr: SocketAddr,
 }
 
 impl Default for AdbClient {
     fn default() -> Self {
-        Self {
-            serial: None,
-            adb_path: "adb".to_string(),
-            timeout: DEFAULT_ADB_TIMEOUT,
-        }
+        Self::new(None)
     }
 }
 
@@ -458,6 +455,7 @@ impl AdbClient {
             serial: serial.map(String::from),
             adb_path: "adb".to_string(),
             timeout: DEFAULT_ADB_TIMEOUT,
+            server_addr: server_addr_from_environment(),
         }
     }
 
@@ -499,6 +497,7 @@ impl AdbClient {
             serial: serial.map(String::from),
             adb_path: adb_path.to_string(),
             timeout: DEFAULT_ADB_TIMEOUT,
+            server_addr: server_addr_from_environment(),
         }
     }
 
@@ -508,92 +507,84 @@ impl AdbClient {
         self
     }
 
-    /// Build base ADB command with optional device serial.
-    fn base_command(&self) -> Command {
-        let mut cmd = Command::new(&self.adb_path);
-        if let Some(ref serial) = self.serial {
-            cmd.arg("-s").arg(serial);
-        }
-        cmd
+    /// Set the ADB server address.
+    pub fn with_server_addr(mut self, server_addr: SocketAddr) -> Self {
+        self.server_addr = server_addr;
+        self
     }
 
-    /// Build an ADB command without an optional device serial.
-    fn command_without_serial(&self) -> Command {
-        Command::new(&self.adb_path)
-    }
-
-    async fn run(&self, kind: &str, mut cmd: Command) -> Result<Output> {
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let child = cmd.spawn().with_context(|| {
-            format!(
-                "ADB binary not found at '{}'. Install Android SDK Platform Tools.",
-                self.adb_path
-            )
-        })?;
-        tokio::time::timeout(self.timeout, child.wait_with_output())
+    async fn run<T>(
+        &self,
+        kind: &str,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(self.timeout, operation)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "adb {kind} command timed out after {}s (adb path: '{}')",
+                    "adb {kind} request timed out after {}s (adb server: {})",
                     self.timeout.as_secs_f64(),
-                    self.adb_path
+                    self.server_addr
                 )
             })?
-            .with_context(|| format!("Failed to execute adb {kind} command"))
     }
 
     /// Execute an ADB shell command.
     pub async fn shell(&self, args: &[&str]) -> Result<String> {
-        let mut cmd = self.base_command();
-        cmd.arg("shell").args(args);
-        let output = self.run("shell", cmd).await?;
-        Self::check_output(&output, "shell")?;
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let output = self
+            .run("shell", transport.shell(self.serial.as_deref(), args))
+            .await?;
+        Self::check_shell_output(&output)?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Execute an ADB shell command and return raw bytes.
     pub async fn shell_raw(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = self.base_command();
-        cmd.arg("shell").args(args);
-        let output = self.run("shell", cmd).await?;
-        Self::check_output(&output, "shell")?;
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let output = self
+            .run("shell", transport.shell(self.serial.as_deref(), args))
+            .await?;
+        Self::check_shell_output(&output)?;
         Ok(output.stdout)
     }
 
-    /// Execute `adb exec-out` for efficient binary output.
+    /// Execute a device command and return its binary output.
+    ///
+    /// The underlying `exec:` service provides no exit status; this method
+    /// returns bytes until the server closes the stream.
     pub async fn exec_out(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = self.base_command();
-        cmd.arg("exec-out").args(args);
-        let output = self.run("exec-out", cmd).await?;
-        Self::check_output(&output, "exec-out")?;
-        Ok(output.stdout)
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        self.run("exec", transport.exec(self.serial.as_deref(), args))
+            .await
     }
 
-    /// Execute a general ADB command (not shell).
-    pub async fn command(&self, args: &[&str]) -> Result<String> {
-        let mut cmd = self.base_command();
-        cmd.args(args);
-        let output = self.run("adb", cmd).await?;
-        Self::check_output(&output, "adb")?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    /// Query the ADB server version.
+    pub async fn server_version(&self) -> Result<String> {
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let output = self
+            .run("host:version", transport.host_query("host:version"))
+            .await?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
-    fn check_output(output: &Output, cmd_type: &str) -> Result<()> {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "ADB {} command failed (exit code {}): stdout={}, stderr={}",
-                cmd_type,
-                output.status.code().unwrap_or(-1),
-                stdout.trim(),
-                stderr.trim()
-            );
-        }
-        Ok(())
+    /// Query the feature list reported by the ADB server.
+    pub async fn server_features(&self) -> Result<String> {
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let output = self
+            .run("host:features", transport.host_query("host:features"))
+            .await?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    /// Wait until the selected device is available.
+    pub async fn wait_for_device(&self) -> Result<()> {
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        self.run(
+            "wait-for-device",
+            transport.wait_for_device(self.serial.as_deref()),
+        )
+        .await
     }
 
     /// Check if ADB is available and a device is connected.
@@ -615,11 +606,11 @@ impl AdbClient {
     }
 
     pub async fn connected_devices(&self) -> Result<Vec<String>> {
-        let mut cmd = self.command_without_serial();
-        cmd.arg("devices");
-        let output = self.run("devices", cmd).await?;
-        Self::check_output(&output, "devices")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let transport = transport::AdbTransport::new(self.server_addr, &self.adb_path);
+        let output = self
+            .run("host:devices", transport.host_query("host:devices"))
+            .await?;
+        let stdout = String::from_utf8_lossy(&output);
         Ok(stdout
             .lines()
             .skip(1)
@@ -628,6 +619,18 @@ impl AdbClient {
                 (state.split_whitespace().next() == Some("device")).then(|| serial.to_string())
             })
             .collect())
+    }
+
+    fn check_shell_output(output: &transport::ShellOutput) -> Result<()> {
+        if output.exit_code != 0 {
+            bail!(
+                "ADB shell command failed (exit code {}): stdout={}, stderr={}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     pub async fn resolved_serial(&self) -> Result<String> {
@@ -844,6 +847,14 @@ fn adb_binary_name() -> &'static str {
     }
 }
 
+fn server_addr_from_environment() -> SocketAddr {
+    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(transport::DEFAULT_SERVER_ADDR.port());
+    SocketAddr::new(transport::DEFAULT_SERVER_ADDR.ip(), port)
+}
+
 /// Escape text for ADB shell input command.
 pub fn escape_shell_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len() * 2);
@@ -951,20 +962,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn adb_command_times_out_and_kills_child() {
-        let adb =
-            AdbClient::with_adb_path(None, "/bin/sleep").with_timeout(Duration::from_millis(100));
-        let started = std::time::Instant::now();
-        let error = adb.command(&["5"]).await.unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(error.to_string().contains("timed out after"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn missing_adb_binary_has_install_context() {
-        let adb = AdbClient::with_adb_path(None, "/no/such/adb");
+        let adb = AdbClient::with_adb_path(None, "/no/such/adb")
+            .with_server_addr(SocketAddr::from(([127, 0, 0, 1], 1)));
         let error = adb.connected_devices().await.unwrap_err();
         assert!(error.to_string().contains(
             "ADB binary not found at '/no/such/adb'. Install Android SDK Platform Tools."

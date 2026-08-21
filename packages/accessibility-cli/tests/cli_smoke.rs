@@ -96,6 +96,7 @@ fn operational_flags_parse_before_backend_startup() {
     for args in cases {
         let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
         cmd.env("PATH", &no_adb_path)
+            .env("ANDROID_ADB_SERVER_PORT", "1")
             .args(*args)
             .assert()
             .failure()
@@ -195,6 +196,7 @@ fn press_accepts_query_on_non_ios_platforms() {
         .join("test-no-adb");
     let mut cmd = Command::cargo_bin("accessibility-cli").unwrap();
     cmd.env("PATH", &no_adb_path)
+        .env("ANDROID_ADB_SERVER_PORT", "1")
         .args([
             "--platform",
             "android",
