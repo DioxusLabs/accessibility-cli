@@ -25,17 +25,15 @@ async fn main() -> Result<()> {
     println!("encoded   : {}x{}", config.width, config.height);
 
     let stimulus = adb.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        std::thread::sleep(Duration::from_secs(1));
-        let _ = runtime.block_on(stimulus.swipe(
-            (width as f64 * 0.5, height as f64 * 0.75),
-            (width as f64 * 0.5, height as f64 * 0.25),
-            800,
-        ));
+    let stimulus = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = stimulus
+            .swipe(
+                (width as f64 * 0.5, height as f64 * 0.75),
+                (width as f64 * 0.5, height as f64 * 0.25),
+                800,
+            )
+            .await;
     });
 
     let started = Instant::now();
@@ -72,6 +70,7 @@ async fn main() -> Result<()> {
         restart.elapsed().as_secs_f64() * 1000.0
     );
     println!("entry NALs: {:?}", nal_types(&first.data));
+    let _ = stimulus.await;
     println!("probe passed");
     Ok(())
 }
