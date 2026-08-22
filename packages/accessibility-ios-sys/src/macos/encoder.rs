@@ -215,7 +215,9 @@ impl H264Encoder {
     /// Encode one frame, rebuilding the session if the source resized.
     ///
     /// `width`/`height` describe the *source*; the session may be smaller if
-    /// the config caps the long edge, in which case VideoToolbox scales.
+    /// the config caps the long edge, in which case VideoToolbox scales. The
+    /// pixel transfer is synchronous and blocks until the encoder owns a copy
+    /// of the recycled simulator surface.
     pub fn encode(
         &mut self,
         image: &CVImageBuffer,

@@ -23,6 +23,19 @@ Miss that and attribute reads do not fail, they silently return an empty label
 and a zero frame. `get_tree` already does this; see the matching step in
 `get_element_at_point`.
 
+## SpringBoard crash remediation
+
+A dead SpringBoard can leave CoreSimulatorBridge serving a stale root with a
+zero frame. Spawn the runtime's `bin/launchctl` through
+`SimDevice.spawnAsyncWithPath:...` and run `stop com.apple.CoreSimulator.bridge`.
+The service is kept alive and respawns automatically; after it exits, retry the
+accessibility query once. This was verified on Xcode 26.6 by killing SpringBoard:
+the retry returned a healthy tree from the replacement SpringBoard PID.
+
+The spawn completion and termination callbacks share one `Condvar`, so their
+results must also share one mutex. macOS rejects using one condition variable
+with two mutexes and panics before the CoreSimulator call can complete.
+
 ## Backdrops swallow hit tests
 
 Every app has full-screen backdrops: the Application node plus one or more

@@ -53,6 +53,9 @@ pub struct Screenshot {
 }
 
 impl Screenshot {
+    /// Crop and re-encode this screenshot as PNG.
+    ///
+    /// This decodes and encodes the image synchronously on the calling thread.
     pub fn crop(&self, bounds: &Rect, screen_bounds: &Rect) -> Result<Screenshot> {
         use image::ImageReader;
         use std::io::Cursor;
@@ -504,6 +507,7 @@ pub(super) unsafe fn nsstring_to_string_static(ns_string: *mut AnyObject) -> Opt
 ///
 /// Devices are returned in CoreSimulator's order. Each entry includes the
 /// stable UDID used by the rest of this crate and the user-visible device name.
+/// Framework loading and device enumeration happen synchronously.
 pub fn booted_simulators() -> Result<Vec<BootedSimulator>> {
     crate::frameworks::load_coresimulator_framework()?;
 

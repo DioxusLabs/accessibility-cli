@@ -362,6 +362,10 @@ impl CaptureState {
 }
 
 /// Live framebuffer capture session for one simulator device.
+///
+/// Starting synchronously discovers and registers SimulatorKit IO ports.
+/// Stopping, including through `Drop`, blocks while the idle worker exits and
+/// callbacks are unregistered.
 pub struct SimFramebuffer {
     device_udid: String,
     state: Arc<CaptureState>,
@@ -427,6 +431,8 @@ impl SimFramebuffer {
     }
 
     /// Begin capturing. Calling twice rebuilds the pipeline.
+    ///
+    /// IO-port discovery and callback registration happen synchronously.
     pub fn start(&mut self) -> Result<()> {
         self.state.running.store(true, Ordering::Relaxed);
         self.state.wire_up()?;
@@ -474,6 +480,8 @@ impl SimFramebuffer {
         }));
     }
 
+    /// Stop capture, blocking until the idle worker exits and callbacks are
+    /// unregistered.
     pub fn stop(&mut self) {
         self.state.running.store(false, Ordering::Relaxed);
         self.state.activity.notify_one();

@@ -35,7 +35,9 @@ impl SimVideoStream {
     /// Start capturing `udid` and pushing encoded chunks to `sink`.
     ///
     /// `sink` runs on the capture queue, so it must not block; the intended
-    /// use is a bounded channel that drops on overflow.
+    /// use is a bounded channel that drops on overflow. Framework loading,
+    /// encoder creation, and framebuffer registration happen synchronously
+    /// before this function returns.
     pub fn start(udid: Option<&str>, config: EncoderConfig, sink: ChunkSink) -> Result<Self> {
         let mut framebuffer = SimFramebuffer::new(udid)?;
         framebuffer.set_active_frame_rate(config.fps);
@@ -142,6 +144,8 @@ impl SimVideoStream {
     }
 
     /// Stop the running recording and finalize the file.
+    ///
+    /// This blocks while `AVAssetWriter` flushes, for up to 30 seconds.
     pub fn stop_recording(&self) -> Result<Recording> {
         let recorder = self
             .recorder
@@ -162,6 +166,9 @@ impl SimVideoStream {
             .map(|recorder| recorder.frames())
     }
 
+    /// Stop capture and finalize any active recording.
+    ///
+    /// This may block on recording finalization and framebuffer worker shutdown.
     pub fn stop(&mut self) {
         // Finalize before tearing the capture down, so an in-flight recording
         // is left playable rather than truncated.

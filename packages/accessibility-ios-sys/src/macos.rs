@@ -55,6 +55,7 @@ use objc2_foundation::{NSString, NSUUID};
 use slotmap::SecondaryMap;
 
 mod common;
+mod control;
 mod dispatcher;
 mod dynamic;
 mod encoder;
@@ -69,6 +70,9 @@ mod void_block;
 pub use common::{
     BootedSimulator, ButtonDirection, Element, ElementKey, ElementTree, HardwareButton, Point,
     Rect, ScreenSpace, Screenshot, Size, TreeFilter, booted_simulators, load_frameworks,
+};
+pub use control::{
+    SimulatorAppearance, SimulatorContentSize, SimulatorDevice, SimulatorIncreaseContrast,
 };
 pub use encoder::{
     ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat, Tuning,

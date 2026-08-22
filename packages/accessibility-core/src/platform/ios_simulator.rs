@@ -49,6 +49,10 @@ pub fn load_frameworks() -> Result<()> {
 ///
 /// This is a safe core wrapper around `accessibility-ios-sys`; it does not expose
 /// Objective-C, CoreFoundation, or libc handles outside the sys crate.
+///
+/// Its inherent accessibility and HID methods are synchronous and may block on
+/// simulator IPC or deliberate input pacing. Session users should prefer the
+/// dedicated async worker APIs on [`SimSession`].
 pub struct IOSSimulatorAccessibility {
     inner: sys::IOSSimulatorAccessibility,
     cache: ElementCache,
@@ -75,6 +79,8 @@ impl IOSSimulatorAccessibility {
     }
 
     /// Get the accessibility tree from the frontmost app in the simulator.
+    ///
+    /// This synchronously waits on recursive accessibility bridge queries.
     pub fn get_tree(&mut self, filter: &TreeFilter) -> Result<ElementTree> {
         self.clear_local_cache();
 
@@ -169,6 +175,9 @@ impl IOSSimulatorAccessibility {
     }
 
     /// Capture a screenshot of the entire simulator screen.
+    ///
+    /// This blocks while waiting for a framebuffer and encoding PNG. Async
+    /// callers should use the [`AccessibilityReader`] implementation instead.
     pub fn capture_screen(&self) -> Result<Screenshot> {
         self.inner.capture_screen().map(from_sys_screenshot)
     }
@@ -181,6 +190,9 @@ impl IOSSimulatorAccessibility {
     }
 
     /// Capture a screenshot of a specific element.
+    ///
+    /// This blocks for full-screen capture, image decoding, cropping, and PNG
+    /// re-encoding.
     pub fn capture_element(&mut self, id: ElementKey) -> Result<Screenshot> {
         let sys_id = self.sys_id(id)?;
         self.inner.capture_element(sys_id).map(from_sys_screenshot)
@@ -300,7 +312,15 @@ impl AccessibilityReader for IOSSimulatorAccessibility {
         &self,
         _target: &Target,
     ) -> impl std::future::Future<Output = Result<Screenshot>> {
-        async move { IOSSimulatorAccessibility::capture_screen(self) }
+        let udid = self.device_udid().to_string();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                sys::IOSSimulatorAccessibility::capture_screen_for_device(Some(&udid))
+                    .map(from_sys_screenshot)
+            })
+            .await
+            .map_err(|error| anyhow!("simulator screenshot worker failed: {error}"))?
+        }
     }
 
     fn get_screen_bounds(

@@ -81,15 +81,12 @@ async fn stats(State(state): State<AppState>) -> Json<crate::session::StatsRepor
 
 #[cfg(target_os = "macos")]
 async fn settings(State(state): State<AppState>) -> Json<Vec<Setting>> {
-    // Each read shells out to simctl, so keep it off the async worker threads.
+    // Each read goes through the simulator control worker, keeping synchronous
+    // CoreSimulator round trips off the async worker threads.
     let Some(session) = state.session.ios_session().cloned() else {
         return Json(Vec::new());
     };
-    Json(
-        tokio::task::spawn_blocking(move || session.settings())
-            .await
-            .unwrap_or_default(),
-    )
+    Json(session.settings().await.unwrap_or_default())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -123,13 +120,9 @@ async fn set_setting(
         )
             .into_response();
     };
-    let result =
-        tokio::task::spawn_blocking(move || session.set_setting(request.key, &request.value)).await;
-
-    match result {
-        Ok(Ok(value)) => Json(serde_json::json!({ "value": value })).into_response(),
-        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-        Err(error) => internal_error(anyhow::anyhow!(error)),
+    match session.set_setting(request.key, &request.value).await {
+        Ok(value) => Json(serde_json::json!({ "value": value })).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 

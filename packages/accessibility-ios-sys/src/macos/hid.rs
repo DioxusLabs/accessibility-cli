@@ -75,6 +75,11 @@ pub enum Orientation {
     LandscapeLeft = 4,
 }
 
+/// Direct simulator HID client.
+///
+/// Sends synchronously wait for a dispatch-queue round trip. Composite taps,
+/// swipes, buttons, and key presses also sleep to preserve event timing, so
+/// callers should keep this client off async runtime threads.
 pub struct SimulatorHID {
     client: *mut AnyObject, // SimDeviceLegacyHIDClient
     device: *mut AnyObject, // SimDevice, retained for GSEvent port lookup

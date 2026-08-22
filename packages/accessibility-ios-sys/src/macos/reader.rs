@@ -1,4 +1,5 @@
 use super::common::{ElementCache, find_booted_device, get_translator, map_ax_role_ios};
+use super::control::SimulatorDevice;
 use super::dispatcher::{
     CFRetain, ensure_dispatcher_registered, generate_token, get_dispatcher_state,
 };
@@ -10,6 +11,10 @@ mod actions;
 /// iOS Simulator accessibility reader.
 ///
 /// Provides access to the accessibility tree of iOS apps running in the iOS Simulator.
+///
+/// Tree queries, hit tests, and actions synchronously wait on the simulator's
+/// accessibility bridge, which currently has no response timeout. Call these
+/// methods from a dedicated worker thread.
 pub struct IOSSimulatorAccessibility {
     translator: *mut AnyObject,
     device: *mut AnyObject,
@@ -74,6 +79,9 @@ impl IOSSimulatorAccessibility {
     }
 
     /// Get the accessibility tree from the frontmost app in the simulator.
+    ///
+    /// This recursively performs synchronous bridge queries with no response
+    /// timeout and may also wait for accessibility remediation.
     pub fn get_tree(&mut self, filter: &TreeFilter) -> Result<ElementTree> {
         // Clear previous cache
         self.clear_cache();
@@ -159,8 +167,8 @@ impl IOSSimulatorAccessibility {
         }
 
         // Store the app bounds for screenshot coordinate conversion.
-        // iOS accessibility coordinates are in macOS screen space, but xcrun simctl screenshot
-        // captures device-local coordinates starting at (0,0). We need to subtract the app's
+        // iOS accessibility coordinates are in macOS screen space, but framebuffer screenshots
+        // use device-local coordinates starting at (0,0). We need to subtract the app's
         // origin to convert accessibility bounds to device-local coordinates.
         self.app_bounds = Some(Rect::new(
             Point::new(frame.origin.x, frame.origin.y),
@@ -198,61 +206,25 @@ impl IOSSimulatorAccessibility {
             "[WARN] This usually means SpringBoard crashed and CoreSimulatorBridge needs restart"
         );
 
-        // Get the device UDID for the launchctl command
+        // Get the device UDID for diagnostics if remediation fails.
         let udid = &self.device_udid;
 
-        // Restart CoreSimulatorBridge via launchctl
-        // The service name pattern is: com.apple.CoreSimulator.bridge.<UDID>
-        let service_name = format!("com.apple.CoreSimulator.bridge.{}", udid);
-
-        // Use xcrun simctl to stop and restart the bridge
-        // This is safer than directly calling launchctl
-        let output = std::process::Command::new("xcrun")
-            .args([
-                "simctl",
-                "spawn",
-                udid,
-                "launchctl",
-                "kickstart",
-                "-k",
-                &format!("system/{}", service_name),
-            ])
-            .output();
-
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    eprintln!("[INFO] Successfully restarted CoreSimulatorBridge");
-                    // Give the bridge a moment to restart
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    Ok(true)
-                } else {
-                    // If kickstart fails, try using simctl directly
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    eprintln!(
-                        "[WARN] Failed to restart via launchctl ({}), trying alternative...",
-                        stderr.trim()
-                    );
-
-                    // Alternative: use simctl shutdown and boot
-                    // This is more disruptive but more reliable
-                    // For now, just return an error with instructions
-                    Err(anyhow!(
-                        "Accessibility subsystem appears to be in a bad state (zero-sized frame). \
-                        This typically happens when SpringBoard has crashed. \
-                        Try restarting the simulator or running: \
-                        xcrun simctl shutdown {} && xcrun simctl boot {}",
-                        udid,
-                        udid
-                    ))
-                }
-            }
-            Err(e) => Err(anyhow!(
-                "Failed to restart CoreSimulatorBridge: {}. \
+        // Restart CoreSimulatorBridge through the simulator's launchd domain.
+        // The guest service name is com.apple.CoreSimulator.bridge.
+        let device = unsafe { SimulatorDevice::retaining(self.device) };
+        device.restart_accessibility_bridge().map_err(|error| {
+            anyhow!(
+                "Failed to restart CoreSimulatorBridge for {}: {}. \
                     Try restarting the simulator manually.",
-                e
-            )),
-        }
+                udid,
+                error
+            )
+        })?;
+
+        eprintln!("[INFO] Successfully restarted CoreSimulatorBridge");
+        // Give the bridge a moment to restart
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Ok(true)
     }
 
     /// Build an Element from an AXPMacPlatformElement.
