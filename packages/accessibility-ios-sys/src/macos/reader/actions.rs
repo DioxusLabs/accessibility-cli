@@ -1,5 +1,11 @@
+use std::sync::mpsc::RecvTimeoutError;
+
 use super::*;
 use crate::macos::dispatcher::{CFRelease, get_dispatcher_state};
+use objc2_core_video::{
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+};
 
 impl IOSSimulatorAccessibility {
     /// Clear the element cache and release retained element pointers.
@@ -367,63 +373,40 @@ impl IOSSimulatorAccessibility {
 
     /// Capture a screenshot of the entire simulator screen.
     ///
-    /// Uses `xcrun simctl io` to capture the screenshot as PNG.
+    /// Uses SimulatorKit's live framebuffer and encodes a copied frame as PNG.
+    /// This blocks the current thread while waiting for a frame and encoding it.
     pub fn capture_screen(&self) -> Result<Screenshot> {
-        use std::io::Read;
+        Self::capture_screen_for_device(Some(&self.device_udid))
+    }
 
-        // Create a temporary file for the screenshot
-        let temp_dir = std::env::temp_dir();
-        let screenshot_path = temp_dir.join(format!(
-            "accessibility_cli_screenshot_{}.png",
-            std::process::id()
-        ));
-
-        // Run xcrun simctl io <udid> screenshot <path>
-        let output = std::process::Command::new("xcrun")
-            .args([
-                "simctl",
-                "io",
-                &self.device_udid,
-                "screenshot",
-                "--type=png",
-                screenshot_path.to_str().unwrap(),
-            ])
-            .output()
-            .map_err(|e| anyhow!("Failed to execute xcrun simctl: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up temp file if it exists
-            let _ = std::fs::remove_file(&screenshot_path);
-            return Err(anyhow!("Screenshot capture failed: {}", stderr.trim()));
-        }
-
-        // Read the PNG file
-        let mut file = std::fs::File::open(&screenshot_path)
-            .map_err(|e| anyhow!("Failed to open screenshot file: {}", e))?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .map_err(|e| anyhow!("Failed to read screenshot file: {}", e))?;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&screenshot_path);
-
-        // Decode PNG to get dimensions
-        let (width, height) = {
-            use image::ImageReader;
-            use std::io::Cursor;
-            let img = ImageReader::new(Cursor::new(&data))
-                .with_guessed_format()?
-                .decode()
-                .map_err(|e| anyhow!("Failed to decode screenshot: {}", e))?;
-            (img.width(), img.height())
+    /// Capture a PNG screenshot directly from a booted simulator's framebuffer.
+    ///
+    /// This is a blocking API: it waits up to three seconds for a frame, copies
+    /// the full framebuffer before SimulatorKit recycles it, and encodes the
+    /// copy as PNG on the calling thread. Async callers should run it on a
+    /// blocking worker.
+    pub fn capture_screen_for_device(udid: Option<&str>) -> Result<Screenshot> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut sender = Some(sender);
+        let mut framebuffer = SimFramebuffer::new(udid)?;
+        framebuffer.set_sink(Some(Box::new(move |frame| {
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(RawScreenshot::copy(frame));
+            }
+        })));
+        framebuffer.start()?;
+        let frame = match receiver.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(frame) => frame?,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(anyhow!("Timed out waiting for a simulator framebuffer"));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("Simulator framebuffer capture stopped"));
+            }
         };
+        drop(framebuffer);
 
-        Ok(Screenshot {
-            data,
-            width,
-            height,
-        })
+        frame.encode()
     }
 
     /// Get the screen bounds for the simulator.
@@ -438,7 +421,8 @@ impl IOSSimulatorAccessibility {
 
     /// Capture a screenshot of a specific element.
     ///
-    /// This captures the full screen and crops to the element's bounds.
+    /// This captures the full screen and crops to the element's bounds. It
+    /// blocks while waiting for a frame and while decoding and re-encoding PNG.
     pub fn capture_element(&mut self, id: ElementKey) -> Result<Screenshot> {
         // Get element bounds from cache
         let element_ptr =
@@ -461,5 +445,96 @@ impl IOSSimulatorAccessibility {
 
         // Crop to element bounds
         screenshot.crop(&bounds, &screen_bounds)
+    }
+}
+
+struct RawScreenshot {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl RawScreenshot {
+    fn copy(frame: CapturedFrame<'_>) -> Result<Self> {
+        let flags = CVPixelBufferLockFlags::ReadOnly;
+        let status = unsafe { CVPixelBufferLockBaseAddress(frame.pixel_buffer, flags) };
+        if status != 0 {
+            return Err(anyhow!("Failed to lock simulator framebuffer: {status}"));
+        }
+
+        let result = (|| {
+            let base = CVPixelBufferGetBaseAddress(frame.pixel_buffer).cast::<u8>();
+            if base.is_null() {
+                return Err(anyhow!("Simulator framebuffer has no base address"));
+            }
+            let row_bytes = CVPixelBufferGetBytesPerRow(frame.pixel_buffer);
+            let packed_row_bytes = usize::try_from(frame.width)?
+                .checked_mul(4)
+                .ok_or_else(|| anyhow!("Simulator framebuffer row size overflow"))?;
+            if row_bytes < packed_row_bytes {
+                return Err(anyhow!(
+                    "Simulator framebuffer row is shorter than its width"
+                ));
+            }
+            let height = usize::try_from(frame.height)?;
+            let length = packed_row_bytes
+                .checked_mul(height)
+                .ok_or_else(|| anyhow!("Simulator framebuffer size overflow"))?;
+            let mut rgba = vec![0; length];
+            for row in 0..height {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(row * row_bytes),
+                        rgba.as_mut_ptr().add(row * packed_row_bytes),
+                        packed_row_bytes,
+                    );
+                }
+            }
+            Self::convert_bgra(&mut rgba);
+            Ok(Self {
+                rgba,
+                width: frame.width,
+                height: frame.height,
+            })
+        })();
+
+        let unlock = unsafe { CVPixelBufferUnlockBaseAddress(frame.pixel_buffer, flags) };
+        match result {
+            Err(error) => Err(error),
+            Ok(_) if unlock != 0 => {
+                Err(anyhow!("Failed to unlock simulator framebuffer: {unlock}"))
+            }
+            Ok(frame) => Ok(frame),
+        }
+    }
+
+    fn convert_bgra(pixels: &mut [u8]) {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+
+    fn encode(self) -> Result<Screenshot> {
+        let image = image::RgbaImage::from_raw(self.width, self.height, self.rgba)
+            .ok_or_else(|| anyhow!("Failed to construct simulator screenshot image"))?;
+        let mut data = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut data, image::ImageFormat::Png)?;
+        Ok(Screenshot {
+            data: data.into_inner(),
+            width: self.width,
+            height: self.height,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_bgra_pixels_to_rgba() {
+        let mut pixels = [1, 2, 3, 4, 5, 6, 7, 8];
+        RawScreenshot::convert_bgra(&mut pixels);
+        assert_eq!(pixels, [3, 2, 1, 4, 7, 6, 5, 8]);
     }
 }

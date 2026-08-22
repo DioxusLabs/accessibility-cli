@@ -21,8 +21,8 @@ use crate::video::{
 
 use super::SimulatorVideoCapture;
 use super::ax::{AxCommand, AxSnapshot, ElementDetail, spawn_ax_worker};
-use super::input::{InputCommand, Orientation, spawn_input_worker};
-use super::settings::{self, Setting, SettingKey};
+use super::input::{InputCapabilities, InputCommand, Orientation, spawn_input_worker};
+use super::settings::{Setting, SettingKey, SimulatorControl};
 
 /// How many encoded frames to buffer per subscriber.
 ///
@@ -93,7 +93,9 @@ pub struct SimSession {
     stats: Arc<StreamStats>,
     started: Instant,
     input: std::sync::mpsc::Sender<InputCommand>,
+    input_capabilities: InputCapabilities,
     ax: mpsc::UnboundedSender<AxCommand>,
+    control: SimulatorControl,
     /// Last orientation we asked for.
     ///
     /// The framebuffer is always portrait-native — rotating the device
@@ -103,7 +105,17 @@ pub struct SimSession {
 }
 
 impl SimSession {
-    /// Attach to a booted simulator and start capturing.
+    /// Attach to a booted simulator and start its independent runtime lanes.
+    ///
+    /// Starts:
+    ///
+    /// 1. Framebuffer capture and video encoding.
+    /// 2. Low-latency HID input forwarding.
+    /// 3. Accessibility tree and hit-test handling.
+    /// 4. Direct CoreSimulator settings control.
+    ///
+    /// Framework loading and lane initialization are synchronous and may block
+    /// before the session is returned.
     pub fn start(udid: Option<&str>, config: VideoConfig) -> Result<Arc<Self>> {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let latest_parameter_set = Arc::new(std::sync::Mutex::new(None));
@@ -130,8 +142,9 @@ impl SimSession {
         };
 
         let (capture, resolved_udid) = start_capture(udid, &config, sink)?;
-        let input = spawn_input_worker(&resolved_udid)?;
+        let (input, input_capabilities) = spawn_input_worker(&resolved_udid)?;
         let ax = spawn_ax_worker(&resolved_udid)?;
+        let control = SimulatorControl::start(&resolved_udid)?;
 
         Ok(Arc::new(Self {
             device_udid: resolved_udid,
@@ -141,7 +154,9 @@ impl SimSession {
             stats,
             started: Instant::now(),
             input,
+            input_capabilities,
             ax,
+            control,
             orientation: std::sync::Mutex::new(Orientation::Portrait),
         }))
     }
@@ -218,6 +233,10 @@ impl SimSession {
         }
     }
 
+    pub fn input_capabilities(&self) -> InputCapabilities {
+        self.input_capabilities
+    }
+
     pub fn orientation(&self) -> Orientation {
         *self.orientation.lock().unwrap()
     }
@@ -245,6 +264,8 @@ impl SimSession {
         Ok(path)
     }
 
+    /// Finalize the active recording, blocking for up to 30 seconds while the
+    /// writer flushes the MP4 index.
     pub fn stop_recording(&self) -> Result<Recording> {
         self.capture.stop_recording()
     }
@@ -253,12 +274,12 @@ impl SimSession {
         self.capture.recording_frames()
     }
 
-    pub fn settings(&self) -> Vec<Setting> {
-        settings::read_all(&self.device_udid)
+    pub async fn settings(&self) -> Result<Vec<Setting>> {
+        self.control.read_all().await
     }
 
-    pub fn set_setting(&self, key: SettingKey, value: &str) -> Result<String> {
-        settings::write(&self.device_udid, key, value)
+    pub async fn set_setting(&self, key: SettingKey, value: &str) -> Result<String> {
+        self.control.write(key, value).await
     }
 
     /// Queue an input event. Fire-and-forget: pointer events must never block
@@ -267,6 +288,7 @@ impl SimSession {
         if let InputCommand::Rotate { orientation } = command {
             *self.orientation.lock().unwrap() = orientation;
         }
+        self.capture.note_interaction();
         let _ = self.input.send(command);
     }
 

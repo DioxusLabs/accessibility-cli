@@ -35,9 +35,12 @@ impl SimVideoStream {
     /// Start capturing `udid` and pushing encoded chunks to `sink`.
     ///
     /// `sink` runs on the capture queue, so it must not block; the intended
-    /// use is a bounded channel that drops on overflow.
+    /// use is a bounded channel that drops on overflow. Framework loading,
+    /// encoder creation, and framebuffer registration happen synchronously
+    /// before this function returns.
     pub fn start(udid: Option<&str>, config: EncoderConfig, sink: ChunkSink) -> Result<Self> {
         let mut framebuffer = SimFramebuffer::new(udid)?;
+        framebuffer.set_active_frame_rate(config.fps);
         let force_keyframe = Arc::new(AtomicBool::new(false));
 
         let mut encoder = H264Encoder::new(config, Arc::clone(&force_keyframe), sink)?;
@@ -48,7 +51,12 @@ impl SimVideoStream {
             // `CVPixelBuffer` derefs to `CVImageBuffer`, which is what
             // VideoToolbox wants.
             let image: &CVImageBuffer = frame.pixel_buffer;
-            if let Err(error) = encoder.encode(image, frame.width as i32, frame.height as i32) {
+            if let Err(error) = encoder.encode(
+                image,
+                frame.width as i32,
+                frame.height as i32,
+                frame.captured_at,
+            ) {
                 eprintln!("[capture] encode failed: {error}");
             }
 
@@ -111,6 +119,10 @@ impl SimVideoStream {
         self.force_keyframe.store(true, Ordering::Relaxed);
     }
 
+    pub fn note_interaction(&self) {
+        self.framebuffer.note_interaction();
+    }
+
     /// Begin recording to `path`. Fails if one is already running.
     pub fn start_recording(&self, path: &Path, config: RecordingConfig) -> Result<()> {
         let geometry = self.geometry();
@@ -132,6 +144,8 @@ impl SimVideoStream {
     }
 
     /// Stop the running recording and finalize the file.
+    ///
+    /// This blocks while `AVAssetWriter` flushes, for up to 30 seconds.
     pub fn stop_recording(&self) -> Result<Recording> {
         let recorder = self
             .recorder
@@ -152,6 +166,9 @@ impl SimVideoStream {
             .map(|recorder| recorder.frames())
     }
 
+    /// Stop capture and finalize any active recording.
+    ///
+    /// This may block on recording finalization and framebuffer worker shutdown.
     pub fn stop(&mut self) {
         // Finalize before tearing the capture down, so an in-flight recording
         // is left playable rather than truncated.

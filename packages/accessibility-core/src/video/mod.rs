@@ -13,6 +13,7 @@
 //! reports [`VideoCapture`] as unsupported.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -83,6 +84,7 @@ impl FrameKind {
 pub struct EncodedFrame {
     pub data: Bytes,
     pub kind: FrameKind,
+    pub captured_at: Instant,
 }
 
 /// Pixel dimensions of the captured display.
@@ -191,6 +193,10 @@ pub trait VideoCapture: Send + Sync {
     /// Called when a new client subscribes, or in response to an RTCP PLI/FIR
     /// from a WebRTC receiver.
     fn request_keyframe(&self);
+
+    /// Keep capture at its configured cadence while interaction or resulting
+    /// animation is active.
+    fn note_interaction(&self) {}
 
     /// Stop capturing and release platform resources.
     fn stop(&mut self);

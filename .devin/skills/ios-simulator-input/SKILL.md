@@ -82,3 +82,8 @@ not publish that port.
 colour filters, transparency, VoiceOver) have no simctl verb and need a helper
 binary spawned inside the simulator that drives the private libAccessibility
 setters.
+
+The direct `SimDevice` getters return raw integers. Measured on Xcode 26.6:
+appearance is 1 light / 2 dark, content size is 1 through 12, and increase
+contrast is **1 disabled / 2 enabled** — it is not a 0/1 boolean even though
+the setter accepts a BOOL.

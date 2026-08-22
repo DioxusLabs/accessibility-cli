@@ -159,6 +159,7 @@ impl Recorder {
     ///
     /// Frames the writer is not ready for are dropped rather than queued: a
     /// recording that falls behind should lose frames, not unbounded memory.
+    /// Pixel transfer and writer submission run synchronously on the caller.
     pub fn append(&mut self, source: &CVPixelBuffer) -> Result<()> {
         let started_at = *self.started_at.get_or_insert_with(std::time::Instant::now);
 

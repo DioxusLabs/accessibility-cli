@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use accessibility_android_sys::AdbClient;
 use accessibility_android_sys::emulator::screenrecord::{
@@ -247,6 +247,7 @@ fn emit(
             } else {
                 FrameKind::Delta
             },
+            captured_at: Instant::now(),
         });
     }
 }
