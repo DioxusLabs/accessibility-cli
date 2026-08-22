@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, sel};
@@ -66,6 +66,29 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(200);
 /// do not fall back to the idle cadence between input events.
 const INTERACTION_HOLD: Duration = Duration::from_secs(1);
 
+/// Tolerance on the fill deadline so sub-millisecond timer jitter does not
+/// turn a 60 Hz fill into a 30 Hz beat against native frames.
+const FILL_SLACK: Duration = Duration::from_micros(1_500);
+
+// Raw libdispatch timer-source API; dispatch2 0.3 exposes no safe wrapper.
+unsafe extern "C" {
+    static _dispatch_source_type_timer: c_void;
+    fn dispatch_source_create(
+        ty: *const c_void,
+        handle: usize,
+        mask: usize,
+        queue: *mut c_void,
+    ) -> *mut c_void;
+    fn dispatch_source_set_timer(source: *mut c_void, start: u64, interval: u64, leeway: u64);
+    fn dispatch_source_set_event_handler(source: *mut c_void, handler: *mut c_void);
+    fn dispatch_source_cancel(source: *mut c_void);
+    fn dispatch_resume(object: *mut c_void);
+    fn dispatch_release(object: *mut c_void);
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+}
+const DISPATCH_TIME_NOW: u64 = 0;
+const DISPATCH_TIMER_STRICT: usize = 0x1;
+
 /// How long to wait between re-wire attempts while no frame has ever been
 /// captured.
 ///
@@ -85,7 +108,7 @@ pub struct CapturedFrame<'a> {
     pub captured_at: Instant,
 }
 
-/// Sink invoked on the capture queue for every accepted frame.
+/// Sink invoked on the capture worker queue for every accepted frame.
 pub type FrameSink = Box<dyn FnMut(CapturedFrame<'_>) + Send + 'static>;
 
 #[derive(Debug, Clone, Default)]
@@ -132,7 +155,19 @@ struct Registration {
 /// pipeline without needing `&mut` access to the owner.
 struct CaptureState {
     device: ObjcPtr,
+    /// Serial queue SimulatorKit invokes the screen callbacks on. The render
+    /// server blocks its notify thread until a callback returns, so nothing
+    /// slow may run here.
     queue: DispatchRetained<DispatchQueue>,
+    /// Serial queue that does the actual capture (surface pick, pixel
+    /// transfer, encode submit), fed by coalesced triggers from the callbacks
+    /// and by the fill timer.
+    worker: DispatchRetained<DispatchQueue>,
+    /// A worker run is already enqueued; further triggers fold into it and the
+    /// run captures whatever the newest surface is when it executes.
+    pending: AtomicBool,
+    /// The pending run must bypass the unchanged-seed check.
+    pending_force: AtomicBool,
     registrations: Mutex<Vec<Registration>>,
     /// SimulatorKit retains these blocks for the lifetime of the registration.
     /// Dropping them early is a use-after-free, not a clean failure, so they
@@ -206,6 +241,23 @@ impl CaptureState {
         }
 
         best.map(|(index, surface, _)| (index, surface))
+    }
+
+    /// Record a newest-frame trigger and make sure exactly one worker run is
+    /// queued. Cheap enough to run inline in the SimulatorKit callback.
+    fn trigger(self: &Arc<Self>, force: bool) {
+        if force {
+            self.pending_force.store(true, Ordering::Relaxed);
+        }
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let state = Arc::clone(self);
+        self.worker.exec_async(move || {
+            state.pending.store(false, Ordering::Release);
+            let force = state.pending_force.swap(false, Ordering::Relaxed);
+            state.capture(force);
+        });
     }
 
     /// Capture one frame. `force` bypasses the unchanged-seed check.
@@ -300,10 +352,10 @@ impl CaptureState {
             let uuid = NSUUID::new();
 
             let state = Arc::clone(self);
-            let frame_cb = VoidBlock::new(move || state.capture(false));
+            let frame_cb = VoidBlock::new(move || state.trigger(false));
             // `surfacesChanged` carries no payload; it just means "re-query".
             let state = Arc::clone(self);
-            let surfaces_cb = VoidBlock::new(move || state.capture(true));
+            let surfaces_cb = VoidBlock::new(move || state.trigger(true));
             let props_cb = VoidBlock::new(|| {});
 
             unsafe {
@@ -333,7 +385,7 @@ impl CaptureState {
         *self.blocks.lock().unwrap() = blocks;
 
         // Registration alone does not deliver a first frame; prime it.
-        self.capture(true);
+        self.trigger(true);
         Ok(())
     }
 
@@ -370,7 +422,19 @@ pub struct SimFramebuffer {
     device_udid: String,
     state: Arc<CaptureState>,
     idle_thread: Option<std::thread::JoinHandle<()>>,
+    fill_timer: Option<FillTimer>,
 }
+
+/// Strict GCD timer source on the worker queue plus the handler block it
+/// retains. Only touched from `start`/`stop`.
+struct FillTimer {
+    source: *mut c_void,
+    _handler: VoidBlock,
+}
+
+// The raw pointer is an owned dispatch object; libdispatch is thread-agnostic.
+unsafe impl Send for FillTimer {}
+unsafe impl Sync for FillTimer {}
 
 impl SimFramebuffer {
     /// Attach to a booted simulator. `udid` of `None` picks the first booted one.
@@ -389,6 +453,16 @@ impl SimFramebuffer {
                     "com.accessibility_cli.framebuffer",
                     DispatchQueueAttr::SERIAL,
                 ),
+                worker: DispatchQueue::new(
+                    "com.accessibility_cli.framebuffer.worker",
+                    Some(&DispatchQueueAttr::with_qos_class(
+                        DispatchQueueAttr::SERIAL,
+                        DispatchQoS::UserInteractive,
+                        0,
+                    )),
+                ),
+                pending: AtomicBool::new(false),
+                pending_force: AtomicBool::new(false),
                 registrations: Mutex::new(Vec::new()),
                 blocks: Mutex::new(Vec::new()),
                 sink: Mutex::new(None),
@@ -403,6 +477,7 @@ impl SimFramebuffer {
                 running: AtomicBool::new(false),
             }),
             idle_thread: None,
+            fill_timer: None,
         })
     }
 
@@ -436,11 +511,55 @@ impl SimFramebuffer {
     pub fn start(&mut self) -> Result<()> {
         self.state.running.store(true, Ordering::Relaxed);
         self.state.wire_up()?;
+        self.start_fill_timer();
         self.start_idle_timer();
         Ok(())
     }
 
-    /// Drive forced re-emits, and rebuild the pipeline while nothing arrives.
+    /// Force re-emits at the active cadence while interaction is recent and at
+    /// the idle heartbeat otherwise.
+    ///
+    /// This is a strict GCD timer rather than a sleeping thread: relative
+    /// waits (`nanosleep`, `pthread_cond_timedwait`) are coalesced to ~100 ms
+    /// on virtualised hosts, which caps a thread-driven fill at ~12 fps. It
+    /// runs on the worker queue, so the due-ness check is exact with respect
+    /// to frames that already ran and libdispatch serialises it against
+    /// triggered captures; ticks that land while a capture is in flight are
+    /// coalesced by the source.
+    fn start_fill_timer(&mut self) {
+        if self.fill_timer.is_some() {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let handler = VoidBlock::new(move || {
+            if !state.running.load(Ordering::Relaxed) {
+                return;
+            }
+            let interval = state.tick_interval(*state.active_until.lock().unwrap());
+            if state.last_capture.lock().unwrap().elapsed() + FILL_SLACK >= interval {
+                state.capture(true);
+            }
+        });
+        let interval_ns = self.state.active_interval_micros.load(Ordering::Relaxed) * 1000;
+        let source = unsafe {
+            let source = dispatch_source_create(
+                &raw const _dispatch_source_type_timer,
+                0,
+                DISPATCH_TIMER_STRICT,
+                &*self.state.worker as *const DispatchQueue as *mut c_void,
+            );
+            dispatch_source_set_timer(source, dispatch_time(DISPATCH_TIME_NOW, 0), interval_ns, 0);
+            dispatch_source_set_event_handler(source, handler.as_ptr());
+            dispatch_resume(source);
+            source
+        };
+        self.fill_timer = Some(FillTimer {
+            source,
+            _handler: handler,
+        });
+    }
+
+    /// Rebuild the pipeline while nothing arrives.
     fn start_idle_timer(&mut self) {
         if self.idle_thread.is_some() {
             return;
@@ -450,20 +569,13 @@ impl SimFramebuffer {
             let mut next_rewire = Instant::now() + REWIRE_INTERVAL;
             while state.running.load(Ordering::Relaxed) {
                 let active_until = state.active_until.lock().unwrap();
-                let interval = state.tick_interval(*active_until);
-                let (active_until, _) =
-                    state.activity.wait_timeout(active_until, interval).unwrap();
+                let (active_until, _) = state
+                    .activity
+                    .wait_timeout(active_until, REWIRE_INTERVAL)
+                    .unwrap();
                 drop(active_until);
                 if !state.running.load(Ordering::Relaxed) {
                     break;
-                }
-
-                // Re-read after the wait: an interaction may have arrived while
-                // the thread was parked, which shortens the interval.
-                let interval = state.tick_interval(*state.active_until.lock().unwrap());
-                let idle_for = state.last_capture.lock().unwrap().elapsed();
-                if idle_for >= interval {
-                    state.capture(true);
                 }
 
                 // Self-heal only until the first frame ever lands. After that
@@ -487,6 +599,16 @@ impl SimFramebuffer {
         self.state.activity.notify_one();
         if let Some(handle) = self.idle_thread.take() {
             let _ = handle.join();
+        }
+        if let Some(timer) = self.fill_timer.take() {
+            unsafe {
+                dispatch_source_cancel(timer.source);
+                dispatch_release(timer.source);
+            }
+            // Drain the worker so no handler or triggered capture outlives
+            // the block and the registrations released below.
+            self.state.worker.exec_sync(|| {});
+            drop(timer);
         }
         self.state.unregister_all();
         *self.state.sink.lock().unwrap() = None;
