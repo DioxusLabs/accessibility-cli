@@ -39,12 +39,34 @@ So "chunky, slow and janky" was a single root cause, not three.
 
 The fix is resolution, not bitrate. A phone framebuffer is roughly fifteen
 times the pixels the browser actually displays, so the long edge is capped at
-1280 by default (`--max-dimension`, or `--native-resolution` to disable) and
-the bitrate is derived from the encode resolution at ~0.15 bpp rather than
-being a fixed number. Same stimulus, same bandwidth:
+1280 by default (`--max-dimension`, or `--native-resolution` to disable).
+Historically the bitrate was then derived from the encode resolution at
+~0.15 bpp; measured against a fixed cap at the same stimulus and bandwidth:
 
     native 3.16 MP @ 6 Mbps   4.99 Mbps   0.0297 bpp
     588x1280 @ derived        4.95 Mbps   0.1338 bpp
+
+## Uncapped low-latency mode starves itself
+
+`--bitrate` is now an optional cap: omitting it sets **no** `AverageBitRate`.
+The session creates fine without one, but do not assume VideoToolbox spends
+generously when uncapped — it does the opposite. Measured on a 1206x2622
+device encoding at 588x1280, on a screen fully covered by CSS animation,
+25-second windows:
+
+    uncapped (low latency)      0.37-0.48 Mbps   0.029-0.030 bpp    2.7 KB/frame   16-23 fps
+    6 Mbps   (low latency)      5.84 Mbps        0.1302 bpp        12.0 KB/frame   59.6 fps
+    24 Mbps  (low latency)      8.80 Mbps        0.1965 bpp        18.1 KB/frame   59.5 fps
+    uncapped, low latency OFF   4.37 Mbps        0.2272 bpp        20.9 KB/frame   25.6 fps
+
+With low-latency rate control and no `AverageBitRate`, the encoder picks an
+internal budget under half a megabit and drops most frames staying inside it —
+the capped runs at the same stimulus sustained ~60 fps. Turning low latency
+off while staying uncapped restores quality (0.23 bpp) but halves the frame
+rate and re-adds ~300ms of decoder buffering. So an explicit generous cap is
+what actually delivers both fps and quality; uncapped exists for callers that
+want VideoToolbox's own choice and to keep a fixed number out of the default
+path.
 
 Raise `--max-dimension` if viewing in a large or retina window; the default
 trades sharpness for bits on the assumption of a normal-sized preview.
@@ -78,9 +100,10 @@ So the two settings are mutually exclusive, and `Tuning` pairs them into a
 single choice rather than letting the useless combination be expressed:
 
 - `Interactive { bitrate }` — low-latency rate control and `MaxFrameDelayCount`
-  0, spending a bitrate derived from the encode resolution. Omitting
-  low-latency costs roughly 300ms of decoder buffering, so this is what any
-  live viewer wants.
+  0. `bitrate` is an optional cap: `Some` sets `AverageBitRate`, `None` sets
+  no rate-control property at all (see the uncapped measurements above).
+  Omitting low-latency costs roughly 300ms of decoder buffering, so this is
+  what any live viewer wants.
 - `Recording { quality }` — no low-latency constraint, so the quality target is
   honoured and bits go where the picture needs them. Latency is unbounded in
   principle.

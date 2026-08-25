@@ -1889,8 +1889,8 @@ pub struct ServeSimArgs {
     #[arg(long, default_value = "interactive")]
     pub tuning: String,
 
-    /// Target bitrate in bits per second, for interactive tuning. Defaults to
-    /// a value derived from the encode resolution.
+    /// Bitrate cap in bits per second, for interactive tuning. Defaults to
+    /// uncapped: no cap is set and VideoToolbox chooses.
     #[arg(long, conflicts_with = "quality")]
     pub bitrate: Option<u32>,
 

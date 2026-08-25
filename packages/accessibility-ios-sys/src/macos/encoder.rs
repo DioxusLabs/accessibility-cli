@@ -62,15 +62,6 @@ pub struct EncodedChunk {
     pub captured_at: Instant,
 }
 
-/// Bits per pixel per frame to aim for when no explicit bitrate is given.
-///
-/// Screen content needs roughly 0.10-0.20 bpp to avoid visible blocking on
-/// motion. Below that VideoToolbox does not merely soften the picture: with
-/// low-latency rate control it starts *dropping frames* to stay inside its
-/// per-frame budget, so starving the encoder costs frame rate as well as
-/// quality.
-const TARGET_BITS_PER_PIXEL: f64 = 0.15;
-
 /// Longest edge to encode at when no limit is given.
 ///
 /// A phone framebuffer is far larger than the browser ever displays it — an
@@ -91,9 +82,12 @@ const DEFAULT_MAX_DIMENSION: u32 = 1280;
 pub enum Tuning {
     /// Live interactive streaming. Low-latency rate control and no frame
     /// delay, which costs perhaps 300ms of decoder buffering if omitted.
-    /// Spends a fixed bitrate; quality varies with how busy the screen is.
     Interactive {
-        /// Target bitrate, or `None` to derive one from the encode resolution.
+        /// Bitrate cap in bits per second, or `None` for uncapped: no
+        /// `AverageBitRate` is set and VideoToolbox chooses how to spend
+        /// bits. `Some` sets `AverageBitRate`, which low-latency rate
+        /// control enforces per frame — starving it costs frame rate, not
+        /// just quality.
         bitrate: Option<u32>,
     },
     /// Recording and offline capture. Drops the low-latency constraint so the
@@ -109,6 +103,30 @@ pub enum Tuning {
 impl Tuning {
     fn is_interactive(self) -> bool {
         matches!(self, Tuning::Interactive { .. })
+    }
+}
+
+/// The single rate-control property a tuning sets on the session, if any.
+///
+/// Resolved ahead of the CF calls so the translation is testable without
+/// VideoToolbox.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RateControl {
+    /// No rate-control property at all; VideoToolbox chooses.
+    Uncapped,
+    /// `AverageBitRate`, in bits per second.
+    AverageBitRate(i32),
+    /// `Quality`, from 0 to 1.
+    Quality(f64),
+}
+
+fn rate_control(tuning: Tuning) -> RateControl {
+    match tuning {
+        Tuning::Interactive { bitrate: None } => RateControl::Uncapped,
+        Tuning::Interactive {
+            bitrate: Some(bitrate),
+        } => RateControl::AverageBitRate(bitrate as i32),
+        Tuning::Recording { quality } => RateControl::Quality(quality.clamp(0.0, 1.0)),
     }
 }
 
@@ -153,14 +171,6 @@ impl EncoderConfig {
             even((width as f64 * scale).round() as i32),
             even((height as f64 * scale).round() as i32),
         )
-    }
-
-    /// Bitrate for interactive tuning, derived from the encode size if unset.
-    fn resolved_bitrate(&self, bitrate: Option<u32>, width: i32, height: i32) -> u32 {
-        bitrate.unwrap_or_else(|| {
-            let pixels = (width as f64) * (height as f64);
-            (pixels * self.fps as f64 * TARGET_BITS_PER_PIXEL) as u32
-        })
     }
 }
 
@@ -373,13 +383,13 @@ impl H264Encoder {
             "MaxKeyFrameIntervalDuration",
             self.config.keyframe_interval_secs as f64,
         );
-        match self.config.tuning {
-            Tuning::Interactive { bitrate } => {
-                let bitrate = self.config.resolved_bitrate(bitrate, width, height);
-                set_i32(&session, "AverageBitRate", bitrate as i32);
+        match rate_control(self.config.tuning) {
+            RateControl::Uncapped => {}
+            RateControl::AverageBitRate(bitrate) => {
+                set_i32(&session, "AverageBitRate", bitrate);
             }
-            Tuning::Recording { quality } => {
-                set_f64(&session, "Quality", quality.clamp(0.0, 1.0));
+            RateControl::Quality(quality) => {
+                set_f64(&session, "Quality", quality);
             }
         }
 
@@ -588,4 +598,35 @@ fn set_string(session: &VTCompressionSession, key: &str, value: &str) {
 
 fn set_f64(session: &VTCompressionSession, key: &str, value: f64) {
     set_property(session, key, CFNumber::new_f64(value).as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_without_bitrate_sets_no_rate_control() {
+        assert_eq!(
+            rate_control(Tuning::Interactive { bitrate: None }),
+            RateControl::Uncapped
+        );
+    }
+
+    #[test]
+    fn interactive_with_bitrate_sets_average_bitrate() {
+        assert_eq!(
+            rate_control(Tuning::Interactive {
+                bitrate: Some(6_000_000)
+            }),
+            RateControl::AverageBitRate(6_000_000)
+        );
+    }
+
+    #[test]
+    fn recording_sets_clamped_quality() {
+        assert_eq!(
+            rate_control(Tuning::Recording { quality: 1.7 }),
+            RateControl::Quality(1.0)
+        );
+    }
 }

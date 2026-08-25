@@ -54,6 +54,9 @@ pub struct StatsReport {
     pub keyframe_requests: u64,
     pub lag_events: u64,
     pub subscribers: usize,
+    /// Bitrate cap the encoder targets, in bits per second. `None` means
+    /// uncapped (or the platform does not report one).
+    pub target_bitrate: Option<u32>,
     pub recording_frames: Option<u64>,
     pub width: u32,
     pub height: u32,
@@ -260,6 +263,7 @@ fn from_android_stats(stats: android_session::StatsReport) -> StatsReport {
         keyframe_requests: stats.keyframe_requests,
         lag_events: stats.lag_events,
         subscribers: stats.subscribers,
+        target_bitrate: None,
         recording_frames: stats.recording_frames,
         width: stats.width,
         height: stats.height,
@@ -302,6 +306,7 @@ fn from_ios_stats(stats: ios_session::StatsReport) -> StatsReport {
         keyframe_requests: stats.keyframe_requests,
         lag_events: stats.lag_events,
         subscribers: stats.subscribers,
+        target_bitrate: stats.target_bitrate,
         recording_frames: stats.recording_frames,
         width: stats.width,
         height: stats.height,
