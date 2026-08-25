@@ -62,6 +62,10 @@ pub struct StatsReport {
     pub keyframe_requests: u64,
     pub lag_events: u64,
     pub subscribers: usize,
+    /// Bitrate cap the encoder was asked to target, in bits per second.
+    /// `None` means uncapped: no `AverageBitRate` was set and VideoToolbox
+    /// chose the spend reflected in `mbps`.
+    pub target_bitrate: Option<u32>,
     /// Frames written to the current recording, or `None` when idle.
     pub recording_frames: Option<u64>,
     /// Capture resolution.
@@ -92,6 +96,8 @@ pub struct SimSession {
     latest_parameter_set: Arc<std::sync::Mutex<Option<EncodedFrame>>>,
     stats: Arc<StreamStats>,
     started: Instant,
+    /// Bitrate cap the stream encoder targets, `None` for uncapped.
+    target_bitrate: Option<u32>,
     input: std::sync::mpsc::Sender<InputCommand>,
     input_capabilities: InputCapabilities,
     ax: mpsc::UnboundedSender<AxCommand>,
@@ -141,6 +147,10 @@ impl SimSession {
             })
         };
 
+        let target_bitrate = match config.tuning {
+            crate::video::Tuning::Interactive { bitrate } => bitrate,
+            crate::video::Tuning::Recording { .. } => None,
+        };
         let (capture, resolved_udid) = start_capture(udid, &config, sink)?;
         let (input, input_capabilities) = spawn_input_worker(&resolved_udid)?;
         let ax = spawn_ax_worker(&resolved_udid)?;
@@ -153,6 +163,7 @@ impl SimSession {
             latest_parameter_set,
             stats,
             started: Instant::now(),
+            target_bitrate,
             input,
             input_capabilities,
             ax,
@@ -215,6 +226,7 @@ impl SimSession {
             keyframe_requests: self.stats.keyframe_requests.load(Ordering::Relaxed),
             lag_events: self.stats.lag_events.load(Ordering::Relaxed),
             subscribers: self.frames.receiver_count(),
+            target_bitrate: self.target_bitrate,
             recording_frames: self.capture.recording_frames(),
             width: geometry.width,
             height: geometry.height,

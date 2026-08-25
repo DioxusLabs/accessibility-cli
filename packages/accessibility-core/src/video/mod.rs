@@ -26,9 +26,12 @@ use bytes::Bytes;
 /// combination that silently does nothing impossible to ask for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tuning {
-    /// Live interactive streaming. Lowest latency; spends a fixed bitrate.
+    /// Live interactive streaming. Lowest latency.
     Interactive {
-        /// Target bitrate, or `None` to derive one from the encode resolution.
+        /// Bitrate cap in bits per second, or `None` for uncapped: the
+        /// encoder chooses how to spend bits. On iOS this maps to
+        /// VideoToolbox `AverageBitRate`; Android derives a bitrate when
+        /// unset.
         bitrate: Option<u32>,
     },
     /// Recording and offline capture. Targets a constant quality from 0 to 1,
@@ -106,10 +109,10 @@ pub struct VideoConfig {
     pub codec: VideoCodec,
     pub nal_format: NalFormat,
     pub fps: u32,
-    /// What to optimize for. Deriving the bitrate is usually right: a fixed
-    /// value that suits a phone framebuffer is wildly wrong for a watch, and
-    /// too low a value does not just soften the image, it makes the encoder
-    /// drop frames.
+    /// What to optimize for. Leaving the bitrate uncapped is usually right:
+    /// a fixed value that suits a phone framebuffer is wildly wrong for a
+    /// watch, and too low a value does not just soften the image, it makes
+    /// the encoder drop frames.
     pub tuning: Tuning,
     /// Longest edge to encode at; the source is scaled down to fit.
     ///
