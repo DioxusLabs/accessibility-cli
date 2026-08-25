@@ -416,6 +416,11 @@ impl VideoCapture for SimulatorVideoCapture {
         self.inner.request_keyframe();
     }
 
+    fn set_bitrate(&self, bitrate: u32) -> Result<()> {
+        self.inner.set_bitrate(bitrate);
+        Ok(())
+    }
+
     fn note_interaction(&self) {
         self.inner.note_interaction();
     }

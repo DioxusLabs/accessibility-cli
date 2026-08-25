@@ -197,6 +197,10 @@ pub trait VideoCapture: Send + Sync {
     /// from a WebRTC receiver.
     fn request_keyframe(&self);
 
+    fn set_bitrate(&self, _bitrate: u32) -> Result<()> {
+        anyhow::bail!("Live bitrate updates are not supported on this platform")
+    }
+
     /// Keep capture at its configured cadence while interaction or resulting
     /// animation is active.
     fn note_interaction(&self) {}

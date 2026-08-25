@@ -4,7 +4,7 @@
 //! capture queue so that only compressed bytes ever cross a thread boundary.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -25,6 +25,7 @@ pub struct ScreenGeometry {
 pub struct SimVideoStream {
     framebuffer: SimFramebuffer,
     force_keyframe: Arc<AtomicBool>,
+    pending_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
     /// Set while a recording is running. Shared with the capture queue, which
     /// appends to it, so starting and stopping is just swapping this slot.
@@ -42,8 +43,14 @@ impl SimVideoStream {
         let mut framebuffer = SimFramebuffer::new(udid)?;
         framebuffer.set_active_frame_rate(config.fps);
         let force_keyframe = Arc::new(AtomicBool::new(false));
+        let pending_bitrate = Arc::new(AtomicU32::new(0));
 
-        let mut encoder = H264Encoder::new(config, Arc::clone(&force_keyframe), sink)?;
+        let mut encoder = H264Encoder::new(
+            config,
+            Arc::clone(&force_keyframe),
+            Arc::clone(&pending_bitrate),
+            sink,
+        )?;
         let recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));
         let recorder_for_sink = Arc::clone(&recorder);
 
@@ -75,6 +82,7 @@ impl SimVideoStream {
         Ok(Self {
             framebuffer,
             force_keyframe,
+            pending_bitrate,
             config,
             recorder,
         })
@@ -117,6 +125,11 @@ impl SimVideoStream {
     /// the raw stream endpoints.
     pub fn request_keyframe(&self) {
         self.force_keyframe.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_bitrate(&self, bitrate: u32) {
+        self.pending_bitrate
+            .store(bitrate.max(1), Ordering::Release);
     }
 
     pub fn note_interaction(&self) {
