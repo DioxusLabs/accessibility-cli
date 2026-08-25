@@ -190,6 +190,10 @@ impl SimSession {
         self.capture.request_keyframe();
     }
 
+    pub fn set_bitrate(&self, bitrate: u32) -> Result<()> {
+        self.capture.set_bitrate(bitrate)
+    }
+
     pub fn note_lag(&self) {
         self.stats.lag_events.fetch_add(1, Ordering::Relaxed);
     }

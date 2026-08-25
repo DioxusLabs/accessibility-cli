@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -192,6 +192,7 @@ pub struct H264Encoder {
     frame_index: i64,
     /// Set by RTCP PLI/FIR so the next frame is forced to an IDR.
     force_keyframe: Arc<AtomicBool>,
+    pending_bitrate: Arc<AtomicU32>,
     /// Whether the `avcC` record for the current session has been emitted.
     emitted_parameter_set: Arc<Mutex<bool>>,
     /// Copies, converts and scales each frame before it is encoded.
@@ -207,6 +208,7 @@ impl H264Encoder {
     pub fn new(
         config: EncoderConfig,
         force_keyframe: Arc<AtomicBool>,
+        pending_bitrate: Arc<AtomicU32>,
         sink: ChunkSink,
     ) -> Result<Self> {
         Ok(Self {
@@ -217,6 +219,7 @@ impl H264Encoder {
             dimensions: (0, 0),
             frame_index: 0,
             force_keyframe,
+            pending_bitrate,
             emitted_parameter_set: Arc::new(Mutex::new(false)),
             sink,
         })
@@ -239,6 +242,15 @@ impl H264Encoder {
             self.source_dimensions = (width, height);
             self.dimensions = self.config.encode_size(width, height);
             self.rebuild_session()?;
+        }
+        let pending_bitrate = self.pending_bitrate.swap(0, Ordering::AcqRel);
+        if pending_bitrate != 0 {
+            if let Some(session) = self.session.as_ref() {
+                set_i32(session, "AverageBitRate", pending_bitrate as i32);
+            }
+            self.config.tuning = Tuning::Interactive {
+                bitrate: Some(pending_bitrate),
+            };
         }
 
         // One hardware pass does the copy off the live framebuffer, the BGRA
