@@ -3,9 +3,10 @@ fn main() {
         return;
     }
 
-    println!("cargo:rerun-if-changed=src/macos/blocks.c");
+    println!("cargo:rerun-if-changed=src/macos/blocks.m");
     cc::Build::new()
-        .file("src/macos/blocks.c")
+        .file("src/macos/blocks.m")
         .flag("-fblocks")
+        .flag("-fno-objc-arc")
         .compile("accessibility_ios_blocks");
 }
