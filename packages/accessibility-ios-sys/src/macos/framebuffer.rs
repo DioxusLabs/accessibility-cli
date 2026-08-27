@@ -191,9 +191,10 @@ struct CaptureState {
     /// The pending run must bypass the unchanged-seed check.
     pending_force: AtomicBool,
     registrations: Mutex<Vec<Registration>>,
-    /// SimulatorKit retains these blocks for the lifetime of the registration.
-    /// Dropping them early is a use-after-free, not a clean failure, so they
-    /// are held until the matching unregister call.
+    /// This side's references to the registered callback blocks, released at
+    /// the matching unregister call. SimulatorKit keeps its own reference and
+    /// the blocks own their closures, so a callback it has already queued
+    /// stays valid past that release.
     blocks: Mutex<Vec<VoidBlock>>,
     sink: Mutex<Option<FrameSink>>,
     last_capture: Mutex<Instant>,
@@ -427,8 +428,6 @@ impl CaptureState {
             }
         }
         drop(registrations);
-        // Only safe to release the blocks once SimulatorKit has been told to
-        // stop calling them.
         self.blocks.lock().unwrap().clear();
         self.width.store(0, Ordering::Relaxed);
         self.height.store(0, Ordering::Relaxed);

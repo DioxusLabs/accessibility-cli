@@ -38,8 +38,16 @@ block's ObjC type encoding, which requires `BLOCK_HAS_SIGNATURE`. `block2` does
 not emit that flag (there is a TODO in its `global.rs`), so passing an
 `RcBlock` aborts with "Block is missing signature field".
 
-`macos/blocks.c` creates the blocks with clang instead. See
+`macos/blocks.m` creates the blocks with clang instead. See
 `macos/void_block.rs`.
+
+## Unregistering does not stop callbacks immediately
+
+`unregisterScreenCallbacksWithUUID:` returns while the render server may still
+have a frame callback queued on the callback queue, and SimulatorKit keeps its
+own reference to the block. The block therefore owns the closure it invokes
+(freed from the block's dispose, not from the Rust drop). Freeing the closure
+at unregister time crashed in `__invoking___` on descriptor rebuilds.
 
 ## Registering screen callbacks is load-bearing
 
