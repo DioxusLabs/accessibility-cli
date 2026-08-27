@@ -122,18 +122,40 @@ pub struct FramebufferStats {
     pub display_classes: Vec<Option<u16>>,
 }
 
-/// Wrapper making a raw Objective-C pointer movable across threads.
+/// An owning (+1 retained) Objective-C reference movable across threads.
 ///
-/// The pointers here are owned by SimulatorKit and only ever messaged from the
-/// capture queue (or from `start`/`stop`, which are externally serialized).
-#[derive(Clone, Copy)]
+/// SimulatorKit hands out its device, port and descriptor objects at +0 and
+/// drops them whenever it rebuilds the IO port graph (`updateIOPorts`), which
+/// another `SimFramebuffer` on the same device does on every start. Holding
+/// our own retain keeps the proxy object alive for as long as a registration
+/// can still message it; without it the capture worker dereferences freed
+/// memory the first time two sessions overlap.
+///
+/// The objects are only ever messaged from the capture queue (or from
+/// `start`/`stop`, which are externally serialized).
 struct ObjcPtr(*mut AnyObject);
 unsafe impl Send for ObjcPtr {}
 unsafe impl Sync for ObjcPtr {}
 
 impl ObjcPtr {
-    fn as_ptr(self) -> *mut AnyObject {
+    /// Retain `ptr` so the object outlives whoever handed it to us.
+    unsafe fn retaining(ptr: *mut AnyObject) -> Self {
+        if ptr.is_null() {
+            return Self(ptr);
+        }
+        Self(unsafe { objc2::ffi::objc_retain(ptr) })
+    }
+
+    fn as_ptr(&self) -> *mut AnyObject {
         self.0
+    }
+}
+
+impl Drop for ObjcPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { objc2::ffi::objc_release(self.0) };
+        }
     }
 }
 
@@ -374,7 +396,7 @@ impl CaptureState {
             blocks.push(surfaces_cb);
             blocks.push(props_cb);
             registrations.push(Registration {
-                descriptor: ObjcPtr(descriptor),
+                descriptor: unsafe { ObjcPtr::retaining(descriptor) },
                 uuid,
                 last_seed: None,
                 display_class: unsafe { display_class(descriptor) },
@@ -448,7 +470,7 @@ impl SimFramebuffer {
         Ok(Self {
             device_udid,
             state: Arc::new(CaptureState {
-                device: ObjcPtr(device),
+                device: unsafe { ObjcPtr::retaining(device) },
                 queue: DispatchQueue::new(
                     "com.accessibility_cli.framebuffer",
                     DispatchQueueAttr::SERIAL,
