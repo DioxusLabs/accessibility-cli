@@ -134,6 +134,8 @@ impl WindowsAccessibility {
             enabled: sys_element.enabled,
             focused: sys_element.focused,
             actions: sys_element.actions.clone(),
+            checked: None,
+            native_id: None,
             children,
         });
 
@@ -394,6 +396,8 @@ fn from_sys_element_standalone(element: sys::Element) -> Element {
         enabled: element.enabled,
         focused: element.focused,
         actions: element.actions,
+        checked: None,
+        native_id: None,
         children: element
             .children
             .into_iter()

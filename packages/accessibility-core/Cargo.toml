@@ -28,12 +28,12 @@ serde.workspace = true
 serde_json.workspace = true
 slotmap.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 viuer.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-ios-sys.workspace = true
 accessibility-macos-sys.workspace = true
-tracing.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 accessibility-windows-sys.workspace = true

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use keyboard_types::Code;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const UI_DUMP_ATTEMPTS: usize = 3;
 const UI_DUMP_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -754,7 +755,15 @@ impl AdbClient {
     }
 
     async fn dump_ui_once(&self) -> Result<String> {
-        let result = self.shell(&["uiautomator", "dump", "/dev/tty"]).await;
+        // uiautomator's stdout is not forwarded over the shell-v2 service (only
+        // the trailer arrives), so shell()-based dumps always fell through to
+        // the tmp-file fallback — a second full uiautomator run, ~2s extra on
+        // an emulator. The exec: service does forward it, and /dev/tty resolves
+        // to that stream, so a single run returns the XML directly.
+        let result = self
+            .exec_out(&["uiautomator", "dump", "/dev/tty"])
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
 
         match result {
             Ok(output) => match extract_ui_xml(&output) {
@@ -796,6 +805,83 @@ impl AdbClient {
         } else {
             bail!("Failed to parse UI dump XML: {}", truncate_for_error(&xml));
         }
+    }
+
+    /// Push `data` to `device_path` (equivalent to `adb push`).
+    pub async fn push(&self, device_path: &str, data: &[u8]) -> Result<()> {
+        let transport = self.transport();
+        self.run(
+            "push",
+            transport.push(self.serial.as_deref(), device_path, data, 0o644),
+        )
+        .await
+    }
+
+    /// Push the bundled AxDump dex to the device, ready for
+    /// [`Self::start_dump_server`].
+    pub async fn ensure_axdump(&self) -> Result<()> {
+        self.push(AXDUMP_DEX_DEVICE_PATH, AXDUMP_DEX).await
+    }
+
+    /// Start the persistent accessibility dump server (experimental).
+    ///
+    /// Requires the AxDump dex at `dex_device_path` (push it first with
+    /// `adb push classes.dex /data/local/tmp/axdump.dex`). The returned
+    /// server holds one `UiAutomation` connection per display, so only one
+    /// instance may run at a time; steady-state dumps are ~2ms versus ~2s
+    /// for `uiautomator dump`. Callers must fall back to [`Self::dump_ui`]
+    /// on any server error.
+    ///
+    /// `UiAutomation` registration is first-come: while any client (this
+    /// server or a running `uiautomator dump`) owns the display, a new
+    /// server is killed at startup ("already registered"). After a clean
+    /// [`UiDumpServer::shutdown`] the registration takes a couple of seconds
+    /// to release, so startup retries with backoff before giving up.
+    pub async fn start_dump_server(&self, dex_device_path: &str) -> Result<UiDumpServer> {
+        const BACKOFF: [Duration; 3] = [
+            Duration::from_millis(500),
+            Duration::from_millis(1_500),
+            Duration::from_millis(3_000),
+        ];
+        let mut last_error = None;
+        for (attempt, delay) in BACKOFF.iter().enumerate() {
+            match self.start_dump_server_once(dex_device_path).await {
+                Ok(server) => return Ok(server),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < BACKOFF.len() {
+                        tokio::time::sleep(*delay).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("at least one startup attempt"))
+    }
+
+    async fn start_dump_server_once(&self, dex_device_path: &str) -> Result<UiDumpServer> {
+        let command = format!("CLASSPATH={dex_device_path} app_process /system/bin AxDump");
+        let transport = self.transport();
+        let stream = self
+            .run(
+                "exec",
+                transport.exec_stream(self.serial.as_deref(), &[&command]),
+            )
+            .await?;
+        let mut server = UiDumpServer {
+            stream,
+            buffer: Vec::new(),
+            timeout: self.timeout,
+        };
+        let ready = tokio::time::timeout(self.timeout, server.read_line())
+            .await
+            .map_err(|_| anyhow::anyhow!("AxDump server did not report ready in time"))??;
+        if !ready.contains("axdump ready") {
+            bail!(
+                "AxDump server startup failed: {}",
+                truncate_for_error(&ready)
+            );
+        }
+        Ok(server)
     }
 
     /// Launch an app by package name and optional activity.
@@ -846,6 +932,79 @@ impl AdbClient {
         }
 
         bail!("Could not determine current activity");
+    }
+}
+
+/// The bundled AxDump persistent dump server dex (source:
+/// `resources/AxDump.java`, compiled with `javac` + `d8`).
+pub const AXDUMP_DEX: &[u8] = include_bytes!("../resources/axdump.dex");
+
+/// Where [`AdbClient::ensure_axdump`] installs the dex on the device.
+pub const AXDUMP_DEX_DEVICE_PATH: &str = "/data/local/tmp/axdump.dex";
+
+/// A live connection to the persistent AxDump accessibility server
+/// (see [`AdbClient::start_dump_server`]). Experimental: any protocol error
+/// poisons the connection; drop it and fall back to `uiautomator dump`.
+pub struct UiDumpServer {
+    stream: tokio::net::TcpStream,
+    buffer: Vec<u8>,
+    timeout: Duration,
+}
+
+impl UiDumpServer {
+    /// Request one hierarchy dump; returns uiautomator-compatible XML.
+    ///
+    /// A `no active window root` response (a transient race right after
+    /// startup or during window transitions) is surfaced as an error the
+    /// caller may retry.
+    pub async fn dump(&mut self) -> Result<String> {
+        tokio::time::timeout(self.timeout, self.dump_inner())
+            .await
+            .map_err(|_| anyhow::anyhow!("AxDump dump request timed out"))?
+    }
+
+    async fn dump_inner(&mut self) -> Result<String> {
+        self.stream.write_all(b"dump\n").await?;
+        let mut body = String::new();
+        loop {
+            let line = self.read_line().await?;
+            if line.starts_with("###END###") {
+                break;
+            }
+            body.push_str(&line);
+            body.push('\n');
+        }
+        if body.starts_with("error:") {
+            bail!("AxDump server error: {}", body.trim());
+        }
+        extract_ui_xml(&body)
+            .with_context(|| format!("AxDump output was not XML: {}", truncate_for_error(&body)))
+    }
+
+    /// Ask the server to exit and release its `UiAutomation` connection.
+    ///
+    /// While the server is running, other `UiAutomation` clients — including
+    /// `uiautomator dump` — are killed by the system (only one client may
+    /// own a display), so releasing before handing control elsewhere matters.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.stream.write_all(b"quit\n").await?;
+        let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+
+    async fn read_line(&mut self) -> Result<String> {
+        loop {
+            if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=position).collect();
+                return Ok(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+            }
+            let mut chunk = [0; 8192];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                bail!("AxDump server stream closed");
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
     }
 }
 
@@ -966,6 +1125,104 @@ mod tests {
         assert_eq!(
             AndroidKeyCode::from_code(Code::F1),
             Some(AndroidKeyCode::F1)
+        );
+    }
+
+    /// Serve one scripted response to a `dump` request on a loopback socket
+    /// and return a `UiDumpServer` connected to it, exercising the real
+    /// framing path without a device.
+    async fn scripted_server(response: &'static [u8], timeout: Duration) -> UiDumpServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0; 64];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(response).await;
+            // Keep the socket open so short reads are the timeout's problem,
+            // not an EOF: a real server blocks between requests too.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        UiDumpServer {
+            stream: tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            buffer: Vec::new(),
+            timeout,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn dump_server_parses_framed_xml() {
+        let mut server = scripted_server(
+            b"<?xml version=\"1.0\" ?><hierarchy rotation=\"0\" />\n###END###\n",
+            Duration::from_secs(2),
+        )
+        .await;
+        let xml = server.dump().await.expect("dump");
+        assert!(xml.contains("<hierarchy"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn dump_server_surfaces_error_body() {
+        let mut server = scripted_server(
+            b"error: no active window root\n###END###\n",
+            Duration::from_secs(2),
+        )
+        .await;
+        let error = server.dump().await.unwrap_err();
+        assert!(error.to_string().contains("no active window"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn dump_server_rejects_non_xml_body() {
+        let mut server = scripted_server(
+            b"garbage that is not xml\n###END###\n",
+            Duration::from_secs(2),
+        )
+        .await;
+        let error = server.dump().await.unwrap_err();
+        assert!(error.to_string().contains("was not XML"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn dump_server_times_out_without_end_marker() {
+        let mut server = scripted_server(
+            b"<?xml version=\"1.0\" ?><hierarchy />\n",
+            Duration::from_millis(200),
+        )
+        .await;
+        let error = server.dump().await.unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn dump_server_reports_closed_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            drop(socket);
+        });
+        let mut server = UiDumpServer {
+            stream: tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            buffer: Vec::new(),
+            timeout: Duration::from_secs(2),
+        };
+        // A dropped peer surfaces as either a clean EOF ("stream closed")
+        // or an ECONNRESET depending on whether the RST beats the read.
+        let error = server.dump().await.unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("stream closed") || text.contains("reset"),
+            "{text}"
         );
     }
 

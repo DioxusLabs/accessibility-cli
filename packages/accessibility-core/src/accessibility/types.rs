@@ -158,6 +158,14 @@ pub struct Element {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
 
+    /// Platform-native stable node identity, when the platform exposes one
+    /// (Android `AccessibilityNodeInfo.getSourceNodeId()`; Linux a hash of
+    /// the AT-SPI D-Bus bus name and object path): stable for the
+    /// same underlying view across dumps within a window, so consumers can
+    /// distinguish "same control, new state" from "replaced control".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_id: Option<u64>,
+
     /// Screen bounds of the element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Rect>,
@@ -167,6 +175,11 @@ pub struct Element {
 
     /// Whether the element currently has keyboard focus.
     pub focused: bool,
+
+    /// Checked/toggled state for checkable elements (checkboxes, toggles,
+    /// radio buttons). `None` when the element is not checkable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
 
     /// Available actions on this element.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -190,9 +203,11 @@ impl Element {
             help: None,
             role_description: None,
             identifier: None,
+            native_id: None,
             bounds: None,
             enabled: true,
             focused: false,
+            checked: None,
             actions: Vec::new(),
             children: Vec::new(),
         }
