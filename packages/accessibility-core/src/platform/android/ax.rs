@@ -3,7 +3,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accessibility::{
-    AccessibilityReader, AndroidTarget, Element, ElementTree, Point, Rect, Size, Target, TreeFilter,
+    AccessibilityReader, AndroidTarget, Element, Point, Rect, Size, Target, TreeFilter,
 };
 
 use super::AndroidAccessibility;
@@ -52,6 +52,9 @@ pub struct ElementDetail {
     pub label: Option<String>,
     pub value: Option<String>,
     pub identifier: Option<String>,
+    /// Stable per-window native node identity (AxDump's `ax-node-id`);
+    /// absent on the classic `uiautomator dump` path.
+    pub native_id: Option<u64>,
     pub enabled: bool,
     pub focused: bool,
     pub actions: Vec<String>,
@@ -116,8 +119,18 @@ async fn snapshot(
     _scan: bool,
 ) -> Result<(AxSnapshot, Rect)> {
     let tree = reader.get_tree(target, &TreeFilter::default()).await?;
-    let screen =
-        screen_bounds(&tree).ok_or_else(|| anyhow!("Android tree has no screen bounds"))?;
+    // Normalise against the physical display, not the tree's max extent: when a
+    // dialog is up the active window's tree is the dialog, so tree-derived
+    // normalisation scales normalized (x, y) by the dialog size and taps land
+    // outside it.
+    let (width, height) = match reader.screen_size() {
+        Some(size) => size,
+        None => reader.refresh_screen_size().await?,
+    };
+    let screen = Rect::new(
+        Point::new(0.0, 0.0),
+        Size::new(f64::from(width), f64::from(height)),
+    );
     let mut elements = Vec::with_capacity(tree.element_count);
     flatten(&tree.root, &screen, 0, &mut elements);
     elements.retain(|element| {
@@ -158,20 +171,6 @@ async fn hit_test(
         .map(|element| to_detail(element, screen, 0)))
 }
 
-fn screen_bounds(tree: &ElementTree) -> Option<Rect> {
-    let mut max_x = 0.0f64;
-    let mut max_y = 0.0f64;
-    let mut stack = vec![&tree.root];
-    while let Some(element) = stack.pop() {
-        if let Some(bounds) = &element.bounds {
-            max_x = max_x.max(bounds.origin.x + bounds.size.width);
-            max_y = max_y.max(bounds.origin.y + bounds.size.height);
-        }
-        stack.extend(element.children.iter());
-    }
-    (max_x > 0.0 && max_y > 0.0).then(|| Rect::new(Point::new(0.0, 0.0), Size::new(max_x, max_y)))
-}
-
 fn flatten(element: &Element, screen: &Rect, depth: u32, out: &mut Vec<ElementDetail>) {
     out.push(to_detail(element, screen, depth));
     for child in &element.children {
@@ -187,6 +186,7 @@ fn to_detail(element: &Element, screen: &Rect, depth: u32) -> ElementDetail {
         label: element.title.clone().filter(|value| !value.is_empty()),
         value: element.value.clone().filter(|value| !value.is_empty()),
         identifier: element.identifier.clone().filter(|value| !value.is_empty()),
+        native_id: element.native_id,
         enabled: element.enabled,
         focused: element.focused,
         actions: element.actions.clone(),

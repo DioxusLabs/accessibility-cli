@@ -249,6 +249,8 @@ impl IOSSimulatorAccessibility {
             enabled: sys_element.enabled,
             focused: sys_element.focused,
             actions: sys_element.actions.clone(),
+            checked: None,
+            native_id: None,
             children,
         });
 

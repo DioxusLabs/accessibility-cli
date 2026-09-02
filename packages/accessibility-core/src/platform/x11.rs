@@ -10,6 +10,7 @@ use crate::accessibility::{
 };
 use accessibility_linux_sys::atspi::proxy::accessible::AccessibleProxy;
 use accessibility_linux_sys::atspi::proxy::action::ActionProxy;
+use accessibility_linux_sys::atspi::proxy::cache::CacheProxy;
 use accessibility_linux_sys::atspi::proxy::component::ComponentProxy;
 use accessibility_linux_sys::atspi::proxy::editable_text::EditableTextProxy;
 use accessibility_linux_sys::atspi::proxy::text::TextProxy;
@@ -25,8 +26,56 @@ use accesskit::{Action, Role};
 use anyhow::{Result, anyhow, bail};
 use slotmap::SecondaryMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+/// WebKit web-process connections (plug graft targets), which number their
+/// AT-SPI roles differently from GTK apps (see [`LinuxAccessibility::fetch_role`]),
+/// keyed by web-process bus name with the UI-process bus its plug grafts into
+/// as the value (so a stalled web process can be attributed to its embedder).
+fn webkit_buses() -> &'static RwLock<HashMap<String, String>> {
+    static BUSES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+    BUSES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Which applications' web content is unreachable because their WebKit web
+/// process stopped answering (typically a script dialog blocking it).
+#[derive(Default)]
+struct BlockedGrafts {
+    /// UI-process bus names whose grafted web subtree is stalled; a walk that
+    /// never touches these buses is unaffected.
+    ui_buses: HashSet<String>,
+    /// A stalled web process that could not be attributed to any UI-process
+    /// bus — every walk must be treated as potentially incomplete.
+    unattributed: bool,
+}
+
+/// The process name (`/proc/<pid>/comm`, kernel-truncated to 15 bytes).
+fn process_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|comm| comm.trim().to_string())
+}
+
+/// The parent PID from `/proc/<pid>/stat` (field 4, after the parenthesised
+/// comm, which may itself contain spaces or parentheses).
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Whether a D-Bus error means the peer never answered (reply timeout), as
+/// opposed to answering with an error. Applications blocked mid-walk (e.g. a
+/// WebKit web process stalled on a script dialog) fail this way.
+fn is_no_reply_error(error: &impl std::fmt::Display) -> bool {
+    let text = error.to_string();
+    text.contains("Did not receive a reply")
+        || text.contains("NoReply")
+        || text.contains("timed out")
+        || text.contains("Timeout")
+}
 
 /// Macro to generate D-Bus proxy factory functions with consistent error handling.
 macro_rules! create_proxy_fn {
@@ -66,6 +115,12 @@ pub struct LinuxAccessibility {
 
     /// AT-SPI connection to the accessibility bus.
     connection: AccessibilityConnection,
+
+    /// Whether the most recent tree walk hit a D-Bus no-reply timeout on a
+    /// child fetch — the application (typically a WebKit web process blocked
+    /// by a script dialog) stopped answering mid-walk, so the returned tree
+    /// is silently missing subtrees.
+    walk_blocked: bool,
 }
 
 impl LinuxAccessibility {
@@ -85,7 +140,35 @@ impl LinuxAccessibility {
             cache: ElementCache::new(),
             handles: SecondaryMap::new(),
             connection,
+            walk_blocked: false,
         })
+    }
+
+    /// Create a reader connected to an explicit accessibility bus address
+    /// (e.g. the address published in the X root window's `AT_SPI_BUS`
+    /// property), for environments where the session bus's `org.a11y.Bus`
+    /// answer points at a different bus than the one applications register on.
+    pub async fn with_bus_address(address: &str) -> Result<Self> {
+        let address = address
+            .parse()
+            .map_err(|e| anyhow!("Invalid AT-SPI bus address {address:?}: {e}"))?;
+        let connection = AccessibilityConnection::from_address(address)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to AT-SPI bus at explicit address: {e}"))?;
+
+        Ok(Self {
+            cache: ElementCache::new(),
+            handles: SecondaryMap::new(),
+            connection,
+            walk_blocked: false,
+        })
+    }
+
+    /// Whether the most recent tree walk was silently cut short by an
+    /// application that stopped answering (D-Bus no-reply timeout on a child
+    /// fetch). Callers should treat such a tree as incomplete.
+    pub fn last_walk_blocked(&self) -> bool {
+        self.walk_blocked
     }
 
     /// Get the PID of a D-Bus bus name owner.
@@ -130,10 +213,176 @@ impl LinuxAccessibility {
             .map_err(|e| anyhow!("Failed to create TextProxy: {}", e))
     }
 
+    /// Discover plug roots that are grafted into other applications' trees.
+    ///
+    /// Out-of-process web content (WebKitGTK web processes, used by Epiphany,
+    /// Tauri on Linux, and other WebKitGTK embedders) registers on the
+    /// accessibility bus as separate connections. The UI-process socket node
+    /// reports zero children over `GetChildren`/`GetChildAtIndex`, so a plain
+    /// walk never crosses into web content. Each plug connection exposes an
+    /// `org.a11y.atspi.Cache` whose root item's parent points at the
+    /// UI-process socket node; this returns that socket -> plug-root mapping
+    /// so the tree walk can graft the web content subtree in place.
+    ///
+    /// Also reports whether a bus previously seen serving WebKit plug objects
+    /// failed to answer: its web process has stopped responding (typically a
+    /// script dialog blocking it), so the walk would silently drop the web
+    /// content subtree and the returned tree must be treated as blocked.
+    async fn discover_plug_grafts(
+        conn: &zbus::Connection,
+    ) -> (HashMap<(String, String), NativeHandle>, BlockedGrafts) {
+        let mut grafts = HashMap::new();
+        let mut blocked = BlockedGrafts::default();
+        let mut stalled_unknown: Vec<String> = Vec::new();
+        let Ok(dbus_proxy) = DBusProxy::new(conn).await else {
+            return (grafts, blocked);
+        };
+        let Ok(names) = dbus_proxy.list_names().await else {
+            return (grafts, blocked);
+        };
+        for name in &names {
+            let name = name.as_str();
+            if !name.starts_with(':') {
+                continue;
+            }
+            let Ok(cache_proxy) = CacheProxy::builder(conn)
+                .destination(name.to_string())
+                .and_then(|b| b.path("/org/a11y/atspi/cache"))
+                .map(|b| b.cache_properties(CacheProperties::No))
+                .map(|b| b.build())
+            else {
+                continue;
+            };
+            let Ok(cache_proxy) = cache_proxy.await else {
+                continue;
+            };
+            // Bound each query: connections that do not serve an AT-SPI cache
+            // (ATs, monitors) may never reply.
+            let items = match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                cache_proxy.get_items(),
+            )
+            .await
+            {
+                Ok(Ok(items)) => items,
+                _ => {
+                    // Connections that never serve a cache (ATs, monitors)
+                    // time out here routinely; that is the intended bound.
+                    // But a bus already known to host WebKit plug objects
+                    // going quiet means its web process is stalled and its
+                    // graft (the whole web subtree) is about to be missing
+                    // from that embedder's tree specifically.
+                    let embedder = webkit_buses()
+                        .read()
+                        .ok()
+                        .and_then(|buses| buses.get(name).cloned());
+                    if let Some(embedder) = embedder {
+                        blocked.ui_buses.insert(embedder);
+                    } else {
+                        stalled_unknown.push(name.to_string());
+                    }
+                    continue;
+                }
+            };
+            for item in items {
+                let Some(parent_name) = item.parent.name_as_str() else {
+                    continue;
+                };
+                // A cross-connection parent marks a plug root embedded in
+                // another process's tree (e.g. a WebKit web process plugged
+                // into its UI process).
+                if parent_name.is_empty() || parent_name == name {
+                    continue;
+                }
+                // Every application root's cache parent is the registry's
+                // root object; those are ordinary registrations, not plugs.
+                if item.parent.path_as_str() == "/org/a11y/atspi/accessible/root" {
+                    continue;
+                }
+                let Some(object_name) = item.object.name_as_str() else {
+                    continue;
+                };
+                // Only WebKit web processes number roles differently; their
+                // plug objects live under /org/a11y/webkit/.
+                if item.object.path_as_str().starts_with("/org/a11y/webkit/")
+                    && let Ok(mut buses) = webkit_buses().write()
+                {
+                    buses.insert(object_name.to_string(), parent_name.to_string());
+                }
+                grafts.insert(
+                    (
+                        parent_name.to_string(),
+                        item.parent.path_as_str().to_string(),
+                    ),
+                    NativeHandle {
+                        bus_name: object_name.to_string(),
+                        object_path: item.object.path_as_str().to_string(),
+                    },
+                );
+            }
+        }
+        // Cold start: a WebKit web process already stalled before this
+        // process ever saw its plug objects is not in `webkit_buses()`, so
+        // the timeout above cannot classify it. The bus daemon still answers
+        // for the stalled connection, so identify it by its process name and
+        // attribute it to its embedder (its parent process) by matching the
+        // parent PID against the other connections' PIDs.
+        for name in stalled_unknown {
+            let Some(pid) = Self::get_pid_for_bus_name(conn, &name).await else {
+                continue;
+            };
+            if !process_comm(pid).is_some_and(|comm| comm.starts_with("WebKitWebProc")) {
+                continue;
+            }
+            let embedder_pid = process_parent_pid(pid);
+            let mut attributed = false;
+            if let Some(embedder_pid) = embedder_pid {
+                for candidate in &names {
+                    let candidate = candidate.as_str();
+                    if candidate == name || !candidate.starts_with(':') {
+                        continue;
+                    }
+                    if Self::get_pid_for_bus_name(conn, candidate).await == Some(embedder_pid) {
+                        blocked.ui_buses.insert(candidate.to_string());
+                        attributed = true;
+                    }
+                }
+            }
+            if !attributed {
+                blocked.unattributed = true;
+            }
+        }
+        (grafts, blocked)
+    }
+
     create_proxy_fn!(create_component_proxy, ComponentProxy);
     create_proxy_fn!(create_action_proxy, ActionProxy);
     create_proxy_fn!(create_editable_text_proxy, EditableTextProxy);
     create_proxy_fn!(create_value_proxy, ValueProxy);
+
+    /// Fetch an accessible's role, correcting for WebKitGTK's role numbering.
+    ///
+    /// WebKitGTK >= 2.50 numbers its AT-SPI roles per current at-spi2-core,
+    /// where the deprecated `Footer` slot (72) is gone and `SectionFooter`/
+    /// `SectionHeader` sit at the end, so every wire value >= 72 is one less
+    /// than the numbering the `atspi` crate decodes. WebKit objects live on
+    /// their web process's own bus connection, recorded at plug discovery.
+    async fn fetch_role(proxy: &AccessibleProxy<'_>) -> Option<AtspiRole> {
+        let raw: u32 = proxy.inner().call("GetRole", &()).await.ok()?;
+        let destination = proxy.inner().destination().as_str().to_string();
+        let webkit = webkit_buses()
+            .read()
+            .map(|buses| buses.contains_key(&destination))
+            .unwrap_or(false);
+        let adjusted = match raw {
+            _ if !webkit => raw,
+            0..=71 => raw,
+            115 => 72, // SectionFooter -> Footer
+            116 => 71, // SectionHeader -> Header
+            n => n + 1,
+        };
+        AtspiRole::try_from(adjusted).ok()
+    }
 
     /// Map AT-SPI Role to accesskit Role.
     fn map_role(atspi_role: AtspiRole) -> Role {
@@ -145,7 +394,8 @@ impl LinuxAccessibility {
             AtspiRole::Text | AtspiRole::Terminal => Role::MultilineTextInput,
             AtspiRole::Label | AtspiRole::Static => Role::Label,
             AtspiRole::ComboBox => Role::ComboBox,
-            AtspiRole::Slider | AtspiRole::SpinButton => Role::Slider,
+            AtspiRole::Slider => Role::Slider,
+            AtspiRole::SpinButton => Role::SpinButton,
             AtspiRole::Menu | AtspiRole::PopupMenu => Role::Menu,
             AtspiRole::MenuItem => Role::MenuItem,
             AtspiRole::CheckMenuItem => Role::MenuItemCheckBox,
@@ -161,7 +411,7 @@ impl LinuxAccessibility {
             AtspiRole::MenuBar => Role::MenuBar,
             AtspiRole::ScrollBar => Role::ScrollBar,
             AtspiRole::ScrollPane => Role::ScrollView,
-            AtspiRole::StatusBar => Role::Tooltip,
+            AtspiRole::StatusBar => Role::Status,
             AtspiRole::Panel | AtspiRole::Filler => Role::Group,
             AtspiRole::Application => Role::Application,
             AtspiRole::DocumentFrame | AtspiRole::DocumentWeb => Role::WebView,
@@ -180,6 +430,36 @@ impl LinuxAccessibility {
             AtspiRole::ColumnHeader | AtspiRole::TableColumnHeader => Role::ColumnHeader,
             AtspiRole::RowHeader | AtspiRole::TableRowHeader => Role::RowHeader,
             AtspiRole::DesktopFrame | AtspiRole::DesktopIcon => Role::Unknown,
+            // High-numbered roles emitted by WebKitGTK for ordinary web content
+            AtspiRole::Section | AtspiRole::Grouping => Role::Group,
+            AtspiRole::Header => Role::Header,
+            AtspiRole::Footer => Role::Footer,
+            AtspiRole::Caption => Role::Caption,
+            AtspiRole::BlockQuote => Role::Blockquote,
+            AtspiRole::Article => Role::Article,
+            AtspiRole::Landmark => Role::Region,
+            AtspiRole::Comment => Role::Comment,
+            AtspiRole::Notification | AtspiRole::InfoBar => Role::Status,
+            AtspiRole::LevelBar => Role::Meter,
+            AtspiRole::TitleBar => Role::TitleBar,
+            AtspiRole::Audio => Role::Audio,
+            AtspiRole::Video => Role::Video,
+            AtspiRole::Definition => Role::Definition,
+            AtspiRole::Log => Role::Log,
+            AtspiRole::Marquee => Role::Marquee,
+            AtspiRole::Math => Role::Math,
+            AtspiRole::Timer => Role::Timer,
+            AtspiRole::DescriptionList => Role::DescriptionList,
+            AtspiRole::DescriptionTerm => Role::Term,
+            AtspiRole::DescriptionValue => Role::Definition,
+            AtspiRole::Footnote => Role::DocFootnote,
+            AtspiRole::ContentDeletion => Role::ContentDeletion,
+            AtspiRole::ContentInsertion => Role::ContentInsertion,
+            AtspiRole::Mark => Role::Mark,
+            AtspiRole::Suggestion => Role::Suggestion,
+            AtspiRole::Autocomplete => Role::ComboBox,
+            AtspiRole::Editbar => Role::TextInput,
+            AtspiRole::Embedded => Role::EmbeddedObject,
             _ => Role::Unknown,
         }
     }
@@ -193,11 +473,12 @@ impl LinuxAccessibility {
         id: ElementKey,
     ) -> Option<Element> {
         // Get role
-        let atspi_role = proxy.get_role().await.ok()?;
+        let atspi_role = Self::fetch_role(proxy).await?;
         let role = Self::map_role(atspi_role);
 
         // Build element
         let mut element = Element::new(id, role);
+        element.native_id = Some(native_identity(&handle.bus_name, &handle.object_path));
 
         // Get basic properties
         element.title = proxy.name().await.ok().filter(|s| !s.is_empty());
@@ -211,6 +492,9 @@ impl LinuxAccessibility {
             element.enabled =
                 !states.contains(atspi::State::Sensitive) || states.contains(atspi::State::Enabled);
             element.focused = states.contains(atspi::State::Focused);
+            if is_checkable(role, &states) {
+                element.checked = Some(states.contains(atspi::State::Checked));
+            }
         }
 
         // Get bounds from Component interface if available
@@ -232,15 +516,8 @@ impl LinuxAccessibility {
         if interfaces.contains(atspi::Interface::Action)
             && let Ok(action_proxy) =
                 Self::create_action_proxy(conn, &handle.bus_name, &handle.object_path).await
-            && let Ok(n_actions) = action_proxy.nactions().await
+            && let Ok(actions) = Self::list_action_names(&action_proxy).await
         {
-            // Use nactions + get_name instead of get_actions for compatibility
-            let mut actions = Vec::new();
-            for i in 0..n_actions {
-                if let Ok(name) = action_proxy.get_name(i).await {
-                    actions.push(name);
-                }
-            }
             element.actions = actions;
         }
 
@@ -270,6 +547,35 @@ impl LinuxAccessibility {
         Some(element)
     }
 
+    /// List an element's action names via NActions + GetName.
+    ///
+    /// GetActions crashes on some older GTK applications and never answers on
+    /// WebKitGTK, so it is avoided entirely. The spec property is `NActions`,
+    /// but atspi-proxies' generated getter asks for `Nactions`; some
+    /// implementations (WebKitGTK) only answer the correctly-cased name, so
+    /// try both.
+    async fn list_action_names(action_proxy: &ActionProxy<'_>) -> Result<Vec<String>> {
+        let n_actions = match action_proxy.inner().get_property::<i32>("NActions").await {
+            Ok(n) => n,
+            Err(_) => action_proxy
+                .nactions()
+                .await
+                .map_err(|e| anyhow!("Failed to get action count: {}", e))?,
+        };
+        let mut actions = Vec::new();
+        for i in 0..n_actions {
+            // WebKitGTK advertises a nameless action on plain text nodes
+            // (paragraphs, headings); an empty name carries no information
+            // and reads as actionable, so it is dropped.
+            if let Ok(name) = action_proxy.get_name(i).await
+                && !name.is_empty()
+            {
+                actions.push(name);
+            }
+        }
+        Ok(actions)
+    }
+
     /// Build the accessibility tree iteratively using a stack.
     async fn build_tree_async(
         &mut self,
@@ -291,6 +597,10 @@ impl LinuxAccessibility {
         // Clone the connection for use in async block
         let conn = self.connection.connection().clone();
 
+        // Socket nodes report zero children; plug roots discovered here are
+        // grafted in as their children so web content is reachable.
+        let (plug_grafts, grafts_blocked) = Self::discover_plug_grafts(&conn).await;
+
         // Collect results and handles in async block using temporary IDs
         let async_result: Option<_> = async {
             // Use temporary indices that will be remapped to real slotmap IDs later
@@ -299,6 +609,7 @@ impl LinuxAccessibility {
             let mut element_count = 0usize;
             let mut root_temp_id: Option<TempId> = None;
             let mut next_temp_id: TempId = 1;
+            let mut blocked = false;
 
             // Initialize stack with root
             let root_proxy = Self::create_accessible_proxy(
@@ -364,7 +675,38 @@ impl LinuxAccessibility {
 
                 // Get children if we should recurse
                 let should_recurse = filter.max_depth.is_none_or(|max| entry.depth < max);
-                if should_recurse && let Ok(children) = proxy.get_children().await {
+                if should_recurse
+                    && let Some(plug_root) = plug_grafts.get(&(
+                        entry.handle.bus_name.clone(),
+                        entry.handle.object_path.clone(),
+                    ))
+                    && let Ok(plug_proxy) = Self::create_accessible_proxy(
+                        &conn,
+                        &plug_root.bus_name,
+                        &plug_root.object_path,
+                    )
+                    .await
+                    && let Ok(plug_interfaces) = plug_proxy.get_interfaces().await
+                {
+                    stack.push(StackEntry {
+                        handle: plug_root.clone(),
+                        interfaces: plug_interfaces,
+                        parent_temp_id: Some(temp_id),
+                        depth: entry.depth + 1,
+                    });
+                }
+                let children = if should_recurse {
+                    match proxy.get_children().await {
+                        Ok(children) => Some(children),
+                        Err(error) => {
+                            blocked |= is_no_reply_error(&error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(children) = children {
                     // Push children to stack in reverse order so first child is processed first
                     for child_ref in children.into_iter().rev() {
                         let child_handle = NativeHandle {
@@ -395,11 +737,18 @@ impl LinuxAccessibility {
                 element_count += 1;
             }
 
-            Some((results, handles_to_insert, root_temp_id))
+            Some((results, handles_to_insert, root_temp_id, blocked))
         }
         .await;
 
-        let (mut results, handles_to_insert, root_temp_id) = async_result?;
+        let (mut results, handles_to_insert, root_temp_id, blocked) = async_result?;
+        // A stalled web process only blocks walks that actually cross the
+        // embedder it plugs into; other applications' trees stay trustworthy.
+        let grafts_blocked = grafts_blocked.unattributed
+            || handles_to_insert
+                .iter()
+                .any(|(_, handle)| grafts_blocked.ui_buses.contains(&handle.bus_name));
+        self.walk_blocked = blocked || grafts_blocked;
         let root_temp_id = root_temp_id?;
 
         // Build temp_id -> handle mapping for later use
@@ -411,6 +760,12 @@ impl LinuxAccessibility {
             if let Some(pid) = parent_temp_id {
                 children_map.entry(*pid).or_default().push(temp_id);
             }
+        }
+        // Temp ids are assigned in depth-first document order, but the map
+        // above is iterated in hash order — sort so siblings keep the order
+        // the application reports them in.
+        for siblings in children_map.values_mut() {
+            siblings.sort_unstable();
         }
 
         // Build tree recursively, storing elements and handles as we go
@@ -460,9 +815,11 @@ impl LinuxAccessibility {
                 help: element.help,
                 role_description: element.role_description,
                 identifier: element.identifier,
+                native_id: element.native_id,
                 bounds: element.bounds,
                 enabled: element.enabled,
                 focused: element.focused,
+                checked: element.checked,
                 actions: element.actions,
                 children: children_elements,
             });
@@ -514,26 +871,41 @@ impl LinuxAccessibility {
         None
     }
 
-    /// Find the focused application.
+    /// Find the focused application. The ACTIVE state lives on an
+    /// application's window children, not on the application node itself, so
+    /// check each application's top-level windows; only fall back to
+    /// application-level Active/Focused states. There is deliberately no
+    /// "first registered application" fallback: background daemons (e.g.
+    /// desktop portals) register first and would win.
     async fn find_focused_app(
         conn: &zbus::Connection,
         root: &AccessibleProxy<'_>,
     ) -> Option<(NativeHandle, u32)> {
         let children = root.get_children().await.ok()?;
 
-        // First pass: look for focused/active application
         for child_ref in &children {
             let handle = NativeHandle {
                 bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
                 object_path: child_ref.path_as_str().to_string(),
             };
-
-            if let Ok(proxy) =
+            let Ok(proxy) =
                 Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
-                && let Ok(states) = proxy.get_state().await
-            {
-                // Check for Active or Focused state
-                if states.contains(atspi::State::Active) || states.contains(atspi::State::Focused) {
+            else {
+                continue;
+            };
+            let Ok(windows) = proxy.get_children().await else {
+                continue;
+            };
+            for window_ref in &windows {
+                if let Ok(window) = Self::create_accessible_proxy(
+                    conn,
+                    window_ref.name_as_str().unwrap_or_default(),
+                    window_ref.path_as_str(),
+                )
+                .await
+                    && let Ok(states) = window.get_state().await
+                    && states.contains(atspi::State::Active)
+                {
                     let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
                         .await
                         .unwrap_or(0);
@@ -542,19 +914,20 @@ impl LinuxAccessibility {
             }
         }
 
-        // Fallback: return first application with a valid PID
         for child_ref in &children {
-            let bus_name = child_ref.name_as_str().unwrap_or_default().to_string();
-            if let Some(pid) = Self::get_pid_for_bus_name(conn, &bus_name).await
-                && pid > 0
+            let handle = NativeHandle {
+                bus_name: child_ref.name_as_str().unwrap_or_default().to_string(),
+                object_path: child_ref.path_as_str().to_string(),
+            };
+            if let Ok(proxy) =
+                Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await
+                && let Ok(states) = proxy.get_state().await
+                && (states.contains(atspi::State::Active) || states.contains(atspi::State::Focused))
             {
-                return Some((
-                    NativeHandle {
-                        bus_name,
-                        object_path: child_ref.path_as_str().to_string(),
-                    },
-                    pid,
-                ));
+                let pid = Self::get_pid_for_bus_name(conn, &handle.bus_name)
+                    .await
+                    .unwrap_or(0);
+                return Some((handle, pid));
             }
         }
 
@@ -733,6 +1106,83 @@ impl LinuxAccessibility {
         Self::find_window_by_pid_recursive(&conn, root, pid_atom, pid)
     }
 
+    /// Raise and activate the toplevel window belonging to a PID.
+    ///
+    /// Sends an EWMH `_NET_ACTIVE_WINDOW` request for the first managed
+    /// toplevel whose `_NET_WM_PID` matches, so synthesized pointer events
+    /// aimed at that application are not swallowed by a covering window.
+    pub fn activate_window_for_pid(pid: u32) -> Result<()> {
+        use accessibility_linux_sys::x11rb::connection::Connection;
+        use accessibility_linux_sys::x11rb::protocol::xproto::{
+            ClientMessageEvent, ConnectionExt as _, EventMask,
+        };
+
+        let (conn, screen_num) =
+            x11rb::connect(None).map_err(|e| anyhow!("Failed to connect to X11: {}", e))?;
+        let root = conn.setup().roots[screen_num].root;
+        let atom = |name: &[u8]| -> Result<u32> {
+            Ok(conn
+                .intern_atom(false, name)
+                .map_err(|e| anyhow!("intern_atom: {}", e))?
+                .reply()
+                .map_err(|e| anyhow!("intern_atom reply: {}", e))?
+                .atom)
+        };
+        let client_list = atom(b"_NET_CLIENT_LIST")?;
+        let pid_atom = atom(b"_NET_WM_PID")?;
+        let active_window = atom(b"_NET_ACTIVE_WINDOW")?;
+
+        let list = conn
+            .get_property(
+                false,
+                root,
+                client_list,
+                x11rb::protocol::xproto::AtomEnum::WINDOW,
+                0,
+                u32::MAX,
+            )
+            .map_err(|e| anyhow!("get _NET_CLIENT_LIST: {}", e))?
+            .reply()
+            .map_err(|e| anyhow!("_NET_CLIENT_LIST reply: {}", e))?;
+        let windows: Vec<u32> = list.value32().map(|v| v.collect()).unwrap_or_default();
+        for window in windows {
+            let Ok(cookie) = conn.get_property(
+                false,
+                window,
+                pid_atom,
+                x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                0,
+                1,
+            ) else {
+                continue;
+            };
+            let Ok(reply) = cookie.reply() else { continue };
+            let window_pid = reply.value32().and_then(|mut v| v.next());
+            if window_pid != Some(pid) {
+                continue;
+            }
+            let event = ClientMessageEvent::new(
+                32,
+                window,
+                active_window,
+                // source indication 2 = pager/direct user action, so the
+                // window manager honors the activation instead of setting
+                // the demands-attention hint.
+                [2, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            conn.send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .map_err(|e| anyhow!("send _NET_ACTIVE_WINDOW: {}", e))?;
+            conn.flush().map_err(|e| anyhow!("flush: {}", e))?;
+            return Ok(());
+        }
+        bail!("no toplevel window found for pid {}", pid)
+    }
+
     /// Recursively search for a window with matching PID.
     fn find_window_by_pid_recursive(
         conn: &impl x11rb::connection::Connection,
@@ -869,23 +1319,123 @@ impl AccessibilityReader for LinuxAccessibility {
             return Ok(());
         }
 
-        // Use Action interface for other actions
+        // Most elements have no context-menu action; the reliable route is a
+        // synthesized right-click at the element's center through the AT-SPI
+        // DeviceEventController (no direct X dependency), matching what a
+        // user does. An explicit context-named action is preferred when the
+        // element exposes one.
+        if action == Action::ShowContextMenu {
+            // Querying the Action interface on an element that does not
+            // implement it crashes GTK's atk-bridge (an ATK_IS_ACTION
+            // assertion followed by a D-Bus marshalling abort takes the whole
+            // app down), so gate on the advertised interface set.
+            if let Ok(accessible) =
+                Self::create_accessible_proxy(&conn, &handle.bus_name, &handle.object_path).await
+                && let Ok(interfaces) = accessible.get_interfaces().await
+                && interfaces.contains(atspi::Interface::Action)
+                && let Ok(action_proxy) =
+                    Self::create_action_proxy(&conn, &handle.bus_name, &handle.object_path).await
+                && let Ok(names) = Self::list_action_names(&action_proxy).await
+                && let Some(index) = names
+                    .iter()
+                    .position(|a| a.to_lowercase().contains("context"))
+                && matches!(action_proxy.do_action(index as i32).await, Ok(true))
+            {
+                return Ok(());
+            }
+            let component =
+                Self::create_component_proxy(&conn, &handle.bus_name, &handle.object_path).await?;
+            let (x, y, width, height) = component
+                .get_extents(CoordType::Screen)
+                .await
+                .map_err(|e| anyhow!("Failed to get extents: {}", e))?;
+            // The synthesized pointer event lands on whatever window is on
+            // top at those coordinates, so activate the target app's window
+            // first in case another application is covering it.
+            if let Ok(pid_reply) = conn
+                .call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "GetConnectionUnixProcessID",
+                    &(handle.bus_name.as_str(),),
+                )
+                .await
+                && let Ok(pid) = pid_reply.body().deserialize::<u32>()
+            {
+                let _ = Self::activate_window_for_pid(pid);
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            conn.call_method(
+                Some("org.a11y.atspi.Registry"),
+                "/org/a11y/atspi/registry/deviceeventcontroller",
+                Some("org.a11y.atspi.DeviceEventController"),
+                "GenerateMouseEvent",
+                &(x + width / 2, y + height / 2, "b3c"),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to synthesize right-click: {}", e))?;
+            return Ok(());
+        }
+
+        // A user click on a table cell both selects the row and activates it;
+        // the AT-SPI "activate" action alone does not move the selection, so
+        // grab focus first (which selects the row in GTK tree views).
+        if action == Action::Click
+            && let Ok(accessible) =
+                Self::create_accessible_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && Self::fetch_role(&accessible).await == Some(AtspiRole::TableCell)
+            && let Ok(component) =
+                Self::create_component_proxy(&conn, &handle.bus_name, &handle.object_path).await
+        {
+            let _ = component.grab_focus().await;
+        }
+
+        // Use Action interface for other actions. Querying the Action
+        // interface on an element that does not implement it crashes GTK's
+        // atk-bridge (an ATK_IS_ACTION assertion followed by a D-Bus
+        // marshalling abort takes the whole app down), so gate on the
+        // advertised interface set first.
+        let accessible =
+            Self::create_accessible_proxy(&conn, &handle.bus_name, &handle.object_path).await?;
+        let interfaces = accessible
+            .get_interfaces()
+            .await
+            .map_err(|e| anyhow!("Failed to get interfaces: {}", e))?;
+        if !interfaces.contains(atspi::Interface::Action) {
+            bail!("Element does not support the Action interface");
+        }
         let action_proxy =
             Self::create_action_proxy(&conn, &handle.bus_name, &handle.object_path).await?;
 
+        let action_names = Self::list_action_names(&action_proxy)
+            .await
+            .map_err(|e| anyhow!("Failed to get actions: {}", e))?;
+
         // Map accesskit Action to AT-SPI action index
         let action_index = match action {
-            Action::Click => 0, // Primary action is usually index 0
-            Action::ShowContextMenu => {
-                // Find "showContextMenu" or similar action by name
-                let actions = action_proxy
-                    .get_actions()
-                    .await
-                    .map_err(|e| anyhow!("Failed to get actions: {}", e))?;
-                actions
+            Action::Click => {
+                // Prefer an explicitly click-like action by name: GTK tree
+                // cells list "expand or contract" before "activate", so
+                // index 0 is not always the primary action.
+                action_names
                     .iter()
                     .position(|a| {
-                        let name = a.name.to_lowercase();
+                        let name = a.to_lowercase();
+                        name.contains("activate")
+                            || name.contains("click")
+                            || name.contains("press")
+                            || name.contains("toggle")
+                    })
+                    .map(|i| i as i32)
+                    .unwrap_or(0)
+            }
+            Action::ShowContextMenu => {
+                // Find "showContextMenu" or similar action by name
+                action_names
+                    .iter()
+                    .position(|a| {
+                        let name = a.to_lowercase();
                         name.contains("context") || name.contains("menu")
                     })
                     .map(|i| i as i32)
@@ -893,25 +1443,17 @@ impl AccessibilityReader for LinuxAccessibility {
             }
             Action::Increment => {
                 // Find "increment" action
-                let actions = action_proxy
-                    .get_actions()
-                    .await
-                    .map_err(|e| anyhow!("Failed to get actions: {}", e))?;
-                actions
+                action_names
                     .iter()
-                    .position(|a| a.name.to_lowercase().contains("increment"))
+                    .position(|a| a.to_lowercase().contains("increment"))
                     .map(|i| i as i32)
                     .unwrap_or(-1)
             }
             Action::Decrement => {
                 // Find "decrement" action
-                let actions = action_proxy
-                    .get_actions()
-                    .await
-                    .map_err(|e| anyhow!("Failed to get actions: {}", e))?;
-                actions
+                action_names
                     .iter()
-                    .position(|a| a.name.to_lowercase().contains("decrement"))
+                    .position(|a| a.to_lowercase().contains("decrement"))
                     .map(|i| i as i32)
                     .unwrap_or(-1)
             }
@@ -944,23 +1486,24 @@ impl AccessibilityReader for LinuxAccessibility {
         let conn = self.connection.connection().clone();
         let value = value.to_string();
 
-        // Try EditableText interface first (for text fields)
-        if let Ok(editable) =
-            Self::create_editable_text_proxy(&conn, &handle.bus_name, &handle.object_path).await
-            && editable.set_text_contents(&value).await.is_ok()
+        // Prefer the Value interface for numeric values: GTK spin buttons
+        // expose both EditableText and Value, but text written through
+        // EditableText is not committed to the numeric value until the
+        // widget is activated, so setting the value directly is the only
+        // route that takes effect immediately.
+        if let Ok(numeric_value) = value.parse::<f64>()
+            && let Ok(value_proxy) =
+                Self::create_value_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && value_proxy.set_current_value(numeric_value).await.is_ok()
         {
             return Ok(());
         }
 
-        // Fallback to Value interface (for sliders, spin buttons)
-        if let Ok(value_proxy) =
-            Self::create_value_proxy(&conn, &handle.bus_name, &handle.object_path).await
-            && let Ok(numeric_value) = value.parse::<f64>()
+        // EditableText interface (for text fields)
+        if let Ok(editable) =
+            Self::create_editable_text_proxy(&conn, &handle.bus_name, &handle.object_path).await
+            && editable.set_text_contents(&value).await.is_ok()
         {
-            value_proxy
-                .set_current_value(numeric_value)
-                .await
-                .map_err(|e| anyhow!("Failed to set value: {}", e))?;
             return Ok(());
         }
 
@@ -1033,9 +1576,11 @@ impl AccessibilityReader for LinuxAccessibility {
                                 help: element.help.clone(),
                                 role_description: element.role_description.clone(),
                                 identifier: element.identifier.clone(),
+                                native_id: element.native_id,
                                 bounds: element.bounds,
                                 enabled: element.enabled,
                                 focused: element.focused,
+                                checked: element.checked,
                                 actions: element.actions.clone(),
                                 children: vec![], // hit_test returns a single element without children
                             });
@@ -1174,6 +1719,31 @@ fn current_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// GTK (unlike WebKitGTK) does not set the Checkable AT-SPI state on its
+/// toggle widgets, so treat inherently-checkable roles as checkable too.
+fn is_checkable(role: Role, states: &atspi::StateSet) -> bool {
+    states.contains(atspi::State::Checkable)
+        || matches!(
+            role,
+            Role::CheckBox
+                | Role::RadioButton
+                | Role::Switch
+                | Role::MenuItemCheckBox
+                | Role::MenuItemRadio
+        )
+}
+
+/// Stable per-node identity for AT-SPI accessibles: a hash of the D-Bus
+/// (bus name, object path) pair, which addresses the same underlying
+/// accessible object across walks for as long as the app keeps it alive.
+fn native_identity(bus_name: &str, object_path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bus_name.hash(&mut hasher);
+    object_path.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Build a minimal Element from AT-SPI event data.
 async fn build_element_from_event(
     conn: &zbus::Connection,
@@ -1184,13 +1754,14 @@ async fn build_element_from_event(
         .await
         .ok()?;
 
-    let atspi_role = proxy.get_role().await.ok()?;
+    let atspi_role = LinuxAccessibility::fetch_role(&proxy).await?;
     let role = LinuxAccessibility::map_role(atspi_role);
 
     // Use a placeholder key since we're not caching this element
     let placeholder_key = ElementKey::from_ffi(1);
 
     let mut element = Element::new(placeholder_key, role);
+    element.native_id = Some(native_identity(bus_name, object_path));
     element.title = proxy.name().await.ok().filter(|s| !s.is_empty());
     element.description = proxy.description().await.ok().filter(|s| !s.is_empty());
     element.identifier = proxy.accessible_id().await.ok().filter(|s| !s.is_empty());
@@ -1200,6 +1771,9 @@ async fn build_element_from_event(
         element.enabled =
             !states.contains(atspi::State::Sensitive) || states.contains(atspi::State::Enabled);
         element.focused = states.contains(atspi::State::Focused);
+        if is_checkable(role, &states) {
+            element.checked = Some(states.contains(atspi::State::Checked));
+        }
     }
 
     // Try to get bounds from Component interface

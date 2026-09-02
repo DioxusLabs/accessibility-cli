@@ -62,9 +62,109 @@ pub mod ax;
 pub mod input;
 pub mod session;
 pub mod video;
+use accessibility_android_sys::UiDumpServer;
 pub use accessibility_android_sys::{AdbClient, AndroidKeyCode};
 pub use input::{HardwareButton, InputCommand, Orientation, TouchPhase, spawn_input_worker};
 pub use video::AndroidVideoCapture;
+
+/// How long to keep using classic `uiautomator dump` after the persistent
+/// dump server fails before trying to start it again.
+const DUMP_SERVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A process-wide, per-device hybrid UI dump source.
+///
+/// The persistent AxDump server holds the device's only `UiAutomation`
+/// registration, and while it runs the system kills competing clients —
+/// including a plain `uiautomator dump` issued by another
+/// [`AndroidAccessibility`] in the same process. Sharing one source per
+/// serial keeps every reader on the fast path and avoids that conflict.
+///
+/// Steady-state server dumps take a few milliseconds versus ~2s for
+/// `uiautomator dump`; any server failure falls back to the classic dump
+/// for [`DUMP_SERVER_RETRY_DELAY`] before the server is retried.
+#[derive(Clone)]
+pub struct SharedDumpSource {
+    state: std::sync::Arc<tokio::sync::Mutex<DumpSourceState>>,
+}
+
+#[derive(Default)]
+struct DumpSourceState {
+    server: Option<UiDumpServer>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl SharedDumpSource {
+    /// The shared source for `serial` (or the default device when `None`).
+    pub fn for_device(serial: Option<&str>) -> Self {
+        static SOURCES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, SharedDumpSource>>,
+        > = std::sync::OnceLock::new();
+        let key = serial.unwrap_or("<default>").to_string();
+        SOURCES
+            .get_or_init(Default::default)
+            .lock()
+            .expect("dump source registry poisoned")
+            .entry(key)
+            .or_insert_with(|| SharedDumpSource {
+                state: Default::default(),
+            })
+            .clone()
+    }
+
+    /// Dump the UI hierarchy, preferring the persistent server.
+    pub async fn dump_ui(&self, adb: &AdbClient) -> Result<String> {
+        if dump_server_disabled() {
+            return adb.dump_ui().await;
+        }
+        let mut state = self.state.lock().await;
+        if state.server.is_none()
+            && state
+                .retry_at
+                .is_none_or(|at| std::time::Instant::now() >= at)
+        {
+            match Self::start_server(adb).await {
+                Ok(server) => state.server = Some(server),
+                Err(error) => {
+                    tracing::debug!(?error, "AxDump server unavailable; using classic dumps");
+                    state.retry_at = Some(std::time::Instant::now() + DUMP_SERVER_RETRY_DELAY);
+                }
+            }
+        }
+        if let Some(server) = state.server.as_mut() {
+            // One retry covers the transient `no active window root` race
+            // during window transitions.
+            for attempt in 0..2 {
+                match server.dump().await {
+                    Ok(xml) => return Ok(xml),
+                    Err(error)
+                        if attempt == 0 && error.to_string().contains("no active window") =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(error) => {
+                        tracing::debug!(?error, "AxDump server dump failed; falling back");
+                        break;
+                    }
+                }
+            }
+            state.server = None;
+            state.retry_at = Some(std::time::Instant::now() + DUMP_SERVER_RETRY_DELAY);
+        }
+        drop(state);
+        adb.dump_ui().await
+    }
+
+    async fn start_server(adb: &AdbClient) -> Result<UiDumpServer> {
+        adb.ensure_axdump().await?;
+        adb.start_dump_server(accessibility_android_sys::AXDUMP_DEX_DEVICE_PATH)
+            .await
+    }
+}
+
+fn dump_server_disabled() -> bool {
+    std::env::var("AX_ANDROID_DUMP_SERVER")
+        .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("off"))
+}
 
 /// Parse Android bounds string like "[0,0][1080,1920]" into a Rect.
 fn parse_bounds(bounds_str: &str) -> Option<Rect> {
@@ -251,6 +351,10 @@ struct UiNode {
     long_clickable: bool,
     /// Package name.
     package: Option<String>,
+    /// Stable native node identity (AxDump's `ax-node-id`, from the hidden
+    /// `AccessibilityNodeInfo.getSourceNodeId()`); absent in classic
+    /// `uiautomator dump` output.
+    node_id: Option<u64>,
     /// Child nodes.
     children: Vec<UiNode>,
 }
@@ -272,6 +376,7 @@ impl UiNode {
             scrollable: false,
             long_clickable: false,
             package: None,
+            node_id: None,
             children: Vec::new(),
         }
     }
@@ -294,6 +399,7 @@ impl UiNode {
                 .or_else(|| self.content_desc.clone().filter(|s| !s.is_empty()));
             elem.description = self.content_desc.clone().filter(|s| !s.is_empty());
             elem.identifier = self.resource_id.clone();
+            elem.native_id = self.node_id;
             elem.bounds = bounds;
             elem.enabled = self.enabled;
             elem.focused = self.focused;
@@ -379,6 +485,7 @@ fn parse_ui_xml(xml: &str) -> Result<UiNode> {
                             "scrollable" => node.scrollable = value == "true",
                             "long-clickable" => node.long_clickable = value == "true",
                             "package" => node.package = Some(value),
+                            "ax-node-id" => node.node_id = value.parse().ok(),
                             _ => {}
                         }
                     }
@@ -419,6 +526,7 @@ fn parse_ui_xml(xml: &str) -> Result<UiNode> {
                             "scrollable" => node.scrollable = value == "true",
                             "long-clickable" => node.long_clickable = value == "true",
                             "package" => node.package = Some(value),
+                            "ax-node-id" => node.node_id = value.parse().ok(),
                             _ => {}
                         }
                     }
@@ -484,6 +592,8 @@ pub struct AndroidAccessibility {
     element_bounds: SecondaryMap<ElementKey, String>,
     /// Cached screen size.
     screen_size: Option<(u32, u32)>,
+    /// Hybrid dump source shared across readers of the same device.
+    dump_source: SharedDumpSource,
     /// Last known app package (for PID-like targeting).
     last_package: Option<String>,
 }
@@ -514,6 +624,7 @@ impl AndroidAccessibility {
         let screen_size = adb.get_screen_size().await.ok();
 
         Ok(Self {
+            dump_source: SharedDumpSource::for_device(serial),
             adb,
             cache: ElementCache::new(),
             element_bounds: SecondaryMap::new(),
@@ -530,6 +641,7 @@ impl AndroidAccessibility {
         let screen_size = adb.get_screen_size().await.ok();
 
         Ok(Self {
+            dump_source: SharedDumpSource::for_device(serial),
             adb,
             cache: ElementCache::new(),
             element_bounds: SecondaryMap::new(),
@@ -575,7 +687,7 @@ impl AccessibilityReader for AndroidAccessibility {
             self.element_bounds.clear();
 
             // Dump UI hierarchy
-            let xml = self.adb.dump_ui().await?;
+            let xml = self.dump_source.dump_ui(&self.adb).await?;
 
             // Parse XML into node tree
             let root_node = parse_ui_xml(&xml)?;

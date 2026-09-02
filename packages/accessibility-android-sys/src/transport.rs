@@ -60,6 +60,65 @@ impl AdbTransport {
         read_to_end_limited(&mut stream, MAX_OUTPUT_LENGTH, "exec output").await
     }
 
+    /// Open a bidirectional `exec:` stream to a long-lived device command.
+    ///
+    /// Unlike [`Self::exec`], the stream is returned after the OKAY status so
+    /// the caller can keep writing to the command's stdin and reading its
+    /// stdout across many requests (e.g. a persistent dump server).
+    pub(crate) async fn exec_stream(
+        &self,
+        serial: Option<&str>,
+        args: &[&str],
+    ) -> Result<TcpStream> {
+        let service = format!("exec:{}", args.join(" "));
+        let mut stream = self.switch_to_device(serial).await?;
+        write_service(&mut stream, &service).await?;
+        read_status(&mut stream).await?;
+        Ok(stream)
+    }
+
+    /// Write `data` to `device_path` via the `sync:` service.
+    pub(crate) async fn push(
+        &self,
+        serial: Option<&str>,
+        device_path: &str,
+        data: &[u8],
+        mode: u32,
+    ) -> Result<()> {
+        let mut stream = self.switch_to_device(serial).await?;
+        write_service(&mut stream, "sync:").await?;
+        read_status(&mut stream).await?;
+
+        let target = format!("{device_path},{mode}");
+        write_sync_request(&mut stream, b"SEND", target.as_bytes()).await?;
+        for chunk in data.chunks(SYNC_DATA_CHUNK_LENGTH) {
+            write_sync_request(&mut stream, b"DATA", chunk).await?;
+        }
+        let mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as u32)
+            .unwrap_or(0);
+        stream.write_all(b"DONE").await?;
+        stream.write_all(&mtime.to_le_bytes()).await?;
+
+        let mut reply = [0; 8];
+        stream
+            .read_exact(&mut reply)
+            .await
+            .context("truncated sync push reply")?;
+        match &reply[..4] {
+            b"OKAY" => Ok(()),
+            b"FAIL" => {
+                let length =
+                    (u32::from_le_bytes(reply[4..].try_into().unwrap()) as usize).min(4096);
+                let mut message = vec![0; length];
+                stream.read_exact(&mut message).await.ok();
+                bail!("sync push failed: {}", String::from_utf8_lossy(&message));
+            }
+            _ => bail!("malformed sync push reply"),
+        }
+    }
+
     async fn connect(&self) -> Result<TcpStream> {
         match TcpStream::connect(self.server_addr).await {
             Ok(stream) => Ok(stream),
@@ -161,6 +220,15 @@ async fn write_service(stream: &mut TcpStream, service: &str) -> Result<()> {
     let header = format!("{length:04x}");
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(service.as_bytes()).await?;
+    Ok(())
+}
+
+async fn write_sync_request(stream: &mut TcpStream, id: &[u8; 4], payload: &[u8]) -> Result<()> {
+    stream.write_all(id).await?;
+    stream
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .await?;
+    stream.write_all(payload).await?;
     Ok(())
 }
 
@@ -298,6 +366,9 @@ const MAX_PACKET_LENGTH: usize = 1024 * 1024;
 const MAX_OUTPUT_LENGTH: usize = 64 * 1024 * 1024;
 
 const IO_BUFFER_LENGTH: usize = 8192;
+
+/// Maximum payload per sync-protocol DATA packet (adb's SYNC_DATA_MAX).
+const SYNC_DATA_CHUNK_LENGTH: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
