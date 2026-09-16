@@ -61,6 +61,7 @@ mod dynamic;
 mod encoder;
 mod framebuffer;
 mod hid;
+mod indigo;
 mod pixel_buffer;
 mod reader;
 mod recorder;

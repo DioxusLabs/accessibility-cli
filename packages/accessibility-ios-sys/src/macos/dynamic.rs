@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 
-use objc2::runtime::{AnyObject, Sel};
+use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::sel;
 
 /// Send a zero-argument message returning an object pointer.
@@ -88,6 +88,42 @@ pub(super) unsafe fn send_void_with_id(
     type Imp = unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject);
     let imp: Imp = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as *const c_void) };
     unsafe { imp(receiver, selector, argument) }
+}
+
+/// Send `sendWithMessage:freeWhenDone:completionQueue:completion:` to a
+/// `SimDeviceLegacyHIDClient`.
+///
+/// Goes through `objc_msgSend` directly, like the proxy helpers above, so
+/// `msg_send!`'s debug-build encoding verification is not applied to the Swift
+/// client's signature. With `free_when_done` the client `free`s `message`
+/// afterwards; otherwise the caller must keep it alive until the completion
+/// block has run.
+pub(super) unsafe fn send_hid_message(
+    receiver: *mut AnyObject,
+    message: *const c_void,
+    free_when_done: bool,
+    completion_queue: *mut AnyObject,
+    completion: *const block2::Block<dyn Fn(*mut AnyObject)>,
+) {
+    type Imp = unsafe extern "C" fn(
+        *mut AnyObject,
+        Sel,
+        *const c_void,
+        Bool,
+        *mut AnyObject,
+        *const block2::Block<dyn Fn(*mut AnyObject)>,
+    );
+    let imp: Imp = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as *const c_void) };
+    unsafe {
+        imp(
+            receiver,
+            sel!(sendWithMessage:freeWhenDone:completionQueue:completion:),
+            message,
+            Bool::from(free_when_done),
+            completion_queue,
+            completion,
+        )
+    }
 }
 
 /// Send a zero-argument message returning an unsigned short.
