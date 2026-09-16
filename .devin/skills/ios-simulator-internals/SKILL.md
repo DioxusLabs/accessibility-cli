@@ -71,6 +71,22 @@ Retaining the `CVPixelBuffer` does not help, because the surface mutates
 underneath it. The sink must finish with a frame, or copy it, before
 returning. The encoder's pixel transfer is what does that copy.
 
+## Indigo messages are typed, not poked
+
+The HID message layouts live in `macos/indigo.rs` as `#[repr(C, packed(4))]`
+structs with `const` asserts on every offset the code depends on. A builder's
+buffer is copied into one of them once (`BuilderMessage`), edited by field,
+and sent by pointer with `freeWhenDone:NO`; the client never owns Rust memory
+and the caller blocks until the completion block runs. Do not add
+`ptr::add(0x..)` offset arithmetic back — add a field to the struct.
+
+```sh
+cargo run -p accessibility-ios-sys --example indigo_layout_probe
+```
+
+dumps what the installed SimulatorKit actually returns and fails if the
+two-point layout or the per-edge flags differ from what `indigo.rs` assumes.
+
 ## SimulatorKit moved in Xcode 27
 
 From `Developer/Library/PrivateFrameworks` to `Contents/SharedFrameworks`.

@@ -1,11 +1,15 @@
+use std::mem::offset_of;
+use std::sync::mpsc;
+
+use objc2_core_foundation::CGPoint;
+
 use super::common::{
-    BUTTON_EVENT_TARGET_HARDWARE, ButtonDirection, HardwareButton,
-    create_touch_message_from_template, is_multi_touch_message, nsstring_to_string_static,
-    patch_multi_touch_message, single_touch_edge_flags,
+    BUTTON_EVENT_TARGET_HARDWARE, ButtonDirection, HardwareButton, nsstring_to_string_static,
 };
-use super::dispatcher::{
-    DISPATCH_TIME_FOREVER, dispatch_group_create, dispatch_group_enter, dispatch_group_leave,
-    dispatch_group_wait, dispatch_queue_create,
+use super::dispatcher::dispatch_queue_create;
+use super::dynamic::send_hid_message;
+use super::indigo::{
+    BuilderMessage, FingerState, MachMessageHeader, MultiTouchMessage, SingleTouchMessage,
 };
 use super::*;
 
@@ -25,8 +29,8 @@ type IndigoMessageForHIDArbitraryFn =
 /// Apple's Simulator.app always passes `NSSize(1.0, 1.0)`, which makes the
 /// ratio computation inside the function reduce to the point itself.
 type IndigoMessageForTouchFn = unsafe extern "C" fn(
-    point0: *const objc2_core_foundation::CGPoint,
-    point1: *const objc2_core_foundation::CGPoint,
+    point0: *const CGPoint,
+    point1: *const CGPoint,
     target: i32,
     event_type: i32,
     edge: u32,
@@ -34,6 +38,27 @@ type IndigoMessageForTouchFn = unsafe extern "C" fn(
     size_height: f64,
 ) -> *mut c_void;
 type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i32) -> *mut c_void;
+
+/// `IndigoHIDTarget` for touches and arbitrary HID buttons.
+const TOUCH_TARGET: i32 = 0x32;
+
+/// Indigo has no distinct "move" phase; contact is maintained by repeating the
+/// down event at the new position.
+const TOUCH_EVENT_DOWN: i32 = 1;
+const TOUCH_EVENT_UP: i32 = 2;
+
+/// Resolve a function in a `dlopen`ed framework.
+///
+/// # Safety
+/// `F` must be a function pointer type matching the symbol's real signature.
+unsafe fn symbol<F: Copy>(handle: *mut c_void, name: &CStr) -> Result<F> {
+    const { assert!(size_of::<F>() == size_of::<*mut c_void>()) };
+    let sym = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    if sym.is_null() {
+        return Err(anyhow!("Failed to find {}", name.to_string_lossy()));
+    }
+    Ok(unsafe { std::mem::transmute_copy(&sym) })
+}
 
 /// HID injection client for iOS Simulator.
 ///
@@ -118,35 +143,21 @@ impl SimulatorHID {
         // Load SimulatorKit and get function pointers
         let handle = load_simulatorkit_framework()?;
 
-        let msg_for_button: IndigoMessageForButtonFn = unsafe {
-            let sym = libc::dlsym(handle, c"IndigoHIDMessageForButton".as_ptr());
-            if sym.is_null() {
-                return Err(anyhow!("Failed to find IndigoHIDMessageForButton"));
-            }
-            std::mem::transmute(sym)
-        };
-
-        let msg_for_hid_arbitrary = unsafe {
-            let sym = libc::dlsym(handle, c"IndigoHIDMessageForHIDArbitrary".as_ptr());
-            (!sym.is_null()).then(|| std::mem::transmute(sym))
-        };
-
-        let msg_for_touch: IndigoMessageForTouchFn = unsafe {
-            let sym = libc::dlsym(handle, c"IndigoHIDMessageForMouseNSEvent".as_ptr());
-            if sym.is_null() {
-                return Err(anyhow!("Failed to find IndigoHIDMessageForMouseNSEvent"));
-            }
-            std::mem::transmute(sym)
-        };
-
-        let msg_for_keyboard: IndigoMessageForKeyboardFn = unsafe {
-            let sym = libc::dlsym(handle, c"IndigoHIDMessageForKeyboardArbitrary".as_ptr());
-            if sym.is_null() {
-                return Err(anyhow!(
-                    "Failed to find IndigoHIDMessageForKeyboardArbitrary"
-                ));
-            }
-            std::mem::transmute(sym)
+        // SAFETY: the signatures are documented on the function pointer types.
+        let (msg_for_button, msg_for_hid_arbitrary, msg_for_touch, msg_for_keyboard) = unsafe {
+            (
+                symbol::<IndigoMessageForButtonFn>(handle, c"IndigoHIDMessageForButton")?,
+                symbol::<IndigoMessageForHIDArbitraryFn>(
+                    handle,
+                    c"IndigoHIDMessageForHIDArbitrary",
+                )
+                .ok(),
+                symbol::<IndigoMessageForTouchFn>(handle, c"IndigoHIDMessageForMouseNSEvent")?,
+                symbol::<IndigoMessageForKeyboardFn>(
+                    handle,
+                    c"IndigoHIDMessageForKeyboardArbitrary",
+                )?,
+            )
         };
 
         // Get SimDeviceLegacyHIDClient class
@@ -304,51 +315,32 @@ impl SimulatorHID {
         });
 
         // Only the first finger picks up the edge passed to the builder, so
-        // each finger's flags come from a single-finger message instead. They
-        // are looked up before the message is built so a failure leaks nothing.
-        let mut patched = [(0.0, 0.0, false, 0); FINGERS];
-        for (patch, finger) in patched.iter_mut().zip(fingers) {
-            *patch = (
-                finger.x,
-                finger.y,
-                finger.touching,
-                self.touch_edge_flags(finger)?,
-            );
+        // each finger's flags come from a single-finger message instead.
+        let mut states = [FingerState::default(); FINGERS];
+        for (state, finger) in states.iter_mut().zip(fingers) {
+            *state = FingerState {
+                x_ratio: finger.x,
+                y_ratio: finger.y,
+                touching: finger.touching,
+                edge_flags: self.touch_edge_flags(finger)?,
+            };
         }
 
-        // Indigo has no distinct "move" phase; contact is maintained by
-        // repeating the down event at the new position.
         let event_type = if fingers.iter().any(|finger| finger.touching) {
-            1
+            TOUCH_EVENT_DOWN
         } else {
-            2
+            TOUCH_EVENT_UP
         };
-        let [first, second] = fingers.map(|finger| objc2_core_foundation::CGPoint {
+        let [first, second] = fingers.map(|finger| CGPoint {
             x: finger.x,
             y: finger.y,
         });
-        let message = unsafe {
-            (self.msg_for_touch)(
-                &first,
-                &second,
-                0x32,
-                event_type,
-                fingers[0].edge as u32,
-                1.0,
-                1.0,
-            )
-        };
-        if message.is_null() {
-            return Err(anyhow!("Failed to create touch message"));
-        }
-
-        if !unsafe { is_multi_touch_message(message) } {
-            unsafe { libc::free(message) };
-            return Err(anyhow!("Unexpected touch message layout"));
-        }
-
-        unsafe { patch_multi_touch_message(message, patched) };
-        self.send_message(message, true)
+        let mut message: MultiTouchMessage = self
+            .build_touch(&first, Some(&second), event_type, fingers[0].edge)?
+            .into_multi_touch()
+            .ok_or_else(|| anyhow!("Unexpected touch message layout"))?;
+        message.set_fingers(states);
+        self.send(&message)
     }
 
     /// Rotate the device.
@@ -366,34 +358,48 @@ impl SimulatorHID {
         /// `align4(4 + 0x6B)` — a GSEvent header plus a 4-byte payload.
         const MESSAGE_SIZE: u32 = 108;
 
+        /// A GSEvent mach message carrying a 4-byte orientation record, in a
+        /// buffer padded past `MESSAGE_SIZE`.
+        #[repr(C, packed(4))]
+        struct OrientationEvent {
+            header: MachMessageHeader,
+            event_type: u32,
+            _unknown: [u8; 0x2c],
+            record_info_size: u32,
+            orientation: u32,
+            _tail: [u8; 0x20],
+        }
+        const _: () = {
+            assert!(size_of::<OrientationEvent>() == 112);
+            assert!(offset_of!(OrientationEvent, event_type) == 0x18);
+            assert!(offset_of!(OrientationEvent, record_info_size) == 0x48);
+            assert!(offset_of!(OrientationEvent, orientation) == 0x4c);
+        };
+
         unsafe extern "C" {
             fn mach_msg_send(message: *mut c_void) -> i32;
         }
 
         let port = self.purple_workspace_port()?;
 
-        // Oversized so the 108-byte message is comfortably in bounds.
-        let mut buffer = [0u8; 112];
-        let base = buffer.as_mut_ptr();
-        unsafe {
-            // mach_msg_header_t: bits, size, remote, local, voucher, id.
-            std::ptr::write_unaligned(base.add(0x00) as *mut u32, MACH_MSG_TYPE_COPY_SEND);
-            std::ptr::write_unaligned(base.add(0x04) as *mut u32, MESSAGE_SIZE);
-            std::ptr::write_unaligned(base.add(0x08) as *mut u32, port);
-            std::ptr::write_unaligned(base.add(0x0c) as *mut u32, 0);
-            std::ptr::write_unaligned(base.add(0x10) as *mut u32, 0);
-            std::ptr::write_unaligned(base.add(0x14) as *mut i32, GSEVENT_MACH_MESSAGE_ID);
+        let mut event = OrientationEvent {
+            header: MachMessageHeader {
+                bits: MACH_MSG_TYPE_COPY_SEND,
+                size: MESSAGE_SIZE,
+                remote_port: port,
+                local_port: 0,
+                voucher_port: 0,
+                id: GSEVENT_MACH_MESSAGE_ID,
+            },
+            event_type: GSEVENT_TYPE_ORIENTATION_CHANGED | GSEVENT_HOST_FLAG,
+            _unknown: [0; 0x2c],
+            record_info_size: 4,
+            orientation: orientation as u32,
+            _tail: [0; 0x20],
+        };
 
-            std::ptr::write_unaligned(
-                base.add(0x18) as *mut u32,
-                GSEVENT_TYPE_ORIENTATION_CHANGED | GSEVENT_HOST_FLAG,
-            );
-            // record_info_size, then the orientation itself.
-            std::ptr::write_unaligned(base.add(0x48) as *mut u32, 4);
-            std::ptr::write_unaligned(base.add(0x4c) as *mut u32, orientation as u32);
-        }
-
-        let result = unsafe { mach_msg_send(base as *mut c_void) };
+        // SAFETY: `event` is a complete mach message of `MESSAGE_SIZE` bytes.
+        let result = unsafe { mach_msg_send((&raw mut event).cast()) };
         if result != 0 {
             return Err(anyhow!("mach_msg_send for orientation failed: {result}"));
         }
@@ -508,79 +514,64 @@ impl SimulatorHID {
         direction: ButtonDirection,
         edge: TouchEdge,
     ) -> Result<()> {
-        // First get a template message from IndigoHIDMessageForMouseNSEvent
-        let point = objc2_core_foundation::CGPoint {
+        let point = CGPoint {
             x: x_ratio,
             y: y_ratio,
         };
-
         let event_type = match direction {
-            ButtonDirection::Down => 1,
-            ButtonDirection::Up => 2,
+            ButtonDirection::Down => TOUCH_EVENT_DOWN,
+            ButtonDirection::Up => TOUCH_EVENT_UP,
         };
 
-        let template_msg = unsafe {
+        // The builder's message is only a template; idb's duplicated-payload
+        // layout is what actually gets sent.
+        let template = self.build_touch(&point, None, event_type, edge)?;
+        let message = SingleTouchMessage::from_template(&template, x_ratio, y_ratio, direction)
+            .ok_or_else(|| anyhow!("Unexpected touch message layout"))?;
+        self.send(&message)
+    }
+
+    fn touch_edge_flags(&self, contact: TouchContact) -> Result<u32> {
+        let point = CGPoint {
+            x: contact.x,
+            y: contact.y,
+        };
+        let template = self.build_touch(&point, None, TOUCH_EVENT_UP, contact.edge)?;
+        template
+            .touch(1)
+            .map(|touch| touch.edge_flags)
+            .ok_or_else(|| anyhow!("Unexpected touch message layout"))
+    }
+
+    /// Call `IndigoHIDMessageForMouseNSEvent`. A second point selects the
+    /// two-finger message layout.
+    fn build_touch(
+        &self,
+        first: &CGPoint,
+        second: Option<&CGPoint>,
+        event_type: i32,
+        edge: TouchEdge,
+    ) -> Result<BuilderMessage> {
+        let second = second.map_or(std::ptr::null(), |point| point as *const CGPoint);
+        // SAFETY: both points outlive the call; the signature is documented on
+        // `IndigoMessageForTouchFn`.
+        let message = unsafe {
             (self.msg_for_touch)(
-                &point,
-                std::ptr::null(),
-                0x32,
+                first,
+                second,
+                TOUCH_TARGET,
                 event_type,
                 edge as u32,
                 1.0,
                 1.0,
             )
         };
-
-        if template_msg.is_null() {
-            return Err(anyhow!("Failed to create template touch message"));
-        }
-
-        // Patch the x/y ratios like idb does
-        unsafe {
-            let touch_ptr = (template_msg as *mut u8).add(0x30);
-            std::ptr::write_unaligned(touch_ptr.add(0x0c) as *mut f64, x_ratio);
-            std::ptr::write_unaligned(touch_ptr.add(0x14) as *mut f64, y_ratio);
-        }
-
-        // Now create the proper touch message with duplicated payload
-        let message = create_touch_message_from_template(template_msg, x_ratio, y_ratio, direction);
-
-        // Free the template
-        unsafe { libc::free(template_msg) };
-
-        if message.is_null() {
-            return Err(anyhow!("Failed to create touch message"));
-        }
-
-        self.send_message(message, true)
-    }
-
-    fn touch_edge_flags(&self, contact: TouchContact) -> Result<u32> {
-        let point = objc2_core_foundation::CGPoint {
-            x: contact.x,
-            y: contact.y,
-        };
-        let template = unsafe {
-            (self.msg_for_touch)(
-                &point,
-                std::ptr::null(),
-                0x32,
-                2,
-                contact.edge as u32,
-                1.0,
-                1.0,
-            )
-        };
-        if template.is_null() {
-            return Err(anyhow!("Failed to create template touch message"));
-        }
-        let flags = unsafe { single_touch_edge_flags(template) };
-        unsafe { libc::free(template) };
-        Ok(flags)
+        BuilderMessage::new(message).ok_or_else(|| anyhow!("Failed to create touch message"))
     }
 
     /// Send a button event.
     fn send_button(&self, button: HardwareButton, direction: ButtonDirection) -> Result<()> {
+        // SAFETY: the signature is documented on `IndigoMessageForButtonFn`.
         let message = unsafe {
             (self.msg_for_button)(
                 button as i32,
@@ -588,96 +579,67 @@ impl SimulatorHID {
                 BUTTON_EVENT_TARGET_HARDWARE as i32,
             )
         };
-
-        if message.is_null() {
-            return Err(anyhow!("Failed to create button message"));
-        }
-
-        self.send_message(message, true)
+        let message = BuilderMessage::new(message)
+            .ok_or_else(|| anyhow!("Failed to create button message"))?;
+        self.send_raw(message.as_ptr())
     }
 
     fn send_hid_button(&self, page: u32, usage: u32, direction: ButtonDirection) -> Result<()> {
-        const HID_ARBITRARY_BUTTON_TARGET: u32 = 0x32;
-
         let msg_for_hid_arbitrary = self
             .msg_for_hid_arbitrary
             .ok_or_else(|| anyhow!("IndigoHIDMessageForHIDArbitrary is unavailable"))?;
-        let message = unsafe {
-            msg_for_hid_arbitrary(HID_ARBITRARY_BUTTON_TARGET, page, usage, direction as u32)
-        };
-
-        if message.is_null() {
-            return Err(anyhow!("Failed to create arbitrary HID message"));
-        }
-
-        self.send_message(message, true)
+        // SAFETY: the signature is documented on `IndigoMessageForHIDArbitraryFn`.
+        let message =
+            unsafe { msg_for_hid_arbitrary(TOUCH_TARGET as u32, page, usage, direction as u32) };
+        let message = BuilderMessage::new(message)
+            .ok_or_else(|| anyhow!("Failed to create arbitrary HID message"))?;
+        self.send_raw(message.as_ptr())
     }
 
     /// Send a keyboard event.
     fn send_keyboard(&self, key_code: u32, direction: ButtonDirection) -> Result<()> {
+        // SAFETY: the signature is documented on `IndigoMessageForKeyboardFn`.
         let message = unsafe { (self.msg_for_keyboard)(key_code as i32, direction as i32) };
-
-        if message.is_null() {
-            return Err(anyhow!("Failed to create keyboard message"));
-        }
-
-        self.send_message(message, true)
+        let message = BuilderMessage::new(message)
+            .ok_or_else(|| anyhow!("Failed to create keyboard message"))?;
+        self.send_raw(message.as_ptr())
     }
 
-    /// Send an Indigo message to the HID client.
-    fn send_message(&self, message: *mut c_void, free_when_done: bool) -> Result<()> {
-        // Create dispatch group for synchronization
-        let group = unsafe { dispatch_group_create() };
-        unsafe { dispatch_group_enter(group) };
+    /// Send a message value to the HID client and wait for the outcome.
+    fn send<T: Copy>(&self, message: &T) -> Result<()> {
+        self.send_raw((message as *const T).cast())
+    }
 
-        let error_ptr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let error_ptr_clone = error_ptr.clone();
-
-        // Create completion block
+    /// Send an Indigo message to the HID client and wait for the outcome.
+    ///
+    /// The client does not take ownership: `message` is kept alive by the
+    /// caller, which is safe because this returns only after the completion
+    /// block has run or been released.
+    fn send_raw(&self, message: *const c_void) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
         let completion = RcBlock::new(move |error: *mut AnyObject| {
-            if !error.is_null() {
-                let desc: *mut AnyObject = unsafe { msg_send![error, localizedDescription] };
-                if let Some(msg) = unsafe { nsstring_to_string_static(desc) } {
-                    *error_ptr_clone.lock().unwrap() = Some(msg);
-                }
-            }
-            unsafe { dispatch_group_leave(group) };
+            let error = (!error.is_null())
+                .then(|| {
+                    // SAFETY: a non-null `error` is an `NSError`.
+                    let description: *mut AnyObject =
+                        unsafe { msg_send![error, localizedDescription] };
+                    unsafe { nsstring_to_string_static(description) }
+                })
+                .flatten();
+            let _ = sender.send(error);
         });
 
-        // Use objc_msgSend directly to bypass Swift's strict type checking
-        // Selector: sendWithMessage:freeWhenDone:completionQueue:completion:
-        unsafe {
-            let sel = objc2::sel!(sendWithMessage:freeWhenDone:completionQueue:completion:);
+        // SAFETY: `client` and `queue` are live for `self`'s lifetime, and
+        // `message` and `completion` outlive the wait below.
+        unsafe { send_hid_message(self.client, message, self.queue, &*completion) };
 
-            type MsgSendFn = unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                *mut c_void,
-                Bool,
-                *mut AnyObject,
-                *const block2::Block<dyn Fn(*mut AnyObject)>,
-            );
-            let msg_send_fn: MsgSendFn = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-
-            msg_send_fn(
-                self.client,
-                sel,
-                message,
-                Bool::from(free_when_done),
-                self.queue,
-                &*completion as *const _,
-            );
+        match receiver.recv() {
+            Ok(None) => Ok(()),
+            Ok(Some(error)) => Err(anyhow!("HID send failed: {error}")),
+            Err(_) => Err(anyhow!(
+                "HID client released its completion without running it"
+            )),
         }
-
-        // Wait for completion
-        unsafe { dispatch_group_wait(group, DISPATCH_TIME_FOREVER) };
-
-        // Check for error
-        if let Some(error_msg) = error_ptr.lock().unwrap().take() {
-            return Err(anyhow!("HID send failed: {}", error_msg));
-        }
-
-        Ok(())
     }
 }
 

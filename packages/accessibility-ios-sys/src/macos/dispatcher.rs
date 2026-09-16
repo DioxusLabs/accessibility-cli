@@ -55,11 +55,13 @@ pub(super) fn get_dispatcher_state() -> &'static Mutex<DispatcherState> {
 #[link(name = "System", kind = "dylib")]
 unsafe extern "C" {
     pub(super) fn dispatch_queue_create(label: *const c_char, attr: *mut c_void) -> *mut AnyObject;
-    pub(super) fn dispatch_group_create() -> *mut AnyObject;
-    pub(super) fn dispatch_group_enter(group: *mut AnyObject);
-    pub(super) fn dispatch_group_leave(group: *mut AnyObject);
-    pub(super) fn dispatch_group_wait(group: *mut AnyObject, timeout: u64) -> i64;
+    fn dispatch_group_create() -> *mut AnyObject;
+    fn dispatch_group_enter(group: *mut AnyObject);
+    fn dispatch_group_leave(group: *mut AnyObject);
+    fn dispatch_group_wait(group: *mut AnyObject, timeout: u64) -> i64;
 }
+
+const DISPATCH_TIME_FOREVER: u64 = !0u64;
 
 // CoreFoundation retain/release for objects that might not be standard ObjC
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -68,8 +70,6 @@ unsafe extern "C" {
     #[allow(dead_code)]
     pub(super) fn CFRelease(cf: *const c_void);
 }
-
-pub(super) const DISPATCH_TIME_FOREVER: u64 = !0u64;
 
 /// Wrapper for raw pointer to make it Send+Sync.
 /// Safety: The dispatcher is only created once and accessed from the main thread.
