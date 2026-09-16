@@ -78,7 +78,7 @@ pub use encoder::{
     ChunkKind, ChunkSink, EncodedChunk, EncoderConfig, H264Encoder, NalFormat, Tuning,
 };
 pub use framebuffer::{CapturedFrame, FrameSink, FramebufferStats, SimFramebuffer};
-pub use hid::{Orientation, SimulatorHID, TouchEdge, TouchPhase};
+pub use hid::{FINGERS, Orientation, SimulatorHID, TouchContact, TouchEdge};
 pub use reader::IOSSimulatorAccessibility;
 pub use recorder::{Recorder, Recording, RecordingConfig};
 pub use stream::{ScreenGeometry, SimVideoStream};

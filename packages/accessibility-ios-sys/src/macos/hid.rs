@@ -1,6 +1,7 @@
 use super::common::{
     BUTTON_EVENT_TARGET_HARDWARE, ButtonDirection, HardwareButton,
-    create_touch_message_from_template, nsstring_to_string_static,
+    create_touch_message_from_template, is_multi_touch_message, nsstring_to_string_static,
+    patch_multi_touch_message, single_touch_edge_flags,
 };
 use super::dispatcher::{
     DISPATCH_TIME_FOREVER, dispatch_group_create, dispatch_group_enter, dispatch_group_leave,
@@ -39,14 +40,6 @@ type IndigoMessageForKeyboardFn = unsafe extern "C" fn(key_code: i32, action: i3
 /// Uses the Indigo protocol via SimulatorKit's SimDeviceLegacyHIDClient
 /// to inject touch events, button presses, and keyboard input directly
 /// into the simulator's HID subsystem.
-/// Phase of an interactive touch stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TouchPhase {
-    Begin,
-    Move,
-    End,
-}
-
 /// Screen edge a touch is treated as originating from.
 ///
 /// iOS only recognizes system gestures — most importantly swipe-up-to-home on
@@ -63,6 +56,27 @@ pub enum TouchEdge {
     Top = 2,
     Bottom = 3,
     Right = 4,
+}
+
+/// How many fingers every [`SimulatorHID::touch_normalized`] event carries:
+/// the most an Indigo touch message has room for.
+pub const FINGERS: usize = 2;
+
+/// One finger of a [`SimulatorHID::touch_normalized`] event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TouchContact {
+    /// 0..1 fraction of the raw framebuffer width.
+    pub x: f64,
+
+    /// 0..1 fraction of the raw framebuffer height.
+    pub y: f64,
+
+    /// Whether the finger is on the screen. `false` lifts it.
+    pub touching: bool,
+
+    /// The edge the finger's gesture started from. It must stay the same for
+    /// every event of the gesture.
+    pub edge: TouchEdge,
 }
 
 /// Device orientation, using the GSEvent numbering.
@@ -267,39 +281,74 @@ impl SimulatorHID {
         Ok(())
     }
 
-    /// Send a single interactive touch event in normalized screen space.
+    /// Send one interactive touch event in normalized screen space.
     ///
     /// Unlike [`Self::tap`] and [`Self::swipe`], this does not synthesize a
     /// whole gesture: the caller drives the phases itself, which is what a live
     /// pointer stream from a browser needs.
     ///
+    /// Every event carries all [`FINGERS`] fingers, in the message Simulator.app
+    /// sends for its Option-drag pinch. Fingers keep their identity by index: a
+    /// finger that stays `touching` across events is one moving touch, and a
+    /// finger lifts by being sent with `touching: false`. A gesture ends once
+    /// every finger has lifted, so a one-finger gesture sends the other fingers
+    /// lifted throughout.
+    ///
     /// `x` and `y` are 0..1 fractions of the screen, matching what the web UI
     /// already computes, so no point/pixel/scale conversion is involved.
-    pub fn touch_normalized(&self, x: f64, y: f64, phase: TouchPhase) -> Result<()> {
-        self.touch_normalized_edge(x, y, phase, TouchEdge::None)
-    }
+    pub fn touch_normalized(&self, fingers: [TouchContact; FINGERS]) -> Result<()> {
+        let fingers = fingers.map(|finger| TouchContact {
+            x: finger.x.clamp(0.0, 1.0),
+            y: finger.y.clamp(0.0, 1.0),
+            ..finger
+        });
 
-    /// As [`Self::touch_normalized`], but flagged as a system edge gesture.
-    ///
-    /// The same edge must be supplied for every event in the gesture, or iOS
-    /// will not recognize it.
-    pub fn touch_normalized_edge(
-        &self,
-        x: f64,
-        y: f64,
-        phase: TouchPhase,
-        edge: TouchEdge,
-    ) -> Result<()> {
-        let x = x.clamp(0.0, 1.0);
-        let y = y.clamp(0.0, 1.0);
+        // Only the first finger picks up the edge passed to the builder, so
+        // each finger's flags come from a single-finger message instead. They
+        // are looked up before the message is built so a failure leaks nothing.
+        let mut patched = [(0.0, 0.0, false, 0); FINGERS];
+        for (patch, finger) in patched.iter_mut().zip(fingers) {
+            *patch = (
+                finger.x,
+                finger.y,
+                finger.touching,
+                self.touch_edge_flags(finger)?,
+            );
+        }
+
         // Indigo has no distinct "move" phase; contact is maintained by
-        // repeating the down event at the new position, which is exactly what
-        // `swipe` does internally.
-        let direction = match phase {
-            TouchPhase::Begin | TouchPhase::Move => ButtonDirection::Down,
-            TouchPhase::End => ButtonDirection::Up,
+        // repeating the down event at the new position.
+        let event_type = if fingers.iter().any(|finger| finger.touching) {
+            1
+        } else {
+            2
         };
-        self.send_touch_edge(x, y, direction, edge)
+        let [first, second] = fingers.map(|finger| objc2_core_foundation::CGPoint {
+            x: finger.x,
+            y: finger.y,
+        });
+        let message = unsafe {
+            (self.msg_for_touch)(
+                &first,
+                &second,
+                0x32,
+                event_type,
+                fingers[0].edge as u32,
+                1.0,
+                1.0,
+            )
+        };
+        if message.is_null() {
+            return Err(anyhow!("Failed to create touch message"));
+        }
+
+        if !unsafe { is_multi_touch_message(message) } {
+            unsafe { libc::free(message) };
+            return Err(anyhow!("Unexpected touch message layout"));
+        }
+
+        unsafe { patch_multi_touch_message(message, patched) };
+        self.send_message(message, true)
     }
 
     /// Rotate the device.
@@ -504,6 +553,30 @@ impl SimulatorHID {
         }
 
         self.send_message(message, true)
+    }
+
+    fn touch_edge_flags(&self, contact: TouchContact) -> Result<u32> {
+        let point = objc2_core_foundation::CGPoint {
+            x: contact.x,
+            y: contact.y,
+        };
+        let template = unsafe {
+            (self.msg_for_touch)(
+                &point,
+                std::ptr::null(),
+                0x32,
+                2,
+                contact.edge as u32,
+                1.0,
+                1.0,
+            )
+        };
+        if template.is_null() {
+            return Err(anyhow!("Failed to create template touch message"));
+        }
+        let flags = unsafe { single_touch_edge_flags(template) };
+        unsafe { libc::free(template) };
+        Ok(flags)
     }
 
     /// Send a button event.

@@ -8,6 +8,8 @@ use accesskit::Role;
 use euclid::{Point2D, Rect as EuclidRect, Size2D};
 use slotmap::{Key, KeyData, SlotMap};
 
+use super::hid::FINGERS;
+
 /// Identity of a currently booted simulator.
 ///
 /// The UDID is the stable device identifier used to bind independent capture,
@@ -429,6 +431,87 @@ pub(super) fn create_touch_message_from_template(
     }
 
     message as *mut c_void
+}
+
+/// Layout of the multi-finger message `IndigoHIDMessageForMouseNSEvent` returns
+/// when given a non-null second point: a hand payload followed by one payload
+/// per finger, each `0xa0` bytes with the touch event at `+0x10`.
+const MULTI_TOUCH_PAYLOAD_STRIDE: u32 = 0xa0;
+
+/// Offsets within `IndigoTouch`.
+const TOUCH_EDGE_FLAGS_OFFSET: usize = 0x08;
+const TOUCH_TOUCHING_OFFSET: usize = 0x34;
+const TOUCH_IN_RANGE_OFFSET: usize = 0x38;
+
+/// Whether `message` has the multi-finger layout.
+///
+/// # Safety
+/// `message` must be a live message returned by `IndigoHIDMessageForMouseNSEvent`.
+pub(super) unsafe fn is_multi_touch_message(message: *const c_void) -> bool {
+    let message = message as *const u8;
+    unsafe {
+        std::ptr::read_unaligned(message.add(0x18) as *const u32) == MULTI_TOUCH_PAYLOAD_STRIDE
+            && usize::from(*message.add(0x1c)) == FINGERS + 1
+    }
+}
+
+/// Pointer to the touch event of payload `index` in a message with the given stride.
+///
+/// # Safety
+/// `message` must be at least `0x20 + (index + 1) * stride` bytes.
+unsafe fn touch_event_ptr(message: *const c_void, stride: usize, index: usize) -> *mut u8 {
+    unsafe { (message as *mut u8).add(0x20 + index * stride + 0x10) }
+}
+
+/// Edge flags of the finger payload in a single-point template message.
+///
+/// # Safety
+/// `template` must be a live single-point message from `IndigoHIDMessageForMouseNSEvent`.
+pub(super) unsafe fn single_touch_edge_flags(template: *const c_void) -> u32 {
+    let stride =
+        unsafe { std::ptr::read_unaligned((template as *const u8).add(0x18) as *const u32) };
+    unsafe {
+        std::ptr::read_unaligned(
+            touch_event_ptr(template, stride as usize, 1).add(TOUCH_EDGE_FLAGS_OFFSET)
+                as *const u32,
+        )
+    }
+}
+
+/// Rewrite the fingers of a multi-finger message in place.
+///
+/// Each finger is `(x_ratio, y_ratio, touching, edge_flags)`. Fingers are
+/// lifted individually through their touching/in-range fields, and the hand
+/// payload stays touching while any finger is.
+///
+/// # Safety
+/// `message` must satisfy [`is_multi_touch_message`].
+pub(super) unsafe fn patch_multi_touch_message(
+    message: *mut c_void,
+    fingers: [(f64, f64, bool, u32); FINGERS],
+) {
+    let stride = MULTI_TOUCH_PAYLOAD_STRIDE as usize;
+    let any_touching = fingers.iter().any(|finger| finger.2) as u32;
+    unsafe {
+        let hand = touch_event_ptr(message, stride, 0);
+        std::ptr::write_unaligned(hand.add(TOUCH_TOUCHING_OFFSET) as *mut u32, any_touching);
+        std::ptr::write_unaligned(hand.add(TOUCH_IN_RANGE_OFFSET) as *mut u32, any_touching);
+
+        for (index, (x_ratio, y_ratio, touching, edge_flags)) in fingers.into_iter().enumerate() {
+            let touch = touch_event_ptr(message, stride, index + 1);
+            std::ptr::write_unaligned(touch.add(TOUCH_EDGE_FLAGS_OFFSET) as *mut u32, edge_flags);
+            std::ptr::write_unaligned(touch.add(0x0c) as *mut f64, x_ratio);
+            std::ptr::write_unaligned(touch.add(0x14) as *mut f64, y_ratio);
+            std::ptr::write_unaligned(
+                touch.add(TOUCH_TOUCHING_OFFSET) as *mut u32,
+                touching as u32,
+            );
+            std::ptr::write_unaligned(
+                touch.add(TOUCH_IN_RANGE_OFFSET) as *mut u32,
+                touching as u32,
+            );
+        }
+    }
 }
 
 /// Get the AXPTranslator singleton.
