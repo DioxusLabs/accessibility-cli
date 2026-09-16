@@ -64,6 +64,27 @@ and every gesture just becomes an ordinary drag.
 The same edge must be supplied for every event in the gesture, and the edge is
 in *raw* framebuffer space, so it rotates with the device.
 
+## Two-finger touches
+
+Passing a non-null second point to `IndigoHIDMessageForMouseNSEvent` switches
+it to a two-finger layout (stride `0xa0`, three payloads: hand, finger 1,
+finger 2), which is what Simulator.app sends for Option-drag. Every
+`SimulatorHID::touch_normalized` event uses that message: it patches all
+fingers' positions, touching/in-range and edge flags, and a one-finger gesture
+sends the other finger lifted. Only the latest Xcode is supported. Measured on
+Xcode 26.6 with an iOS 27.0 iPhone 17 in Maps:
+
+- The two fingers have fixed identities by slot.
+- A finger lifts by sending the two-finger message with it not touching.
+- A surviving finger keeps being sent through the two-finger message until
+  both are not touching. Lifting it with a single-finger End instead leaves
+  it stuck down: Maps drops a pin from the long press.
+- The builder only applies its edge argument to the first finger, so each
+  finger's edge flags are read from a single-finger template and patched in.
+
+The core input worker gives each contact the lowest free slot for its
+lifetime, so a contact never changes identity mid-gesture.
+
 ## Orientation
 
 The framebuffer never changes size, so orientation cannot be recovered from
