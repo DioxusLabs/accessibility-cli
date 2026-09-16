@@ -74,11 +74,20 @@ returning. The encoder's pixel transfer is what does that copy.
 ## Indigo messages are typed, not poked
 
 The HID message layouts live in `macos/indigo.rs` as `#[repr(C, packed(4))]`
-structs with `const` asserts on every offset the code depends on. A builder's
-buffer is copied into one of them once (`BuilderMessage`), edited by field,
-and sent by pointer with `freeWhenDone:NO`; the client never owns Rust memory
-and the caller blocks until the completion block runs. Do not add
-`ptr::add(0x..)` offset arithmetic back — add a field to the struct.
+structs with `const` asserts on every offset the code depends on. A touch
+builder's buffer is copied into one of them and freed in the same call
+(`take_builder_message`), then edited by field and sent by pointer with
+`freeWhenDone:NO`; button and keyboard messages go straight from the builder
+to the client with `freeWhenDone:YES`. Either way the caller blocks until the
+completion block runs. Do not add `ptr::add(0x..)` offset arithmetic back —
+add a field to the struct.
+
+Measured on Xcode 26.6: the builder leaves the mach header's `size` at zero,
+so the header's payload stride and count are the only size information; both
+the one-point and two-point messages use a `0xa0` stride with two and three
+payloads; and the edge flags depend only on the edge (`0x3`, then
+`0x2040003`/`0x8040003`/`0x1040003`/`0x4040003` for left/top/bottom/right),
+which is why `SimulatorHID` caches them per edge.
 
 ```sh
 cargo run -p accessibility-ios-sys --example indigo_layout_probe

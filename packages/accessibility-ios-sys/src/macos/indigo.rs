@@ -4,7 +4,9 @@
 //! A message is a mach message: a header, then one or more fixed-stride
 //! payloads. They are modelled here as `#[repr(C, packed(4))]` values so a
 //! message can be edited by field and handed to the HID client by pointer. The
-//! only unsafe code is copying a builder's buffer into these types.
+//! only unsafe code is [`take_builder_message`], which copies a builder's
+//! buffer into one of these values and frees it, so no raw pointer outlives
+//! that one function.
 //!
 //! Field names and constants come from idb's `FBSimulatorIndigoHID` and from
 //! measuring what `IndigoHIDMessageForMouseNSEvent` returns; the `_unknown`
@@ -12,7 +14,6 @@
 
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
-use std::ptr::NonNull;
 
 use super::common::ButtonDirection;
 use super::hid::FINGERS;
@@ -99,6 +100,16 @@ pub(super) struct SingleTouchMessage {
     _tail: [u8; 0x20],
 }
 
+/// The message `IndigoHIDMessageForMouseNSEvent` returns for one point: a
+/// hand payload and one finger payload. It is only used as a template.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+pub(super) struct SinglePointTemplate {
+    header: IndigoHeader,
+    hand: MultiTouchPayload,
+    pub finger: MultiTouchPayload,
+}
+
 /// The message `IndigoHIDMessageForMouseNSEvent` returns for two points: a
 /// hand payload followed by one payload per finger.
 #[repr(C, packed(4))]
@@ -107,6 +118,22 @@ pub(super) struct MultiTouchMessage {
     header: IndigoHeader,
     hand: MultiTouchPayload,
     fingers: [MultiTouchPayload; FINGERS],
+}
+
+/// A message layout `IndigoHIDMessageForMouseNSEvent` can return.
+pub(super) trait BuilderLayout: Copy {
+    const PAYLOAD_STRIDE: u32;
+    const PAYLOAD_COUNT: usize;
+}
+
+impl BuilderLayout for SinglePointTemplate {
+    const PAYLOAD_STRIDE: u32 = MULTI_TOUCH_PAYLOAD_STRIDE;
+    const PAYLOAD_COUNT: usize = 2;
+}
+
+impl BuilderLayout for MultiTouchMessage {
+    const PAYLOAD_STRIDE: u32 = MULTI_TOUCH_PAYLOAD_STRIDE;
+    const PAYLOAD_COUNT: usize = FINGERS + 1;
 }
 
 pub(super) const SINGLE_TOUCH_PAYLOAD_STRIDE: u32 = size_of::<IndigoPayload>() as u32;
@@ -132,86 +159,47 @@ const _: () = {
     assert!(MULTI_TOUCH_PAYLOAD_STRIDE == 0xa0);
     assert!(size_of::<SingleTouchMessage>() == 0x140);
     assert!(offset_of!(SingleTouchMessage, payloads) == 0x20);
+    assert!(size_of::<SinglePointTemplate>() == 0x20 + 2 * 0xa0);
+    assert!(offset_of!(SinglePointTemplate, finger) == 0x20 + 0xa0);
     assert!(size_of::<MultiTouchMessage>() == 0x20 + (FINGERS + 1) * 0xa0);
     assert!(offset_of!(MultiTouchMessage, hand) == 0x20);
 };
 
-/// A message allocated by a SimulatorKit builder, freed on drop.
-pub(super) struct BuilderMessage(NonNull<c_void>);
-
-impl BuilderMessage {
-    /// Take ownership of a builder's return value; `None` if the builder failed.
-    pub(super) fn new(message: *mut c_void) -> Option<Self> {
-        NonNull::new(message).map(Self)
+/// Copy a touch builder's message into a `T` and free the builder's buffer.
+///
+/// `None` if the builder returned null or a message whose header does not
+/// describe `T`'s layout. The header's payload stride and count are the only
+/// size information the builder provides: it leaves the mach `size` zero.
+pub(super) fn take_builder_message<T: BuilderLayout>(message: *mut c_void) -> Option<T> {
+    if message.is_null() {
+        return None;
     }
-
-    pub(super) fn as_ptr(&self) -> *const c_void {
-        self.0.as_ptr()
-    }
-
-    pub(super) fn header(&self) -> IndigoHeader {
-        // SAFETY: every Indigo message starts with a header.
-        unsafe { std::ptr::read_unaligned(self.0.as_ptr().cast()) }
-    }
-
-    /// Length implied by the header's payload stride and count.
-    fn len(&self) -> usize {
-        let header = self.header();
-        size_of::<IndigoHeader>() + header.payload_count() * header.payload_stride as usize
-    }
-
-    /// Copy a `T` out of the message at `offset`, if it fits.
-    fn read_at<T: Copy>(&self, offset: usize) -> Option<T> {
-        let end = offset.checked_add(size_of::<T>())?;
-        if end > self.len() {
-            return None;
-        }
-        // SAFETY: `offset..end` is within the payloads the header describes.
-        Some(unsafe { std::ptr::read_unaligned(self.0.as_ptr().cast::<u8>().add(offset).cast()) })
-    }
-
-    /// The touch of payload `index`.
-    pub(super) fn touch(&self, index: usize) -> Option<IndigoTouch> {
-        let stride = self.header().payload_stride as usize;
-        let offset = size_of::<IndigoHeader>()
-            .checked_add(index.checked_mul(stride)?)?
-            .checked_add(offset_of!(IndigoPayload, touch))?;
-        self.read_at(offset)
-    }
-
-    /// The whole message as a two-finger message, if that is its layout.
-    pub(super) fn into_multi_touch(self) -> Option<MultiTouchMessage> {
-        let header = self.header();
-        if header.payload_stride != MULTI_TOUCH_PAYLOAD_STRIDE
-            || header.payload_count() != FINGERS + 1
-        {
-            return None;
-        }
-        self.read_at(0)
-    }
-}
-
-impl Drop for BuilderMessage {
-    fn drop(&mut self) {
-        // SAFETY: the builder allocated the message with `malloc`.
-        unsafe { libc::free(self.0.as_ptr()) }
+    // SAFETY: a non-null builder result is a `malloc`ed message that starts
+    // with a header, and is `T` long when the header says so.
+    unsafe {
+        let header: IndigoHeader = std::ptr::read_unaligned(message.cast());
+        let matches = header.payload_stride == T::PAYLOAD_STRIDE
+            && header.payload_count() == T::PAYLOAD_COUNT;
+        let value = matches.then(|| std::ptr::read_unaligned(message.cast::<T>()));
+        libc::free(message);
+        value
     }
 }
 
 impl SingleTouchMessage {
-    /// Build idb's one-finger message around the touch of a single-point
-    /// builder template.
+    /// Build idb's one-finger message around the hand touch of a builder
+    /// template.
     pub(super) fn from_template(
-        template: &BuilderMessage,
+        template: &SinglePointTemplate,
         x_ratio: f64,
         y_ratio: f64,
         direction: ButtonDirection,
-    ) -> Option<Self> {
-        let mut header = template.header();
+    ) -> Self {
+        let mut header = template.header;
         header.payload_stride = SINGLE_TOUCH_PAYLOAD_STRIDE;
         header.kind = INDIGO_EVENT_TYPE_TOUCH;
 
-        let mut touch = template.touch(0)?;
+        let mut touch = template.hand.payload.touch;
         touch.x_ratio = x_ratio;
         touch.y_ratio = y_ratio;
         let state = match direction {
@@ -232,11 +220,11 @@ impl SingleTouchMessage {
         second.touch.state = 1;
         second.touch.state2 = 2;
 
-        Some(Self {
+        Self {
             header,
             payloads: [first, second],
             _tail: [0; 0x20],
-        })
+        }
     }
 }
 

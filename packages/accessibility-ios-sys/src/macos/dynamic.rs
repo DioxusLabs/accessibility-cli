@@ -95,11 +95,13 @@ pub(super) unsafe fn send_void_with_id(
 ///
 /// Goes through `objc_msgSend` directly, like the proxy helpers above, so
 /// `msg_send!`'s debug-build encoding verification is not applied to the Swift
-/// client's signature. `message` is passed with `freeWhenDone:NO` and must stay
-/// alive until the completion block has run.
+/// client's signature. With `free_when_done` the client `free`s `message`
+/// afterwards; otherwise the caller must keep it alive until the completion
+/// block has run.
 pub(super) unsafe fn send_hid_message(
     receiver: *mut AnyObject,
     message: *const c_void,
+    free_when_done: bool,
     completion_queue: *mut AnyObject,
     completion: *const block2::Block<dyn Fn(*mut AnyObject)>,
 ) {
@@ -117,7 +119,7 @@ pub(super) unsafe fn send_hid_message(
             receiver,
             sel!(sendWithMessage:freeWhenDone:completionQueue:completion:),
             message,
-            Bool::NO,
+            Bool::from(free_when_done),
             completion_queue,
             completion,
         )

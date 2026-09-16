@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::mem::offset_of;
 use std::sync::mpsc;
 
@@ -9,7 +10,8 @@ use super::common::{
 use super::dispatcher::dispatch_queue_create;
 use super::dynamic::send_hid_message;
 use super::indigo::{
-    BuilderMessage, FingerState, MachMessageHeader, MultiTouchMessage, SingleTouchMessage,
+    BuilderLayout, FingerState, MachMessageHeader, MultiTouchMessage, SinglePointTemplate,
+    SingleTouchMessage, take_builder_message,
 };
 use super::*;
 
@@ -83,6 +85,10 @@ pub enum TouchEdge {
     Right = 4,
 }
 
+impl TouchEdge {
+    const COUNT: usize = 5;
+}
+
 /// How many fingers every [`SimulatorHID::touch_normalized`] event carries:
 /// the most an Indigo touch message has room for.
 pub const FINGERS: usize = 2;
@@ -125,6 +131,9 @@ pub struct SimulatorHID {
     queue: *mut AnyObject,  // dispatch_queue_t
     screen_size: (f64, f64),
     screen_scale: f64,
+    /// The builder's edge flags for each [`TouchEdge`], resolved on first use.
+    /// Measured to depend only on the edge, not the point or event type.
+    edge_flags: [OnceCell<u32>; TouchEdge::COUNT],
     // Function pointers for message creation
     msg_for_button: IndigoMessageForButtonFn,
     msg_for_hid_arbitrary: Option<IndigoMessageForHIDArbitraryFn>,
@@ -213,6 +222,7 @@ impl SimulatorHID {
             queue,
             screen_size,
             screen_scale,
+            edge_flags: [const { OnceCell::new() }; TouchEdge::COUNT],
             msg_for_button,
             msg_for_hid_arbitrary,
             msg_for_touch,
@@ -322,7 +332,7 @@ impl SimulatorHID {
                 x_ratio: finger.x,
                 y_ratio: finger.y,
                 touching: finger.touching,
-                edge_flags: self.touch_edge_flags(finger)?,
+                edge_flags: self.touch_edge_flags(finger.edge)?,
             };
         }
 
@@ -335,10 +345,8 @@ impl SimulatorHID {
             x: finger.x,
             y: finger.y,
         });
-        let mut message: MultiTouchMessage = self
-            .build_touch(&first, Some(&second), event_type, fingers[0].edge)?
-            .into_multi_touch()
-            .ok_or_else(|| anyhow!("Unexpected touch message layout"))?;
+        let mut message: MultiTouchMessage =
+            self.build_touch(&first, Some(&second), event_type, fingers[0].edge)?;
         message.set_fingers(states);
         self.send(&message)
     }
@@ -525,33 +533,30 @@ impl SimulatorHID {
 
         // The builder's message is only a template; idb's duplicated-payload
         // layout is what actually gets sent.
-        let template = self.build_touch(&point, None, event_type, edge)?;
-        let message = SingleTouchMessage::from_template(&template, x_ratio, y_ratio, direction)
-            .ok_or_else(|| anyhow!("Unexpected touch message layout"))?;
+        let template: SinglePointTemplate = self.build_touch(&point, None, event_type, edge)?;
+        let message = SingleTouchMessage::from_template(&template, x_ratio, y_ratio, direction);
         self.send(&message)
     }
 
-    fn touch_edge_flags(&self, contact: TouchContact) -> Result<u32> {
-        let point = CGPoint {
-            x: contact.x,
-            y: contact.y,
-        };
-        let template = self.build_touch(&point, None, TOUCH_EVENT_UP, contact.edge)?;
-        template
-            .touch(1)
-            .map(|touch| touch.edge_flags)
-            .ok_or_else(|| anyhow!("Unexpected touch message layout"))
+    fn touch_edge_flags(&self, edge: TouchEdge) -> Result<u32> {
+        let cell = &self.edge_flags[edge as usize];
+        if let Some(flags) = cell.get() {
+            return Ok(*flags);
+        }
+        let point = CGPoint { x: 0.5, y: 0.5 };
+        let template: SinglePointTemplate = self.build_touch(&point, None, TOUCH_EVENT_UP, edge)?;
+        Ok(*cell.get_or_init(|| template.finger.payload.touch.edge_flags))
     }
 
-    /// Call `IndigoHIDMessageForMouseNSEvent`. A second point selects the
-    /// two-finger message layout.
-    fn build_touch(
+    /// Call `IndigoHIDMessageForMouseNSEvent` and copy its result out. A second
+    /// point selects the two-finger message layout.
+    fn build_touch<T: BuilderLayout>(
         &self,
         first: &CGPoint,
         second: Option<&CGPoint>,
         event_type: i32,
         edge: TouchEdge,
-    ) -> Result<BuilderMessage> {
+    ) -> Result<T> {
         let second = second.map_or(std::ptr::null(), |point| point as *const CGPoint);
         // SAFETY: both points outlive the call; the signature is documented on
         // `IndigoMessageForTouchFn`.
@@ -566,7 +571,7 @@ impl SimulatorHID {
                 1.0,
             )
         };
-        BuilderMessage::new(message).ok_or_else(|| anyhow!("Failed to create touch message"))
+        take_builder_message(message).ok_or_else(|| anyhow!("Failed to create touch message"))
     }
 
     /// Send a button event.
@@ -579,9 +584,7 @@ impl SimulatorHID {
                 BUTTON_EVENT_TARGET_HARDWARE as i32,
             )
         };
-        let message = BuilderMessage::new(message)
-            .ok_or_else(|| anyhow!("Failed to create button message"))?;
-        self.send_raw(message.as_ptr())
+        self.send_built(message, "button")
     }
 
     fn send_hid_button(&self, page: u32, usage: u32, direction: ButtonDirection) -> Result<()> {
@@ -591,31 +594,35 @@ impl SimulatorHID {
         // SAFETY: the signature is documented on `IndigoMessageForHIDArbitraryFn`.
         let message =
             unsafe { msg_for_hid_arbitrary(TOUCH_TARGET as u32, page, usage, direction as u32) };
-        let message = BuilderMessage::new(message)
-            .ok_or_else(|| anyhow!("Failed to create arbitrary HID message"))?;
-        self.send_raw(message.as_ptr())
+        self.send_built(message, "arbitrary HID")
     }
 
     /// Send a keyboard event.
     fn send_keyboard(&self, key_code: u32, direction: ButtonDirection) -> Result<()> {
         // SAFETY: the signature is documented on `IndigoMessageForKeyboardFn`.
         let message = unsafe { (self.msg_for_keyboard)(key_code as i32, direction as i32) };
-        let message = BuilderMessage::new(message)
-            .ok_or_else(|| anyhow!("Failed to create keyboard message"))?;
-        self.send_raw(message.as_ptr())
+        self.send_built(message, "keyboard")
     }
 
     /// Send a message value to the HID client and wait for the outcome.
+    ///
+    /// The client does not take ownership: `message` stays alive on the
+    /// caller's stack, which is enough because this returns only after the
+    /// completion block has run or been released.
     fn send<T: Copy>(&self, message: &T) -> Result<()> {
-        self.send_raw((message as *const T).cast())
+        self.send_raw((message as *const T).cast(), false)
     }
 
-    /// Send an Indigo message to the HID client and wait for the outcome.
-    ///
-    /// The client does not take ownership: `message` is kept alive by the
-    /// caller, which is safe because this returns only after the completion
-    /// block has run or been released.
-    fn send_raw(&self, message: *const c_void) -> Result<()> {
+    /// Send a message a SimulatorKit builder allocated, letting the client
+    /// free it. `what` names the message for the error if the builder failed.
+    fn send_built(&self, message: *mut c_void, what: &str) -> Result<()> {
+        if message.is_null() {
+            return Err(anyhow!("Failed to create {what} message"));
+        }
+        self.send_raw(message, true)
+    }
+
+    fn send_raw(&self, message: *const c_void, free_when_done: bool) -> Result<()> {
         let (sender, receiver) = mpsc::channel();
         let completion = RcBlock::new(move |error: *mut AnyObject| {
             let error = (!error.is_null())
@@ -631,7 +638,15 @@ impl SimulatorHID {
 
         // SAFETY: `client` and `queue` are live for `self`'s lifetime, and
         // `message` and `completion` outlive the wait below.
-        unsafe { send_hid_message(self.client, message, self.queue, &*completion) };
+        unsafe {
+            send_hid_message(
+                self.client,
+                message,
+                free_when_done,
+                self.queue,
+                &*completion,
+            )
+        };
 
         match receiver.recv() {
             Ok(None) => Ok(()),
