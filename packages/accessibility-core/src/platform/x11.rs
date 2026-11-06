@@ -85,7 +85,10 @@ macro_rules! create_proxy_fn {
             bus_name: &'a str,
             object_path: &'a str,
         ) -> Result<$proxy_type<'a>> {
+            // No property cache: filling it sends `Properties.GetAll`, and Qt 5's
+            // bridge can crash the application while answering that call.
             $proxy_type::builder(conn)
+                .cache_properties(CacheProperties::No)
                 .destination(bus_name)?
                 .path(object_path)?
                 .build()
@@ -948,6 +951,130 @@ impl LinuxAccessibility {
     /// Not yet implemented on Linux.
     pub fn capture_window(&self, _pid: u32) -> Result<crate::accessibility::Screenshot> {
         bail!("Screenshot capture is not yet implemented on Linux")
+    }
+
+    /// The element's center in screen coordinates.
+    pub async fn element_center(&self, id: ElementKey) -> Result<(i32, i32)> {
+        let handle = self
+            .handles
+            .get(id)
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let conn = self.connection.connection();
+        let component =
+            Self::create_component_proxy(conn, &handle.bus_name, &handle.object_path).await?;
+        let (x, y, width, height) = component
+            .get_extents(CoordType::Screen)
+            .await
+            .map_err(|e| anyhow!("Failed to get extents: {}", e))?;
+        Ok((x + width / 2, y + height / 2))
+    }
+
+    /// Sends one pointer event through the AT-SPI DeviceEventController. `event`
+    /// is its name: `abs` moves, `b1p` presses, `b1r` releases, `b4c` and `b5c`
+    /// turn the wheel.
+    pub async fn generate_mouse_event(&self, x: i32, y: i32, event: &str) -> Result<()> {
+        self.connection
+            .connection()
+            .call_method(
+                Some("org.a11y.atspi.Registry"),
+                "/org/a11y/atspi/registry/deviceeventcontroller",
+                Some("org.a11y.atspi.DeviceEventController"),
+                "GenerateMouseEvent",
+                &(x, y, event),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to send the pointer event {}: {}", event, e))?;
+        Ok(())
+    }
+
+    /// Presses and releases one key, named by its X keysym, through the AT-SPI
+    /// DeviceEventController.
+    pub async fn generate_key_click(&self, keysym: i32) -> Result<()> {
+        // `SPI_KEY_SYM` in the at-spi2 KeySynthType enum.
+        const KEY_SYM: u32 = 4;
+        self.connection
+            .connection()
+            .call_method(
+                Some("org.a11y.atspi.Registry"),
+                "/org/a11y/atspi/registry/deviceeventcontroller",
+                Some("org.a11y.atspi.DeviceEventController"),
+                "GenerateKeyboardEvent",
+                &(keysym, "", KEY_SYM),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to send the key: {}", e))?;
+        Ok(())
+    }
+
+    /// Scrolls the element into view in its nearest scrollable ancestors.
+    pub async fn scroll_element_into_view(&self, id: ElementKey) -> Result<()> {
+        let handle = self
+            .handles
+            .get(id)
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let conn = self.connection.connection();
+        // `ATSPI_SCROLL_ANYWHERE`.
+        const SCROLL_ANYWHERE: u32 = 6;
+        conn.call_method(
+            Some(handle.bus_name.as_str()),
+            handle.object_path.as_str(),
+            Some("org.a11y.atspi.Component"),
+            "ScrollTo",
+            &(SCROLL_ANYWHERE,),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to scroll to the element: {}", e))?;
+        Ok(())
+    }
+
+    /// Adds the element to its parent's selection, keeping what is selected.
+    pub async fn select_element(&self, id: ElementKey) -> Result<()> {
+        let handle = self
+            .handles
+            .get(id)
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let conn = self.connection.connection();
+        let accessible =
+            Self::create_accessible_proxy(conn, &handle.bus_name, &handle.object_path).await?;
+        let index = accessible
+            .get_index_in_parent()
+            .await
+            .map_err(|e| anyhow!("Failed to read the element's position: {}", e))?;
+        let parent = accessible
+            .parent()
+            .await
+            .map_err(|e| anyhow!("Failed to read the element's parent: {}", e))?;
+        let parent_name = parent.name_as_str().unwrap_or_default().to_string();
+        let parent_path = parent.path_as_str().to_string();
+        let parent_accessible =
+            Self::create_accessible_proxy(conn, &parent_name, &parent_path).await?;
+        // A GTK bridge aborts on a call to an interface the object does not
+        // implement, so check the advertised set first.
+        let interfaces = parent_accessible
+            .get_interfaces()
+            .await
+            .map_err(|e| anyhow!("Failed to get interfaces: {}", e))?;
+        if !interfaces.contains(atspi::Interface::Selection) {
+            bail!("The element's parent does not support selection");
+        }
+        let reply = conn
+            .call_method(
+                Some(parent_name.as_str()),
+                parent_path.as_str(),
+                Some("org.a11y.atspi.Selection"),
+                "SelectChild",
+                &(index,),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to select the element: {}", e))?;
+        if !reply
+            .body()
+            .deserialize::<bool>()
+            .map_err(|e| anyhow!("Failed to read the selection reply: {}", e))?
+        {
+            bail!("The application refused to select the element");
+        }
+        Ok(())
     }
 
     /// List all accessible applications with their PIDs.

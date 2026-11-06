@@ -11,21 +11,38 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationValuePattern, TreeScope_Children, UIA_ButtonControlTypeId,
-    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
-    UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_HyperlinkControlTypeId,
-    UIA_ImageControlTypeId, UIA_InvokePatternId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
-    UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
-    UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
-    UIA_ScrollBarControlTypeId, UIA_SliderControlTypeId, UIA_SpinnerControlTypeId,
-    UIA_SplitButtonControlTypeId, UIA_StatusBarControlTypeId, UIA_TabControlTypeId,
-    UIA_TabItemControlTypeId, UIA_TableControlTypeId, UIA_TextControlTypeId,
-    UIA_TitleBarControlTypeId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
-    UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId,
+    CUIAutomation, ExpandCollapseState_Collapsed, ExpandCollapseState_PartiallyExpanded,
+    IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationCondition,
+    IUIAutomationElement, IUIAutomationElement3, IUIAutomationExpandCollapsePattern,
+    IUIAutomationInvokePattern, IUIAutomationRangeValuePattern, IUIAutomationScrollItemPattern,
+    IUIAutomationSelectionItemPattern, IUIAutomationTextPattern, IUIAutomationTogglePattern,
+    IUIAutomationValuePattern, ToggleState_Off, ToggleState_On, TreeScope_Children,
+    UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId,
+    UIA_DataGridControlTypeId, UIA_DataItemControlTypeId, UIA_DocumentControlTypeId,
+    UIA_EditControlTypeId, UIA_ExpandCollapsePatternId, UIA_GroupControlTypeId,
+    UIA_HasKeyboardFocusPropertyId, UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId,
+    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_InvokePatternId,
+    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsInvokePatternAvailablePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_IsRangeValuePatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsTextPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+    UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_NamePropertyId,
+    UIA_PROPERTY_ID, UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId,
+    UIA_RadioButtonControlTypeId, UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
+    UIA_ScrollBarControlTypeId, UIA_ScrollItemPatternId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_SelectionItemPatternId, UIA_SeparatorControlTypeId, UIA_SliderControlTypeId,
+    UIA_SpinnerControlTypeId, UIA_SplitButtonControlTypeId, UIA_StatusBarControlTypeId,
+    UIA_TabControlTypeId, UIA_TabItemControlTypeId, UIA_TableControlTypeId, UIA_TextControlTypeId,
+    UIA_TextPatternId, UIA_TitleBarControlTypeId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
+    UIA_TreeControlTypeId, UIA_TreeItemControlTypeId, UIA_ValueIsReadOnlyPropertyId,
+    UIA_ValuePatternId, UIA_ValueValuePropertyId, UIA_WindowControlTypeId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -44,11 +61,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetForegroundWindow,
+    GA_ROOT, GetAncestor, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
-use windows::core::BSTR;
+use windows::core::{BSTR, Interface};
 
 mod common;
 mod input;

@@ -49,6 +49,32 @@ impl WindowsAccessibility {
         self.inner.focus_window(pid)
     }
 
+    /// Prefer the process's window whose title contains `title` when walking it.
+    pub fn select_window(&mut self, pid: u32, title: Option<&str>) {
+        self.inner.select_window(pid, title);
+    }
+
+    /// Whether the last action's call into the app was still running when it was left behind.
+    pub fn partial_view(&self) -> Option<&str> {
+        self.inner.partial_view()
+    }
+
+    pub fn action_pending(&self) -> bool {
+        self.inner.action_pending()
+    }
+
+    /// Refuse a disabled element or one inside a disabled window.
+    pub fn ensure_actionable(&self, id: ElementKey) -> Result<()> {
+        self.inner.ensure_actionable(self.sys_id(id)?)
+    }
+
+    /// Raise the element's window and return its center for a pointer click,
+    /// refusing when another control would receive the click.
+    pub fn prepare_pointer_target(&self, id: ElementKey, pid: u32) -> Result<Point> {
+        let (x, y) = self.inner.prepare_pointer_target(self.sys_id(id)?, pid)?;
+        Ok(Point::new(x, y))
+    }
+
     /// List all top-level windows with their PIDs.
     pub fn list_windows(&self) -> Vec<(u32, String, String, bool)> {
         self.inner.list_windows()
@@ -82,7 +108,8 @@ impl WindowsAccessibility {
 
         let sys_tree = self.inner.get_tree(pid, &to_sys_filter(filter)).await?;
         let root = self.map_element(&sys_tree.root);
-        let element_count = count_elements(&root);
+        // A walk cut short reports a count at the cap, whatever it kept.
+        let element_count = count_elements(&root).max(sys_tree.element_count);
 
         Ok(ElementTree {
             version: self.cache.version(),
@@ -134,8 +161,8 @@ impl WindowsAccessibility {
             enabled: sys_element.enabled,
             focused: sys_element.focused,
             actions: sys_element.actions.clone(),
-            checked: None,
-            native_id: None,
+            checked: sys_element.checked,
+            native_id: sys_element.native_id,
             children,
         });
 
@@ -396,8 +423,8 @@ fn from_sys_element_standalone(element: sys::Element) -> Element {
         enabled: element.enabled,
         focused: element.focused,
         actions: element.actions,
-        checked: None,
-        native_id: None,
+        checked: element.checked,
+        native_id: element.native_id,
         children: element
             .children
             .into_iter()

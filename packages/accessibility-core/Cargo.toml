@@ -29,7 +29,6 @@ serde_json.workspace = true
 slotmap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-viuer.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-ios-sys.workspace = true
