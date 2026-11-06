@@ -56,6 +56,8 @@ pub struct Element {
     pub bounds: Option<Rect>,
     pub enabled: bool,
     pub focused: bool,
+    pub checked: Option<bool>,
+    pub native_id: Option<u64>,
     pub actions: Vec<String>,
     pub children: Vec<Element>,
 }
@@ -75,6 +77,8 @@ impl Element {
             bounds: None,
             enabled: true,
             focused: false,
+            checked: None,
+            native_id: None,
             actions: Vec::new(),
             children: Vec::new(),
         }
@@ -112,13 +116,13 @@ pub struct WindowBlockerSpec<'a> {
     pub classes: &'a [&'a str],
 }
 
-fn window_class(hwnd: HWND) -> String {
+pub(crate) fn window_class(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
     String::from_utf16_lossy(&buf[..len])
 }
 
-fn window_title(hwnd: HWND) -> String {
+pub(crate) fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
     String::from_utf16_lossy(&buf[..len])

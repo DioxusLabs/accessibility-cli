@@ -1,13 +1,131 @@
 use super::common::ElementCache;
 use super::input::{code_to_vk, send_key_event};
 use super::*;
+use windows::Win32::System::Ole::SafeArrayDestroy;
+use windows::Win32::System::Variant::{VARENUM, VT_BOOL, VT_BSTR, VT_I4, VT_R8, VariantClear};
+use windows::Win32::UI::Accessibility::UIA_ExpandCollapseExpandCollapseStatePropertyId;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
 
 mod adapter;
 mod events;
 
+/// UTF-16 units of a document's text kept as its element value.
+const MAX_DOCUMENT_TEXT: i32 = 4000;
+/// How long UI Automation waits for an app to answer one request. The default
+/// (20 s) lets a hung app consume most of a caller's deadline in a single call.
+const TRANSACTION_TIMEOUT_MS: u32 = 10_000;
+/// A walk stops here and reports a truncated tree.
+const MAX_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+/// Listing a long list in one request can take most of a walk and cannot be
+/// interrupted, so lists are read one child at a time up to this many.
+const MAX_LIST_CHILDREN: usize = 500;
+const UIA_E_TIMEOUT: i32 = 0x80131505_u32 as i32;
+const WALK_PROPERTIES: [UIA_PROPERTY_ID; 20] = [
+    UIA_ControlTypePropertyId,
+    UIA_NamePropertyId,
+    UIA_AutomationIdPropertyId,
+    UIA_BoundingRectanglePropertyId,
+    UIA_IsEnabledPropertyId,
+    UIA_HasKeyboardFocusPropertyId,
+    UIA_IsOffscreenPropertyId,
+    UIA_IsInvokePatternAvailablePropertyId,
+    UIA_IsTogglePatternAvailablePropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId,
+    UIA_IsRangeValuePatternAvailablePropertyId,
+    UIA_IsTextPatternAvailablePropertyId,
+    UIA_ValueValuePropertyId,
+    UIA_ValueIsReadOnlyPropertyId,
+    UIA_RangeValueValuePropertyId,
+    UIA_ToggleToggleStatePropertyId,
+    UIA_SelectionItemIsSelectedPropertyId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId,
+];
+
+/// A cached property, freed on drop. Win32's raw VARIANT has no destructor.
+struct CachedProperty(VARIANT);
+
+impl CachedProperty {
+    fn read(native: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<Self> {
+        unsafe { native.GetCachedPropertyValue(property) }
+            .ok()
+            .map(Self)
+    }
+
+    fn kind(&self) -> VARENUM {
+        unsafe { self.0.Anonymous.Anonymous.vt }
+    }
+}
+
+impl Drop for CachedProperty {
+    fn drop(&mut self) {
+        let _ = unsafe { VariantClear(&mut self.0) };
+    }
+}
+
+fn cached_bool(native: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> bool {
+    CachedProperty::read(native, property).is_some_and(|value| {
+        value.kind() == VT_BOOL
+            && unsafe { value.0.Anonymous.Anonymous.Anonymous.boolVal }.as_bool()
+    })
+}
+
+fn cached_i32(native: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<i32> {
+    let value = CachedProperty::read(native, property)?;
+    (value.kind() == VT_I4).then(|| unsafe { value.0.Anonymous.Anonymous.Anonymous.lVal })
+}
+
+fn cached_f64(native: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<f64> {
+    let value = CachedProperty::read(native, property)?;
+    (value.kind() == VT_R8).then(|| unsafe { value.0.Anonymous.Anonymous.Anonymous.dblVal })
+}
+
+fn cached_string(native: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<String> {
+    let value = CachedProperty::read(native, property)?;
+    if value.kind() != VT_BSTR {
+        return None;
+    }
+    let text = unsafe { &value.0.Anonymous.Anonymous.Anonymous.bstrVal };
+    Some(text.to_string()).filter(|text| !text.is_empty())
+}
+
+/// FNV-1a of the runtime id, which identifies an element for its lifetime.
+fn runtime_id_hash(native: &IUIAutomationElement) -> Option<u64> {
+    let array = unsafe { native.GetRuntimeId() }.ok()?;
+    if array.is_null() {
+        return None;
+    }
+    let hash = unsafe {
+        let parts = (*array).rgsabound[0].cElements as usize;
+        let data = (*array).pvData as *const i32;
+        let hash = std::slice::from_raw_parts(data, parts)
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, part| {
+                (hash ^ *part as u32 as u64).wrapping_mul(0x100000001b3)
+            });
+        let _ = SafeArrayDestroy(array);
+        hash
+    };
+    Some(hash)
+}
+
 /// Windows accessibility reader using UI Automation.
 pub struct WindowsAccessibility {
     automation: IUIAutomation,
+    walk_request: IUIAutomationCacheRequest,
+    pending_action: Option<std::sync::mpsc::Receiver<windows::core::Result<()>>>,
+    pending_action_pid: u32,
+    running_actions: Vec<(u32, std::sync::mpsc::Receiver<windows::core::Result<()>>)>,
+    partial_view: Option<String>,
+    stalled_probes: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<isize>>>,
+    all_elements: IUIAutomationCondition,
+    walk_started: std::time::Instant,
+    walk_cut_short: bool,
+    /// A pid and title substring that picks which of its windows gets walked.
+    selected_window: Option<(u32, String)>,
     cache: ElementCache,
     /// Map from ElementKey to native IUIAutomationElement.
     /// Uses SecondaryMap which is automatically synchronized with the primary SlotMap in cache.
@@ -26,8 +144,36 @@ impl WindowsAccessibility {
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? };
 
+        // UIA reports physical pixels to DPI-aware callers only, and pointer
+        // input and screen metrics have to use the same coordinate space.
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        if let Ok(automation2) = automation.cast::<IUIAutomation2>() {
+            let _ = unsafe { automation2.SetTransactionTimeout(TRANSACTION_TIMEOUT_MS) };
+        }
+
+        // Fetching every property with the child list makes a walk one round
+        // trip per parent instead of about ten per element.
+        let all_elements = unsafe { automation.CreateTrueCondition()? };
+        let walk_request = unsafe { automation.CreateCacheRequest()? };
+        unsafe { walk_request.SetTreeFilter(&all_elements)? };
+        for property in WALK_PROPERTIES {
+            unsafe { walk_request.AddProperty(property)? };
+        }
+
         Ok(Self {
             automation,
+            walk_request,
+            pending_action: None,
+            pending_action_pid: 0,
+            running_actions: Vec::new(),
+            partial_view: None,
+            stalled_probes: Default::default(),
+            all_elements,
+            walk_started: std::time::Instant::now(),
+            walk_cut_short: false,
+            selected_window: None,
             cache: ElementCache::new(),
             native_elements: SecondaryMap::new(),
         })
@@ -43,12 +189,20 @@ impl WindowsAccessibility {
         let hwnd = HWND(native_hwnd.0 as *mut _);
 
         // Set focus via UI Automation first
+        if unsafe { IsIconic(hwnd) }.as_bool() {
+            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        }
         let _ = unsafe { element.SetFocus() };
 
         // Then bring window to foreground
         let _ = unsafe { SetForegroundWindow(hwnd) };
 
         Ok(())
+    }
+
+    /// Prefer the process's window whose title contains `title` when walking it.
+    pub fn select_window(&mut self, pid: u32, title: Option<&str>) {
+        self.selected_window = title.map(|title| (pid, title.to_lowercase()));
     }
 
     /// List all top-level windows with their PIDs.
@@ -61,6 +215,30 @@ impl WindowsAccessibility {
         let foreground_hwnd = unsafe { GetForegroundWindow() };
         let mut foreground_pid: u32 = 0;
         unsafe { GetWindowThreadProcessId(foreground_hwnd, Some(&mut foreground_pid)) };
+        // The focus sits on the stand-in Windows shows for a hung window.
+        if common::window_class(foreground_hwnd) == adapter::GHOST_CLASS
+            && let Some(hung) = adapter::visible_windows()
+                .into_iter()
+                .find(|window| adapter::is_hung(window.hwnd))
+        {
+            foreground_pid = hung.pid;
+        }
+
+        let list_through_win32 = || {
+            adapter::visible_windows()
+                .into_iter()
+                .filter_map(|window| {
+                    let title = common::window_title(window.hwnd);
+                    (!title.is_empty()).then(|| {
+                        let class = common::window_class(window.hwnd);
+                        (window.pid, class, title, window.pid == foreground_pid)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if self.desktop_may_stall() {
+            return list_through_win32();
+        }
 
         // Get root element
         let root = match unsafe { self.automation.GetRootElement() } {
@@ -77,7 +255,7 @@ impl WindowsAccessibility {
         // Get all top-level windows
         let all_windows = match unsafe { root.FindAll(TreeScope_Children, &condition) } {
             Ok(w) => w,
-            Err(_) => return windows,
+            Err(_) => return list_through_win32(),
         };
 
         let count = unsafe { all_windows.Length().unwrap_or(0) };
@@ -115,6 +293,10 @@ impl WindowsAccessibility {
                         .map(|b| b.to_string())
                         .unwrap_or_else(|_| "Unknown".to_string())
                 };
+
+                if class_name == adapter::GHOST_CLASS {
+                    continue;
+                }
 
                 let is_focused = window_pid == foreground_pid && foreground_pid != 0;
 
@@ -159,11 +341,46 @@ impl WindowsAccessibility {
             x if x == UIA_PaneControlTypeId.0 => Role::Pane,
             x if x == UIA_GroupControlTypeId.0 => Role::Group,
             x if x == UIA_DocumentControlTypeId.0 => Role::Document,
+            x if x == UIA_DataGridControlTypeId.0 => Role::Grid,
+            x if x == UIA_DataItemControlTypeId.0 => Role::Row,
+            x if x == UIA_HeaderControlTypeId.0 => Role::Header,
+            x if x == UIA_HeaderItemControlTypeId.0 => Role::ColumnHeader,
+            x if x == UIA_SeparatorControlTypeId.0 => Role::Splitter,
             _ => Role::Unknown,
         }
     }
 
     /// Build an Element from a UI Automation element.
+    fn first_list_children(
+        &mut self,
+        list: &IUIAutomationElement,
+    ) -> windows::core::Result<Vec<IUIAutomationElement>> {
+        let walker = unsafe { self.automation.RawViewWalker()? };
+        let mut children = Vec::new();
+        let mut next = unsafe { walker.GetFirstChildElementBuildCache(list, &self.walk_request) };
+        loop {
+            let child = match next {
+                Ok(child) => child,
+                // Past the last child the walker fails too, so only a timeout means more remain.
+                Err(error) if error.code().0 == UIA_E_TIMEOUT => {
+                    if children.is_empty() {
+                        return Err(error);
+                    }
+                    self.walk_cut_short = true;
+                    break;
+                }
+                Err(_) => break,
+            };
+            if children.len() == MAX_LIST_CHILDREN || self.walk_started.elapsed() > MAX_WALK_TIME {
+                self.walk_cut_short = true;
+                break;
+            }
+            next = unsafe { walker.GetNextSiblingElementBuildCache(&child, &self.walk_request) };
+            children.push(child);
+        }
+        Ok(children)
+    }
+
     fn build_element(
         &mut self,
         native: &IUIAutomationElement,
@@ -185,26 +402,34 @@ impl WindowsAccessibility {
             return Ok(None);
         }
 
-        // Get element properties
-        let control_type = unsafe { native.CurrentControlType()? };
+        // A slow app gets a partial tree rather than an error at the deadline.
+        if self.walk_started.elapsed() > MAX_WALK_TIME {
+            if let Some(max) = filter.max_elements {
+                *element_count = max;
+            }
+            return Ok(None);
+        }
+
+        // `native` was fetched with `walk_request`, so these read locally.
+        let control_type = unsafe { native.CachedControlType()? };
         let role = Self::control_type_to_role(control_type.0);
 
         let name: String = unsafe {
             native
-                .CurrentName()
+                .CachedName()
                 .map(|b| b.to_string())
                 .unwrap_or_default()
         };
 
         let automation_id: String = unsafe {
             native
-                .CurrentAutomationId()
+                .CachedAutomationId()
                 .map(|b| b.to_string())
                 .unwrap_or_default()
         };
 
         // Get bounding rectangle
-        let rect = unsafe { native.CurrentBoundingRectangle()? };
+        let rect = unsafe { native.CachedBoundingRectangle()? };
         let bounds = if rect.right > rect.left && rect.bottom > rect.top {
             Some(Rect::new(
                 Point::new(rect.left as f64, rect.top as f64),
@@ -217,9 +442,9 @@ impl WindowsAccessibility {
             None
         };
 
-        let enabled = unsafe { native.CurrentIsEnabled()?.as_bool() };
+        let enabled = unsafe { native.CachedIsEnabled()?.as_bool() };
 
-        let has_focus = unsafe { native.CurrentHasKeyboardFocus()?.as_bool() };
+        let has_focus = unsafe { native.CachedHasKeyboardFocus()?.as_bool() };
 
         // Collect element properties
         let title = if name.is_empty() { None } else { Some(name) };
@@ -229,32 +454,111 @@ impl WindowsAccessibility {
             Some(automation_id)
         };
 
-        // Try to get value for text controls
-        let mut value = None;
-        if matches!(role, Role::TextInput | Role::Label)
-            && let Ok(value_pattern) = unsafe {
-                native.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-            }
-            && let Ok(v) = unsafe { value_pattern.CurrentValue() }
+        let has_value = cached_bool(native, UIA_IsValuePatternAvailablePropertyId);
+        let has_range = cached_bool(native, UIA_IsRangeValuePatternAvailablePropertyId);
+        let has_toggle = cached_bool(native, UIA_IsTogglePatternAvailablePropertyId);
+        let has_selection = cached_bool(native, UIA_IsSelectionItemPatternAvailablePropertyId);
+
+        let mut value = has_value
+            .then(|| cached_string(native, UIA_ValueValuePropertyId))
+            .flatten();
+        if value.is_none() && has_range {
+            value =
+                cached_f64(native, UIA_RangeValueValuePropertyId).map(|range| range.to_string());
+        }
+        // Rich documents (Word's body) expose their text only through the Text pattern.
+        if value.is_none()
+            && role == Role::Document
+            && cached_bool(native, UIA_IsTextPatternAvailablePropertyId)
+            && let Ok(text_pattern) =
+                unsafe { native.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
+            && let Ok(range) = unsafe { text_pattern.DocumentRange() }
+            && let Ok(text) = unsafe { range.GetText(MAX_DOCUMENT_TEXT) }
         {
-            let value_str = v.to_string();
-            if !value_str.is_empty() {
-                value = Some(value_str);
+            let mut text = text.to_string();
+            if text.encode_utf16().count() >= MAX_DOCUMENT_TEXT as usize {
+                text.push_str("…[truncated]");
+            }
+            if !text.is_empty() {
+                value = Some(text);
             }
         }
 
+        let checked = if has_toggle {
+            match cached_i32(native, UIA_ToggleToggleStatePropertyId) {
+                Some(state) if state == ToggleState_On.0 => Some(true),
+                Some(state) if state == ToggleState_Off.0 => Some(false),
+                _ => None,
+            }
+        } else if has_selection && matches!(role, Role::RadioButton | Role::Tab) {
+            Some(cached_bool(native, UIA_SelectionItemIsSelectedPropertyId))
+        } else {
+            None
+        };
+
+        let mut actions = Vec::new();
+        if cached_bool(native, UIA_IsInvokePatternAvailablePropertyId)
+            || has_toggle
+            || has_selection
+            || cached_bool(native, UIA_IsExpandCollapsePatternAvailablePropertyId)
+        {
+            actions.push("press".to_string());
+        }
+        if has_value && !cached_bool(native, UIA_ValueIsReadOnlyPropertyId) {
+            actions.push("set_text".to_string());
+        }
+        if has_range {
+            actions.push("increment".to_string());
+            actions.push("decrement".to_string());
+        }
+
         // Get children
-        let children =
-            unsafe { native.FindAll(TreeScope_Children, &self.automation.CreateTrueCondition()?)? };
-        let child_count = unsafe { children.Length()? };
+        let listed = if [
+            UIA_ListControlTypeId,
+            UIA_DataGridControlTypeId,
+            UIA_TableControlTypeId,
+            UIA_TreeControlTypeId,
+        ]
+        .contains(&control_type)
+        {
+            self.first_list_children(native)
+        } else {
+            unsafe {
+                native.FindAllBuildCache(TreeScope_Children, &self.all_elements, &self.walk_request)
+            }
+            .map(|children| {
+                let count = unsafe { children.Length() }.unwrap_or(0);
+                (0..count)
+                    .filter_map(|i| unsafe { children.GetElement(i) }.ok())
+                    .collect()
+            })
+        };
+        let children: Option<Vec<IUIAutomationElement>> = match listed {
+            Ok(children) => Some(children),
+            // Nothing read yet means the app is not answering; otherwise keep
+            // what was read and report it as truncated.
+            Err(error) if error.code().0 == UIA_E_TIMEOUT => {
+                if *element_count == 0 {
+                    return Err(error.into());
+                }
+                if let Some(max) = filter.max_elements {
+                    *element_count = max;
+                }
+                None
+            }
+            // The element disappeared during the walk.
+            Err(_) => None,
+        };
 
         let mut children_elements = Vec::new();
-        for i in 0..child_count {
-            if let Ok(child_native) = unsafe { children.GetElement(i) }
-                && let Ok(Some(child_elem)) =
-                    self.build_element(&child_native, depth + 1, filter, element_count)
-            {
-                children_elements.push(child_elem);
+        if let Some(children) = &children {
+            for child_native in children {
+                match self.build_element(child_native, depth + 1, filter, element_count) {
+                    Ok(Some(child_elem)) => children_elements.push(child_elem),
+                    Ok(None) => {}
+                    Err(error) if format!("{error}").contains("0x80131505") => return Err(error),
+                    Err(_) => {}
+                }
             }
         }
 
@@ -272,7 +576,9 @@ impl WindowsAccessibility {
             bounds,
             enabled,
             focused: has_focus,
-            actions: Vec::new(),
+            checked,
+            native_id: runtime_id_hash(native),
+            actions,
             children: children_elements,
         });
 
@@ -290,6 +596,10 @@ impl WindowsAccessibility {
     /// 1. Direct PID match via window handle
     /// 2. For ApplicationFrameWindow (UWP host), check if any child element has matching ProcessId
     fn find_root_for_pid(&self, pid: u32) -> Result<IUIAutomationElement> {
+        if self.desktop_may_stall() {
+            return self.find_answering_window(pid);
+        }
+
         let root = unsafe {
             self.automation
                 .GetRootElement()
@@ -302,14 +612,27 @@ impl WindowsAccessibility {
                 .map_err(|e| anyhow::anyhow!("CreateTrueCondition failed: {:?}", e))?
         };
 
-        let all_windows = unsafe {
-            root.FindAll(TreeScope_Children, &condition)
-                .map_err(|e| anyhow::anyhow!("FindAll failed: {:?}", e))?
+        let Ok(all_windows) = (unsafe { root.FindAll(TreeScope_Children, &condition) }) else {
+            return self.find_answering_window(pid);
         };
 
         let count = unsafe { all_windows.Length()? };
 
-        // First pass: try to match by PID directly via window handle
+        // First pass: match by PID via the window handle. A process can own
+        // empty helper windows (Office's border shadows) listed ahead of its
+        // real ones, so prefer the selected window, then the foreground one,
+        // then a titled one.
+        let foreground_hwnd = unsafe { GetForegroundWindow() };
+        let selected_title = self
+            .selected_window
+            .as_ref()
+            .filter(|(selected_pid, _)| *selected_pid == pid)
+            .map(|(_, title)| title.as_str());
+        let mut selected_foreground = None;
+        let mut first_selected = None;
+        let mut foreground = None;
+        let mut first_titled = None;
+        let mut first_match = None;
         for i in 0..count {
             if let Ok(window) = unsafe { all_windows.GetElement(i) }
                 && let Ok(native_hwnd) = unsafe { window.CurrentNativeWindowHandle() }
@@ -317,10 +640,35 @@ impl WindowsAccessibility {
                 let hwnd = HWND(native_hwnd.0 as *mut _);
                 let mut window_pid: u32 = 0;
                 unsafe { GetWindowThreadProcessId(hwnd, Some(&mut window_pid)) };
-                if window_pid == pid {
-                    return Ok(window);
+                if window_pid != pid {
+                    continue;
                 }
+                let title = unsafe { window.CurrentName() }
+                    .map(|name| name.to_string())
+                    .unwrap_or_default();
+                let is_foreground = hwnd == foreground_hwnd;
+                if selected_title.is_some_and(|selected| title.to_lowercase().contains(selected)) {
+                    if is_foreground {
+                        selected_foreground = Some(window.clone());
+                    }
+                    first_selected.get_or_insert(window.clone());
+                }
+                if is_foreground {
+                    foreground = Some(window.clone());
+                }
+                if !title.is_empty() {
+                    first_titled.get_or_insert(window.clone());
+                }
+                first_match.get_or_insert(window);
             }
+        }
+        if let Some(window) = selected_foreground
+            .or(first_selected)
+            .or(foreground)
+            .or(first_titled)
+            .or(first_match)
+        {
+            return Ok(window);
         }
 
         // Second pass: for UWP apps hosted in ApplicationFrameWindow,
