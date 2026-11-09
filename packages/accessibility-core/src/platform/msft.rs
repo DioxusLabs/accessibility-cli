@@ -63,6 +63,40 @@ impl WindowsAccessibility {
         self.inner.action_pending()
     }
 
+    /// Whether the only native press this element has is selecting it as a list item.
+    pub fn press_only_selects_list_item(&self, id: ElementKey) -> Result<bool> {
+        Ok(self.inner.press_only_selects_list_item(self.sys_id(id)?))
+    }
+
+    /// Whether a selectable element is selected.
+    pub fn is_selected(&self, id: ElementKey) -> Result<bool> {
+        let id = self.sys_id(id)?;
+        Ok(self.inner.is_selected(id))
+    }
+
+    /// Whether the element is scrolled out of view.
+    pub fn is_offscreen(&self, id: ElementKey) -> Result<bool> {
+        let id = self.sys_id(id)?;
+        Ok(self.inner.is_offscreen(id))
+    }
+
+    /// Bring the item named exactly `name` into view through the element's item
+    /// container, including virtualized items. `false` when there is none.
+    pub async fn scroll_item_into_view_by_name(
+        &mut self,
+        id: ElementKey,
+        name: &str,
+    ) -> Result<bool> {
+        let id = self.sys_id(id)?;
+        self.inner.scroll_item_into_view_by_name(id, name).await
+    }
+
+    /// Add the element to its container's selection.
+    pub async fn select_element(&mut self, id: ElementKey) -> Result<()> {
+        let id = self.sys_id(id)?;
+        self.inner.select_element(id).await
+    }
+
     /// Refuse a disabled element or one inside a disabled window.
     pub fn ensure_actionable(&self, id: ElementKey) -> Result<()> {
         self.inner.ensure_actionable(self.sys_id(id)?)
