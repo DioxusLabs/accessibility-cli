@@ -40,6 +40,7 @@ impl WindowsAccessibility {
         });
         let root_element = unsafe { root_element.BuildUpdatedCache(&self.walk_request)? };
         self.walk_started = std::time::Instant::now();
+        self.begin_walk(&root_element);
 
         // Get app name
         let app_name: Option<String> = unsafe {
@@ -160,8 +161,230 @@ impl WindowsAccessibility {
                     dispatch(element, |pattern| unsafe { pattern.ShowContextMenu() })?;
                 Ok(())
             }
+            Action::Expand | Action::Collapse => {
+                let expander = unsafe {
+                    native.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                        UIA_ExpandCollapsePatternId,
+                    )
+                }
+                .map_err(|_| {
+                    anyhow::anyhow!("Element does not support the ExpandCollapse pattern")
+                })?;
+                let expand = action == Action::Expand;
+                if !expand
+                    && unsafe { expander.CurrentExpandCollapseState()? }
+                        == ExpandCollapseState_Collapsed
+                {
+                    bail!("Element is not expanded");
+                }
+                self.pending_action = dispatch(expander, move |pattern| unsafe {
+                    if expand {
+                        pattern.Expand()
+                    } else {
+                        pattern.Collapse()
+                    }
+                })?;
+                Ok(())
+            }
+            Action::ScrollUp | Action::ScrollDown | Action::ScrollLeft | Action::ScrollRight => {
+                let (horizontal, vertical) = match action {
+                    Action::ScrollUp => (ScrollAmount_NoAmount, ScrollAmount_LargeDecrement),
+                    Action::ScrollDown => (ScrollAmount_NoAmount, ScrollAmount_LargeIncrement),
+                    Action::ScrollLeft => (ScrollAmount_LargeDecrement, ScrollAmount_NoAmount),
+                    _ => (ScrollAmount_LargeIncrement, ScrollAmount_NoAmount),
+                };
+                let vertical_axis = matches!(action, Action::ScrollUp | Action::ScrollDown);
+                let forward = matches!(action, Action::ScrollDown | Action::ScrollRight);
+                let position = move |scroller: &IUIAutomationScrollPattern| unsafe {
+                    if vertical_axis {
+                        scroller.CurrentVerticalScrollPercent()
+                    } else {
+                        scroller.CurrentHorizontalScrollPercent()
+                    }
+                };
+                let walker = unsafe { self.automation.RawViewWalker()? };
+                let mut current = native.clone();
+                // A nested pattern may have nothing to scroll on this axis while
+                // an ancestor does.
+                let scroller = loop {
+                    if let Ok(scroller) = unsafe {
+                        current
+                            .GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+                    } && unsafe {
+                        if vertical_axis {
+                            scroller.CurrentVerticallyScrollable()
+                        } else {
+                            scroller.CurrentHorizontallyScrollable()
+                        }
+                    }
+                    .is_ok_and(|scrollable| scrollable.as_bool())
+                    {
+                        break scroller;
+                    }
+                    current = unsafe { walker.GetParentElement(&current) }
+                        .map_err(|_| anyhow::anyhow!("Element has no scrollable container"))?;
+                };
+                let before = position(&scroller).ok();
+                let at_end = before.is_some_and(|percent| {
+                    if forward {
+                        percent >= 99.99
+                    } else {
+                        percent <= 0.01
+                    }
+                });
+                // A container at the end of its range refuses the call, which
+                // is not a failure: the caller sees the view did not move.
+                if let Ok(pending) = dispatch(scroller.clone(), move |pattern| unsafe {
+                    pattern.Scroll(horizontal, vertical)
+                }) {
+                    if pending.is_some() {
+                        self.pending_action = pending;
+                        return Ok(());
+                    }
+                }
+                if at_end {
+                    return Ok(());
+                }
+                // Office galleries accept the call and do not move.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if before.is_some() && position(&scroller).ok() == before {
+                    bail!("Element has no scrollable container that moved");
+                }
+                Ok(())
+            }
+            Action::ScrollIntoView => {
+                let item = unsafe {
+                    native.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(
+                        UIA_ScrollItemPatternId,
+                    )
+                }
+                .map_err(|_| anyhow::anyhow!("Element does not support the ScrollItem pattern"))?;
+                self.pending_action =
+                    dispatch(item, |pattern| unsafe { pattern.ScrollIntoView() })?;
+                Ok(())
+            }
             _ => bail!("Action {:?} not implemented for Windows", action),
         }
+    }
+
+    fn begin_walk(&mut self, root: &IUIAutomationElement) {
+        self.walk_windows.clear();
+        self.walk_pid = 0;
+        if let Ok(handle) = unsafe { root.CurrentNativeWindowHandle() } {
+            self.walk_windows.insert(handle.0 as isize as i32);
+            unsafe { GetWindowThreadProcessId(HWND(handle.0), Some(&mut self.walk_pid)) };
+        }
+    }
+
+    /// Whether a SelectionItem element is selected.
+    pub fn is_selected(&self, id: ElementKey) -> bool {
+        self.native_elements.get(id).is_some_and(|native| {
+            unsafe {
+                native.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                    UIA_SelectionItemPatternId,
+                )
+            }
+            .and_then(|item| unsafe { item.CurrentIsSelected() })
+            .is_ok_and(|selected| selected.as_bool())
+        })
+    }
+
+    /// Whether the provider reports the element as scrolled out of view.
+    pub fn is_offscreen(&self, id: ElementKey) -> bool {
+        self.native_elements.get(id).is_some_and(|native| {
+            unsafe { native.CurrentIsOffscreen() }.is_ok_and(|hidden| hidden.as_bool())
+        })
+    }
+
+    /// Brings the item named exactly `name` into view through the nearest
+    /// ItemContainer, which reaches virtualized items that aren't in the tree.
+    /// `false` when no container has such an item.
+    pub async fn scroll_item_into_view_by_name(
+        &mut self,
+        id: ElementKey,
+        name: &str,
+    ) -> Result<bool> {
+        self.begin_action(id);
+        let native = self
+            .native_elements
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Element not found: {}", id))?;
+        let walker = unsafe { self.automation.RawViewWalker()? };
+        let wanted = VARIANT::from(BSTR::from(name));
+        let mut current = native.clone();
+        loop {
+            if let Ok(container) = unsafe {
+                current.GetCurrentPatternAs::<IUIAutomationItemContainerPattern>(
+                    UIA_ItemContainerPatternId,
+                )
+            } {
+                let found = unsafe {
+                    container.FindItemByProperty(
+                        None::<&IUIAutomationElement>,
+                        UIA_NamePropertyId,
+                        &wanted,
+                    )
+                };
+                if let Ok(item) = found {
+                    let realized = unsafe {
+                        item.GetCurrentPatternAs::<IUIAutomationVirtualizedItemPattern>(
+                            UIA_VirtualizedItemPatternId,
+                        )
+                    }
+                    .is_ok_and(|virtualized| unsafe { virtualized.Realize() }.is_ok());
+                    // A realized item may be a new element, and realizing it
+                    // usually brings it into view already.
+                    let item = if realized {
+                        unsafe {
+                            container.FindItemByProperty(
+                                None::<&IUIAutomationElement>,
+                                UIA_NamePropertyId,
+                                &wanted,
+                            )
+                        }
+                        .unwrap_or(item)
+                    } else {
+                        item
+                    };
+                    if let Ok(scroller) = unsafe {
+                        item.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(
+                            UIA_ScrollItemPatternId,
+                        )
+                    } {
+                        self.pending_action =
+                            dispatch(scroller, |pattern| unsafe { pattern.ScrollIntoView() })?;
+                        return Ok(true);
+                    }
+                    if realized {
+                        return Ok(true);
+                    }
+                }
+            }
+            match unsafe { walker.GetParentElement(&current) } {
+                Ok(parent) => current = parent,
+                Err(_) => return Ok(false),
+            }
+        }
+    }
+
+    /// Adds the element to its container's selection, or selects it where the
+    /// container holds only one selected item.
+    pub async fn select_element(&mut self, id: ElementKey) -> Result<()> {
+        self.begin_action(id);
+        let native = self
+            .native_elements
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Element not found: {}", id))?;
+        let item = unsafe {
+            native.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                UIA_SelectionItemPatternId,
+            )
+        }
+        .map_err(|_| anyhow::anyhow!("Element does not support the SelectionItem pattern"))?;
+        self.pending_action = dispatch(item, |pattern| unsafe {
+            pattern.AddToSelection().or_else(|_| pattern.Select())
+        })?;
+        Ok(())
     }
 
     pub async fn set_value(&mut self, id: ElementKey, value: &str) -> Result<()> {
@@ -346,6 +569,20 @@ impl WindowsAccessibility {
     /// Refuse a disabled element or one inside a disabled window. UI Automation
     /// patterns ignore both: Toggle on a ribbon button changes the document
     /// underneath an open modal dialog, which disables its owner window.
+    /// Whether the only native press this element has is selecting it as a list
+    /// item. That is not a click: an Office gallery item selected this way does
+    /// not activate.
+    pub fn press_only_selects_list_item(&self, id: ElementKey) -> bool {
+        let Some(native) = self.native_elements.get(id) else {
+            return false;
+        };
+        let has = |pattern| unsafe { native.GetCurrentPattern(pattern) }.is_ok();
+        unsafe { native.CurrentControlType() }.is_ok_and(|kind| kind == UIA_ListItemControlTypeId)
+            && has(UIA_SelectionItemPatternId)
+            && !has(UIA_InvokePatternId)
+            && !has(UIA_TogglePatternId)
+    }
+
     pub fn ensure_actionable(&self, id: ElementKey) -> Result<()> {
         let native = self
             .native_elements
@@ -505,6 +742,7 @@ impl WindowsAccessibility {
 
         let element = unsafe { element.BuildUpdatedCache(&self.walk_request)? };
         self.walk_started = std::time::Instant::now();
+        self.begin_walk(&element);
         let mut element_count = 0;
         let Some(element) =
             self.build_element(&element, 0, &TreeFilter::default(), &mut element_count)?
@@ -744,6 +982,7 @@ pub(super) struct VisibleWindow {
 /// Visible top-level windows in z-order, without a UI Automation request.
 /// The "Not Responding" stand-in Windows shows over a hung window, owned by
 /// another process.
+pub(super) const POPUP_MENU_CLASS: &str = "#32768";
 pub(super) const GHOST_CLASS: &str = "Ghost";
 
 const PUMP_CHECK_TIMEOUT_MS: u32 = 250;

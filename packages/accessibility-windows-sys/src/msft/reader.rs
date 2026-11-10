@@ -3,9 +3,19 @@ use super::input::{code_to_vk, send_key_event};
 use super::*;
 use windows::Win32::System::Ole::SafeArrayDestroy;
 use windows::Win32::System::Variant::{VARENUM, VT_BOOL, VT_BSTR, VT_I4, VT_R8, VariantClear};
-use windows::Win32::UI::Accessibility::UIA_ExpandCollapseExpandCollapseStatePropertyId;
+use windows::Win32::UI::Accessibility::{
+    IUIAutomationItemContainerPattern, IUIAutomationScrollPattern,
+    IUIAutomationVirtualizedItemPattern, ScrollAmount_LargeDecrement, ScrollAmount_LargeIncrement,
+    ScrollAmount_NoAmount, UIA_ExpandCollapseExpandCollapseStatePropertyId,
+    UIA_FrameworkIdPropertyId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    UIA_ItemContainerPatternId, UIA_NativeWindowHandlePropertyId, UIA_ScrollPatternId,
+    UIA_VirtualizedItemPatternId,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GA_PARENT, GetAncestor, GetDesktopWindow, IsWindowVisible,
 };
 
 mod adapter;
@@ -22,7 +32,7 @@ const MAX_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(20);
 /// interrupted, so lists are read one child at a time up to this many.
 const MAX_LIST_CHILDREN: usize = 500;
 const UIA_E_TIMEOUT: i32 = 0x80131505_u32 as i32;
-const WALK_PROPERTIES: [UIA_PROPERTY_ID; 20] = [
+const WALK_PROPERTIES: [UIA_PROPERTY_ID; 24] = [
     UIA_ControlTypePropertyId,
     UIA_NamePropertyId,
     UIA_AutomationIdPropertyId,
@@ -43,6 +53,10 @@ const WALK_PROPERTIES: [UIA_PROPERTY_ID; 20] = [
     UIA_ToggleToggleStatePropertyId,
     UIA_SelectionItemIsSelectedPropertyId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId,
+    UIA_FrameworkIdPropertyId,
+    UIA_IsControlElementPropertyId,
+    UIA_IsContentElementPropertyId,
+    UIA_NativeWindowHandlePropertyId,
 ];
 
 /// A cached property, freed on drop. Win32's raw VARIANT has no destructor.
@@ -124,6 +138,9 @@ pub struct WindowsAccessibility {
     all_elements: IUIAutomationCondition,
     walk_started: std::time::Instant,
     walk_cut_short: bool,
+    /// The walked process, and the top-level windows the walk has entered.
+    walk_pid: u32,
+    walk_windows: std::collections::HashSet<i32>,
     /// A pid and title substring that picks which of its windows gets walked.
     selected_window: Option<(u32, String)>,
     cache: ElementCache,
@@ -173,6 +190,8 @@ impl WindowsAccessibility {
             all_elements,
             walk_started: std::time::Instant::now(),
             walk_cut_short: false,
+            walk_pid: 0,
+            walk_windows: std::collections::HashSet::new(),
             selected_window: None,
             cache: ElementCache::new(),
             native_elements: SecondaryMap::new(),
@@ -350,6 +369,24 @@ impl WindowsAccessibility {
         }
     }
 
+    /// A WinForms combo's open dropdown lists the desktop's top-level windows as
+    /// its siblings, so the raw view runs into other applications and back into
+    /// this window. A child window of another process, like a WebView2's, stays.
+    fn leaves_the_walk(&mut self, child: &IUIAutomationElement) -> bool {
+        let Some(handle) =
+            cached_i32(child, UIA_NativeWindowHandlePropertyId).filter(|handle| *handle != 0)
+        else {
+            return false;
+        };
+        let hwnd = HWND(handle as isize as *mut _);
+        if unsafe { GetAncestor(hwnd, GA_PARENT) } != unsafe { GetDesktopWindow() } {
+            return false;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        pid != self.walk_pid || !self.walk_windows.insert(handle)
+    }
+
     /// Build an Element from a UI Automation element.
     fn first_list_children(
         &mut self,
@@ -490,7 +527,7 @@ impl WindowsAccessibility {
                 Some(state) if state == ToggleState_Off.0 => Some(false),
                 _ => None,
             }
-        } else if has_selection && matches!(role, Role::RadioButton | Role::Tab) {
+        } else if has_selection {
             Some(cached_bool(native, UIA_SelectionItemIsSelectedPropertyId))
         } else {
             None
@@ -553,6 +590,9 @@ impl WindowsAccessibility {
         let mut children_elements = Vec::new();
         if let Some(children) = &children {
             for child_native in children {
+                if self.leaves_the_walk(child_native) {
+                    continue;
+                }
                 match self.build_element(child_native, depth + 1, filter, element_count) {
                     Ok(Some(child_elem)) => children_elements.push(child_elem),
                     Ok(None) => {}
@@ -560,6 +600,18 @@ impl WindowsAccessibility {
                     Err(_) => {}
                 }
             }
+        }
+
+        // WebView2 exposes the views of a browser window it never shows ("Tab bar",
+        // "App bar"), some with bounds, none a control or content element. A web
+        // page's wrappers aren't either, so only a childless one can go.
+        if children_elements.is_empty()
+            && cached_string(native, UIA_FrameworkIdPropertyId).as_deref() == Some("Chrome")
+            && (bounds.is_none()
+                || (!cached_bool(native, UIA_IsControlElementPropertyId)
+                    && !cached_bool(native, UIA_IsContentElementPropertyId)))
+        {
+            return Ok(None);
         }
 
         // Store in cache with the final ID
@@ -647,6 +699,14 @@ impl WindowsAccessibility {
                     .map(|name| name.to_string())
                     .unwrap_or_default();
                 let is_foreground = hwnd == foreground_hwnd;
+                // An open Win32 popup menu takes the input without taking the
+                // foreground, so nothing else reaches it.
+                if unsafe { window.CurrentClassName() }
+                    .is_ok_and(|class| class == adapter::POPUP_MENU_CLASS)
+                    && unsafe { IsWindowVisible(hwnd) }.as_bool()
+                {
+                    return Ok(window);
+                }
                 if selected_title.is_some_and(|selected| title.to_lowercase().contains(selected)) {
                     if is_foreground {
                         selected_foreground = Some(window.clone());
