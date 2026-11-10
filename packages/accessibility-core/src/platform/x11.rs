@@ -10,6 +10,7 @@ use crate::accessibility::{
 };
 use accessibility_linux_sys::atspi::proxy::accessible::AccessibleProxy;
 use accessibility_linux_sys::atspi::proxy::action::ActionProxy;
+use accessibility_linux_sys::atspi::proxy::application::ApplicationProxy;
 use accessibility_linux_sys::atspi::proxy::cache::CacheProxy;
 use accessibility_linux_sys::atspi::proxy::component::ComponentProxy;
 use accessibility_linux_sys::atspi::proxy::editable_text::EditableTextProxy;
@@ -505,6 +506,9 @@ impl LinuxAccessibility {
             && let Ok(component) =
                 Self::create_component_proxy(conn, &handle.bus_name, &handle.object_path).await
             && let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
+            // GTK gives this position to a widget that has no place on the screen.
+            && x != i32::MIN
+            && y != i32::MIN
         {
             element.bounds = Some(Rect::new(
                 Point::new(x as f64, y as f64),
@@ -1075,6 +1079,138 @@ impl LinuxAccessibility {
             bail!("The application refused to select the element");
         }
         Ok(())
+    }
+
+    async fn is_qt(conn: &zbus::Connection, bus_name: &str) -> Result<bool> {
+        let application = ApplicationProxy::builder(conn)
+            .cache_properties(CacheProperties::No)
+            .destination(bus_name)?
+            .path("/org/a11y/atspi/accessible/root")?
+            .build()
+            .await
+            .map_err(|e| anyhow!("Failed to create ApplicationProxy: {}", e))?;
+        let toolkit = application
+            .toolkit_name()
+            .await
+            .map_err(|e| anyhow!("Failed to read the toolkit name: {}", e))?;
+        Ok(toolkit.eq_ignore_ascii_case("qt"))
+    }
+
+    /// Puts text at the caret of an editable element and moves the caret after
+    /// it. As with a key, the text replaces a selection. The selection goes only
+    /// after the element shows the new text, so a failure leaves the old text.
+    pub async fn insert_at_caret(&self, id: ElementKey, text: &str) -> Result<()> {
+        let handle = self
+            .handles
+            .get(id)
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let conn = self.connection.connection();
+        let editable =
+            Self::create_editable_text_proxy(conn, &handle.bus_name, &handle.object_path).await?;
+        let reader = Self::create_text_proxy(conn, &handle.bus_name, &handle.object_path).await?;
+        let mut position = reader
+            .caret_offset()
+            .await
+            .map_err(|e| anyhow!("Failed to read the caret: {}", e))?;
+        // A provider can refuse to read a selection that it does not have. The
+        // proxy's method for this count sends `GetNselections`, which no toolkit has.
+        let selections: i32 = conn
+            .call_method(
+                Some(handle.bus_name.as_str()),
+                handle.object_path.as_str(),
+                Some("org.a11y.atspi.Text"),
+                "GetNSelections",
+                &(),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to read the selection: {}", e))?
+            .body()
+            .deserialize()
+            .map_err(|e| anyhow!("Failed to read the selection: {}", e))?;
+        let (selection_start, selection_end) = if selections > 0 {
+            reader
+                .get_selection(0)
+                .await
+                .map_err(|e| anyhow!("Failed to read the selection: {}", e))?
+        } else {
+            (position, position)
+        };
+        if selection_start != selection_end {
+            position = selection_end;
+        }
+        let before = reader
+            .character_count()
+            .await
+            .map_err(|e| anyhow!("Failed to read the text: {}", e))?;
+        // Toolkits read `length` differently. Qt takes UTF-16 units and pads a longer
+        // text with uninitialized memory. ATK toolkits take UTF-8 bytes and count
+        // offsets in characters.
+        let (length, units) = if Self::is_qt(conn, &handle.bus_name).await? {
+            let units = text.encode_utf16().count();
+            (units, units)
+        } else {
+            (text.len(), text.chars().count())
+        };
+        let length = i32::try_from(length).map_err(|_| anyhow!("The text is too long"))?;
+        let units = i32::try_from(units).map_err(|_| anyhow!("The text is too long"))?;
+        let inserted = editable
+            .insert_text(position, text, length)
+            .await
+            .map_err(|e| anyhow!("Failed to insert text: {}", e))?;
+        if !inserted {
+            bail!("The element did not accept the text");
+        }
+        // Toolkits can answer true and insert something else. A NUL also cuts the
+        // text that D-Bus returns, so the read alone does not show extra text.
+        let after = reader
+            .character_count()
+            .await
+            .map_err(|e| anyhow!("Failed to read the text: {}", e))?;
+        let added = after - before;
+        let mut end = position + units;
+        let shown = reader
+            .get_text(position, end)
+            .await
+            .map_err(|e| anyhow!("Failed to read the text: {}", e))?;
+        if added != units || shown != text {
+            if added > 0 {
+                editable
+                    .delete_text(position, position + added)
+                    .await
+                    .map_err(|e| anyhow!("Failed to remove the wrong text: {}", e))?;
+            }
+            bail!("The element kept other text than this");
+        }
+        if selection_start != selection_end {
+            editable
+                .delete_text(selection_start, selection_end)
+                .await
+                .map_err(|e| anyhow!("Failed to replace the selection: {}", e))?;
+            end = selection_start + units;
+        }
+        reader
+            .set_caret_offset(end)
+            .await
+            .map_err(|e| anyhow!("Failed to move the caret: {}", e))?;
+        Ok(())
+    }
+
+    /// The caret of an element with text, which moves when a typed key arrives.
+    pub async fn caret_offset(&self, id: ElementKey) -> Result<i32> {
+        let handle = self
+            .handles
+            .get(id)
+            .ok_or_else(|| anyhow!("Element {} not found in cache", id))?;
+        let reader = Self::create_text_proxy(
+            self.connection.connection(),
+            &handle.bus_name,
+            &handle.object_path,
+        )
+        .await?;
+        reader
+            .caret_offset()
+            .await
+            .map_err(|e| anyhow!("Failed to read the caret: {}", e))
     }
 
     /// List all accessible applications with their PIDs.
