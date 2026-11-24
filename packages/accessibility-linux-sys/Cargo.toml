@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Low-level Linux AT-SPI and X11 wrappers used by accessibility-cli."
 readme = "../../README.md"
 keywords = ["accessibility", "linux", "atspi", "x11", "automation"]

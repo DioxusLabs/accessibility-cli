@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Safe low-level wrappers around macOS accessibility, CoreGraphics, and AppKit APIs for accessibility-cli."
 readme = "../../README.md"
 keywords = ["accessibility", "macos", "ax", "coregraphics", "automation"]

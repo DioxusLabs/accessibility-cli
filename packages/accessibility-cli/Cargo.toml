@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Cross-platform accessibility tree inspection and automation CLI"
 repository.workspace = true
-homepage.workspace = true
 
 [dependencies]
 accessibility-core.workspace = true
