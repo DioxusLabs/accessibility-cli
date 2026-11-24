@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Cross-platform accessibility tree reading, querying, screenshots, and input automation for macOS, Windows, Linux, iOS Simulator, and Android."
 readme = "../../README.md"
 keywords = ["accessibility", "automation", "ui", "ax", "ui-automation"]

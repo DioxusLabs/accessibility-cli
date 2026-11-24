@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Serve a live, interactive iOS Simulator stream over WebRTC with accessibility element inspection."
 readme = "../../README.md"
 keywords = ["accessibility", "ios", "simulator", "webrtc", "streaming"]

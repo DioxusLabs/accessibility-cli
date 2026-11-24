@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Safe low-level wrappers around Windows UI Automation, GDI, and input APIs used by accessibility-cli."
 readme = "../../README.md"
 keywords = ["accessibility", "windows", "uia", "automation"]
